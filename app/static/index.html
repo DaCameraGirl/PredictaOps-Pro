@@ -11,9 +11,12 @@
     --text: #e8ecf4;
     --muted: #8b96ab;
     --accent: #5b8cff;
-    --danger: #ff5b6e;
-    --warn: #ffb454;
-    --ok: #3ddc97;
+    --danger: #ec835a;
+    --critical: #d03b3b;
+    --warn: #fab219;
+    --ok: #0ca30c;
+    --series-actual: #3987e5;
+    --series-predicted: #199e70;
   }
   * { box-sizing: border-box; }
   body {
@@ -25,9 +28,6 @@
   header {
     padding: 16px 24px;
     border-bottom: 1px solid var(--border);
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
   }
   header h1 { font-size: 18px; margin: 0; }
   header .subtitle { color: var(--muted); font-size: 13px; }
@@ -38,105 +38,154 @@
     border-bottom: 1px solid var(--border);
   }
   #profile-bar b { color: var(--text); }
+  #time-control {
+    padding: 12px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  #time-control input[type="range"] { flex: 1; accent-color: var(--accent); }
+  #time-label { font-size: 13px; color: var(--muted); min-width: 210px; text-align: right; font-variant-numeric: tabular-nums; }
   main {
     display: grid;
-    grid-template-columns: 320px 1fr;
-    height: calc(100vh - 96px);
+    grid-template-columns: 300px 1fr;
   }
-  #engine-list {
-    border-right: 1px solid var(--border);
-    overflow-y: auto;
-  }
-  .engine-row {
-    padding: 12px 20px;
+  #bearing-list { border-right: 1px solid var(--border); }
+  .bearing-row {
+    padding: 14px 20px;
     border-bottom: 1px solid var(--border);
     cursor: pointer;
     display: flex;
     justify-content: space-between;
     align-items: center;
   }
-  .engine-row:hover { background: var(--panel); }
-  .engine-row.selected { background: var(--panel); border-left: 3px solid var(--accent); }
+  .bearing-row:hover { background: var(--panel); }
+  .bearing-row.selected { background: var(--panel); border-left: 3px solid var(--accent); }
+  .bearing-name { display: flex; flex-direction: column; }
+  .bearing-name .failed-tag { font-size: 10px; color: var(--critical); text-transform: uppercase; letter-spacing: 0.03em; }
   .badge {
     font-size: 11px;
     padding: 2px 8px;
     border-radius: 10px;
     font-weight: 600;
   }
-  .badge.high { background: rgba(255,91,110,0.15); color: var(--danger); }
-  .badge.medium { background: rgba(255,180,84,0.15); color: var(--warn); }
-  .badge.low { background: rgba(61,220,151,0.15); color: var(--ok); }
-  #detail { padding: 24px; overflow-y: auto; }
-  .stat-row { display: flex; gap: 16px; margin-bottom: 24px; }
+  .badge.high { background: rgba(208,59,59,0.15); color: var(--critical); }
+  .badge.medium { background: rgba(250,178,25,0.15); color: var(--warn); }
+  .badge.low { background: rgba(12,163,12,0.15); color: var(--ok); }
+  #detail { padding: 24px; }
+  .stat-row { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
   .stat-card {
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 16px 20px;
-    min-width: 160px;
+    min-width: 150px;
   }
   .stat-card .label { color: var(--muted); font-size: 12px; }
-  .stat-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
-  h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
+  .stat-card .value { font-size: 28px; font-weight: 600; margin-top: 4px; }
+  h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 28px 0 12px; }
   .contrib-row { display: flex; align-items: center; margin-bottom: 10px; font-size: 13px; }
   .contrib-name { width: 110px; color: var(--muted); }
   .contrib-bar-wrap { flex: 1; background: #0c1120; border-radius: 4px; height: 20px; position: relative; }
   .contrib-bar { position: absolute; top: 0; bottom: 0; border-radius: 4px; }
-  .contrib-bar.neg { background: var(--danger); right: 50%; }
+  .contrib-bar.neg { background: var(--critical); right: 50%; }
   .contrib-bar.pos { background: var(--ok); left: 50%; }
   .contrib-value { width: 80px; text-align: right; font-variant-numeric: tabular-nums; }
-  #placeholder { color: var(--muted); padding: 40px; text-align: center; }
+  #trend-section { padding: 24px; border-top: 1px solid var(--border); grid-column: 1 / -1; }
+  #trend-legend { display: flex; gap: 20px; margin-bottom: 8px; font-size: 12px; color: var(--muted); }
+  .legend-key { display: flex; align-items: center; gap: 6px; }
+  .legend-swatch { width: 14px; height: 2px; border-radius: 1px; }
+  #trend-chart { width: 100%; height: 220px; display: block; }
+  #trend-tooltip {
+    position: absolute; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; font-size: 12px; pointer-events: none;
+    display: none; white-space: nowrap;
+  }
+  .chart-wrap { position: relative; }
 </style>
 </head>
 <body>
 <header>
-  <div>
-    <h1>Predictive Maintenance Studio</h1>
-    <div class="subtitle">NASA C-MAPSS FD001 turbofan fleet · remaining useful life</div>
-  </div>
+  <h1>Predictive Maintenance Studio</h1>
+  <div class="subtitle">NASA/IMS real bearing test-to-failure data &middot; remaining useful life</div>
 </header>
-<div id="profile-bar">Loading dataset profile…</div>
+<div id="profile-bar">Loading dataset profile&hellip;</div>
+<div id="time-control">
+  <span style="font-size:12px; color:var(--muted);">Current time</span>
+  <input type="range" id="time-slider" min="0" max="0" value="0" />
+  <span id="time-label">&nbsp;</span>
+</div>
 <main>
-  <div id="engine-list">Loading engines…</div>
-  <div id="detail"><div id="placeholder">Select an engine on the left to see its prediction and explanation.</div></div>
+  <div id="bearing-list">Loading bearings&hellip;</div>
+  <div id="detail"><div style="color:var(--muted); padding:40px; text-align:center;">Select a bearing to see its prediction and explanation.</div></div>
+  <div id="trend-section">
+    <h2 style="margin-top:0;">Bearing 1 &middot; predicted vs. actual RUL across its full life</h2>
+    <div id="trend-legend">
+      <span class="legend-key"><span class="legend-swatch" style="background:var(--series-actual);"></span>Actual RUL (ground truth)</span>
+      <span class="legend-key"><span class="legend-swatch" style="background:var(--series-predicted);"></span>Predicted RUL (model)</span>
+    </div>
+    <div class="chart-wrap">
+      <svg id="trend-chart" viewBox="0 0 900 220" preserveAspectRatio="none"></svg>
+      <div id="trend-tooltip"></div>
+    </div>
+  </div>
 </main>
 <script>
 const API = "";
+let timestamps = [];
+let currentIndex = 0;
+let selectedBearing = null;
 
 async function loadProfile() {
   const p = await (await fetch(`${API}/api/profile`)).json();
   const bar = document.getElementById("profile-bar");
-  const dropped = p.constant_sensors.length;
-  bar.innerHTML = `<b>${p.n_units}</b> engines profiled &middot; <b>${p.n_rows}</b> sensor readings &middot; ` +
-    `<b>${dropped}</b> constant sensors auto-dropped (no signal) &middot; ` +
-    `fleet lifetime <b>${p.lifetime_cycles.min}-${p.lifetime_cycles.max}</b> cycles`;
+  bar.innerHTML = `<b>${p.n_bearings}</b> bearings on one motor shaft &middot; <b>${p.n_snapshots}</b> vibration snapshots ` +
+    `over <b>${p.recording_span_days}</b> days at <b>${p.sampling_rate_hz.toLocaleString()}</b> Hz &middot; ` +
+    `<b>${p.failed_bearing}</b> failed (${p.failure_mode})`;
 }
 
-async function loadEngines() {
-  const engines = await (await fetch(`${API}/api/engines`)).json();
-  engines.sort((a, b) => a.predicted_rul - b.predicted_rul);
-  const list = document.getElementById("engine-list");
+async function loadTimeline() {
+  const t = await (await fetch(`${API}/api/timeline`)).json();
+  timestamps = t.timestamps;
+  const slider = document.getElementById("time-slider");
+  slider.max = t.n_snapshots - 1;
+  slider.value = t.default_index;
+  currentIndex = t.default_index;
+  slider.addEventListener("input", () => {
+    currentIndex = Number(slider.value);
+    renderSnapshot();
+  });
+  renderSnapshot();
+}
+
+function fmtTime(iso) {
+  return iso.replace("T", " ").slice(0, 16);
+}
+
+async function renderSnapshot() {
+  document.getElementById("time-label").textContent = fmtTime(timestamps[currentIndex]);
+  const snap = await (await fetch(`${API}/api/snapshot/${currentIndex}`)).json();
+  const list = document.getElementById("bearing-list");
+  const sorted = [...snap.bearings].sort((a, b) => a.predicted_rul - b.predicted_rul);
   list.innerHTML = "";
-  for (const e of engines) {
+  for (const b of sorted) {
     const row = document.createElement("div");
-    row.className = "engine-row";
-    row.dataset.unit = e.unit;
-    row.innerHTML = `<span>Engine ${e.unit}</span>` +
-      `<span><span class="badge ${e.risk}">${e.predicted_rul} cycles left</span></span>`;
-    row.onclick = () => selectEngine(e.unit, row);
+    row.className = "bearing-row" + (b.bearing === selectedBearing ? " selected" : "");
+    const truth = b.has_ground_truth ? `<span class="failed-tag">real failure trajectory</span>` : `<span class="failed-tag" style="color:var(--muted);">no ground truth (still healthy)</span>`;
+    row.innerHTML = `<span class="bearing-name"><span>${b.bearing.replace("_", " ")}</span>${truth}</span>` +
+      `<span class="badge ${b.risk}">${b.predicted_rul} left</span>`;
+    row.onclick = () => { selectedBearing = b.bearing; renderSnapshot(); renderDetail(); };
     list.appendChild(row);
   }
-  if (engines.length) selectEngine(engines[0].unit, list.firstChild);
+  if (!selectedBearing) selectedBearing = sorted[0].bearing;
+  renderDetail();
 }
 
-async function selectEngine(unitId, rowEl) {
-  document.querySelectorAll(".engine-row").forEach(r => r.classList.remove("selected"));
-  if (rowEl) rowEl.classList.add("selected");
-
-  const d = await (await fetch(`${API}/api/engines/${unitId}`)).json();
+async function renderDetail() {
+  const d = await (await fetch(`${API}/api/snapshot/${currentIndex}/bearing/${selectedBearing}`)).json();
   const detail = document.getElementById("detail");
-
-  const maxAbs = Math.max(...d.top_contributors.map(c => Math.abs(c.shap_value)), 1);
+  const maxAbs = Math.max(...d.top_contributors.map(c => Math.abs(c.shap_value)), 1e-6);
   const rows = d.top_contributors.map(c => {
     const pct = (Math.abs(c.shap_value) / maxAbs) * 50;
     const cls = c.shap_value < 0 ? "neg" : "pos";
@@ -149,22 +198,69 @@ async function selectEngine(unitId, rowEl) {
 
   detail.innerHTML = `
     <div class="stat-row">
-      <div class="stat-card"><div class="label">Engine</div><div class="value">#${d.unit}</div></div>
-      <div class="stat-card"><div class="label">Current cycle</div><div class="value">${d.cycle}</div></div>
-      <div class="stat-card"><div class="label">Predicted RUL</div><div class="value">${d.predicted_rul.toFixed(0)}</div></div>
-      <div class="stat-card"><div class="label">Fleet average RUL</div><div class="value">${d.base_value.toFixed(0)}</div></div>
+      <div class="stat-card"><div class="label">Bearing</div><div class="value">${d.bearing.replace("_", " ")}</div></div>
+      <div class="stat-card"><div class="label">Predicted RUL (snapshots)</div><div class="value">${d.predicted_rul.toFixed(0)}</div></div>
+      <div class="stat-card"><div class="label">Trained-model baseline</div><div class="value">${d.base_value.toFixed(0)}</div></div>
     </div>
     <h2>Why this prediction (SHAP)</h2>
     ${rows}
     <p style="color:var(--muted); font-size:12px; margin-top:16px;">
-      Red bars push RUL down (worse than fleet average), green bars push it up.
-      Values are the raw sensor readings at the engine's most recent recorded cycle.
+      Red bars push RUL down, green bars push it up. Values are vibration-analysis statistics
+      (RMS, kurtosis, etc.) computed from the real accelerometer reading at this snapshot.
+      ${d.failure_mode ? `This bearing's real failure mode was: <b>${d.failure_mode}</b>.` : "This bearing never failed during the test, so there's no ground truth RUL to compare against."}
     </p>
   `;
 }
 
+// --- trend chart ---
+function buildTrendChart(points) {
+  const svg = document.getElementById("trend-chart");
+  const W = 900, H = 220, padL = 40, padR = 10, padT = 10, padB = 24;
+  const xs = points.map((_, i) => i);
+  const maxRul = Math.max(...points.map(p => Math.max(p.true_rul, p.predicted_rul)));
+  const x = i => padL + (i / (points.length - 1)) * (W - padL - padR);
+  const y = v => H - padB - (v / maxRul) * (H - padT - padB);
+
+  const gridlines = [0, 0.25, 0.5, 0.75, 1].map(f => {
+    const v = Math.round(maxRul * f);
+    return `<line x1="${padL}" y1="${y(v)}" x2="${W - padR}" y2="${y(v)}" stroke="#2c2c2a" stroke-width="1"/>
+            <text x="${padL - 6}" y="${y(v) + 4}" text-anchor="end" font-size="10" fill="#898781">${v}</text>`;
+  }).join("");
+
+  const linePath = (key, color) => {
+    const d = points.map((p, i) => `${i === 0 ? "M" : "L"} ${x(i)} ${y(p[key])}`).join(" ");
+    return `<path d="${d}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+  };
+
+  svg.innerHTML = `
+    ${gridlines}
+    ${linePath("true_rul", "var(--series-actual)")}
+    ${linePath("predicted_rul", "var(--series-predicted)")}
+  `;
+
+  const tooltip = document.getElementById("trend-tooltip");
+  svg.addEventListener("mousemove", (e) => {
+    const rect = svg.getBoundingClientRect();
+    const relX = ((e.clientX - rect.left) / rect.width) * W;
+    let idx = Math.round(((relX - padL) / (W - padL - padR)) * (points.length - 1));
+    idx = Math.max(0, Math.min(points.length - 1, idx));
+    const p = points[idx];
+    tooltip.style.display = "block";
+    tooltip.style.left = `${e.clientX - rect.left + 12}px`;
+    tooltip.style.top = `${e.clientY - rect.top - 10}px`;
+    tooltip.innerHTML = `<div>${fmtTime(p.timestamp)}</div><div style="color:var(--series-actual)">actual: ${p.true_rul}</div><div style="color:var(--series-predicted)">predicted: ${p.predicted_rul}</div>`;
+  });
+  svg.addEventListener("mouseleave", () => { tooltip.style.display = "none"; });
+}
+
+async function loadTrend() {
+  const points = await (await fetch(`${API}/api/bearing1-trend`)).json();
+  buildTrendChart(points);
+}
+
 loadProfile();
-loadEngines();
+loadTimeline();
+loadTrend();
 </script>
 </body>
 </html>
