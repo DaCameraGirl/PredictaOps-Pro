@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Predictive Maintenance Studio</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --panel: #161d2e;
+    --border: #263048;
+    --text: #e8ecf4;
+    --muted: #8b96ab;
+    --accent: #5b8cff;
+    --danger: #ff5b6e;
+    --warn: #ffb454;
+    --ok: #3ddc97;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  header .subtitle { color: var(--muted); font-size: 13px; }
+  #profile-bar {
+    padding: 10px 24px;
+    font-size: 12px;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+  #profile-bar b { color: var(--text); }
+  main {
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    height: calc(100vh - 96px);
+  }
+  #engine-list {
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+  }
+  .engine-row {
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .engine-row:hover { background: var(--panel); }
+  .engine-row.selected { background: var(--panel); border-left: 3px solid var(--accent); }
+  .badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-weight: 600;
+  }
+  .badge.high { background: rgba(255,91,110,0.15); color: var(--danger); }
+  .badge.medium { background: rgba(255,180,84,0.15); color: var(--warn); }
+  .badge.low { background: rgba(61,220,151,0.15); color: var(--ok); }
+  #detail { padding: 24px; overflow-y: auto; }
+  .stat-row { display: flex; gap: 16px; margin-bottom: 24px; }
+  .stat-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    min-width: 160px;
+  }
+  .stat-card .label { color: var(--muted); font-size: 12px; }
+  .stat-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+  h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
+  .contrib-row { display: flex; align-items: center; margin-bottom: 10px; font-size: 13px; }
+  .contrib-name { width: 110px; color: var(--muted); }
+  .contrib-bar-wrap { flex: 1; background: #0c1120; border-radius: 4px; height: 20px; position: relative; }
+  .contrib-bar { position: absolute; top: 0; bottom: 0; border-radius: 4px; }
+  .contrib-bar.neg { background: var(--danger); right: 50%; }
+  .contrib-bar.pos { background: var(--ok); left: 50%; }
+  .contrib-value { width: 80px; text-align: right; font-variant-numeric: tabular-nums; }
+  #placeholder { color: var(--muted); padding: 40px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Predictive Maintenance Studio</h1>
+    <div class="subtitle">NASA C-MAPSS FD001 turbofan fleet · remaining useful life</div>
+  </div>
+</header>
+<div id="profile-bar">Loading dataset profile…</div>
+<main>
+  <div id="engine-list">Loading engines…</div>
+  <div id="detail"><div id="placeholder">Select an engine on the left to see its prediction and explanation.</div></div>
+</main>
+<script>
+const API = "";
+
+async function loadProfile() {
+  const p = await (await fetch(`${API}/api/profile`)).json();
+  const bar = document.getElementById("profile-bar");
+  const dropped = p.constant_sensors.length;
+  bar.innerHTML = `<b>${p.n_units}</b> engines profiled &middot; <b>${p.n_rows}</b> sensor readings &middot; ` +
+    `<b>${dropped}</b> constant sensors auto-dropped (no signal) &middot; ` +
+    `fleet lifetime <b>${p.lifetime_cycles.min}-${p.lifetime_cycles.max}</b> cycles`;
+}
+
+async function loadEngines() {
+  const engines = await (await fetch(`${API}/api/engines`)).json();
+  engines.sort((a, b) => a.predicted_rul - b.predicted_rul);
+  const list = document.getElementById("engine-list");
+  list.innerHTML = "";
+  for (const e of engines) {
+    const row = document.createElement("div");
+    row.className = "engine-row";
+    row.dataset.unit = e.unit;
+    row.innerHTML = `<span>Engine ${e.unit}</span>` +
+      `<span><span class="badge ${e.risk}">${e.predicted_rul} cycles left</span></span>`;
+    row.onclick = () => selectEngine(e.unit, row);
+    list.appendChild(row);
+  }
+  if (engines.length) selectEngine(engines[0].unit, list.firstChild);
+}
+
+async function selectEngine(unitId, rowEl) {
+  document.querySelectorAll(".engine-row").forEach(r => r.classList.remove("selected"));
+  if (rowEl) rowEl.classList.add("selected");
+
+  const d = await (await fetch(`${API}/api/engines/${unitId}`)).json();
+  const detail = document.getElementById("detail");
+
+  const maxAbs = Math.max(...d.top_contributors.map(c => Math.abs(c.shap_value)), 1);
+  const rows = d.top_contributors.map(c => {
+    const pct = (Math.abs(c.shap_value) / maxAbs) * 50;
+    const cls = c.shap_value < 0 ? "neg" : "pos";
+    return `<div class="contrib-row">
+      <div class="contrib-name">${c.feature}</div>
+      <div class="contrib-bar-wrap"><div class="contrib-bar ${cls}" style="width:${pct}%"></div></div>
+      <div class="contrib-value">${c.shap_value > 0 ? "+" : ""}${c.shap_value.toFixed(1)}</div>
+    </div>`;
+  }).join("");
+
+  detail.innerHTML = `
+    <div class="stat-row">
+      <div class="stat-card"><div class="label">Engine</div><div class="value">#${d.unit}</div></div>
+      <div class="stat-card"><div class="label">Current cycle</div><div class="value">${d.cycle}</div></div>
+      <div class="stat-card"><div class="label">Predicted RUL</div><div class="value">${d.predicted_rul.toFixed(0)}</div></div>
+      <div class="stat-card"><div class="label">Fleet average RUL</div><div class="value">${d.base_value.toFixed(0)}</div></div>
+    </div>
+    <h2>Why this prediction (SHAP)</h2>
+    ${rows}
+    <p style="color:var(--muted); font-size:12px; margin-top:16px;">
+      Red bars push RUL down (worse than fleet average), green bars push it up.
+      Values are the raw sensor readings at the engine's most recent recorded cycle.
+    </p>
+  `;
+}
+
+loadProfile();
+loadEngines();
+</script>
+</body>
+</html>
