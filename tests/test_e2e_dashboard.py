@@ -1,0 +1,87 @@
+"""End-to-end browser test for the critical dashboard journey.
+
+Starts the real FastAPI app as a subprocess, drives it with a headless browser via
+Playwright, and checks the page actually renders real data — not just that the
+process launched. Run standalone (`python tests/test_e2e_dashboard.py`) or via
+pytest; set BASE_URL to point at an already-running instance (e.g. the deployed
+app) instead of spawning a local server.
+"""
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+BASE_URL = os.environ.get("BASE_URL")
+PORT = 8931  # distinct from the dev-server default to avoid colliding with a running instance
+
+
+def _wait_for(url: str, timeout: float = 30.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=1)
+            return True
+        except Exception:  # noqa: BLE001 - polling until the server answers
+            time.sleep(0.5)
+    return False
+
+
+@pytest.fixture(scope="module")
+def base_url(model_dir, feature_table):
+    if BASE_URL:
+        yield BASE_URL
+        return
+
+    python = sys.executable
+    proc = subprocess.Popen(
+        [python, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(PORT)],
+        cwd=str(ROOT),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    url = f"http://127.0.0.1:{PORT}"
+    try:
+        if not _wait_for(f"{url}/api/health"):
+            proc.terminate()
+            pytest.fail("local server did not become healthy in time")
+        yield url
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+
+def test_critical_dashboard_journey(base_url):
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        pytest.skip("playwright not installed; pip install playwright && playwright install chromium")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        console_errors = []
+        page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
+        page.on("pageerror", lambda exc: console_errors.append(str(exc)))
+
+        page.goto(base_url)
+        page.wait_for_selector(".bearing-row", timeout=15000)
+
+        rows = page.locator(".bearing-row")
+        assert rows.count() == 4, "all four bearings must render"
+
+        page.click(".bearing-row >> nth=0")
+        page.wait_for_selector("text=SHAP", timeout=10000)
+
+        assert "Predictive Maintenance Studio" in page.title()
+        assert console_errors == [], f"unexpected browser console errors: {console_errors}"
+
+        browser.close()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

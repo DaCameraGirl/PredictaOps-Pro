@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest==9.1.1
+ruff==0.16.4
+httpx==0.28.1
+playwright==1.62.0

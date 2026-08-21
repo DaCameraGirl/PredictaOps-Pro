@@ -1,13 +1,66 @@
 {
   "validation_method": "chronological walk-forward, expanding window, no shuffling",
+  "n_folds": 4,
+  "fold_boundaries": [
+    {
+      "fold": 0,
+      "train_rows": 393,
+      "test_rows": 147,
+      "train_start": "2004-02-12T10:32:39",
+      "train_end": "2004-02-15T03:52:39",
+      "test_start": "2004-02-15T04:02:39",
+      "test_end": "2004-02-16T04:22:39"
+    },
+    {
+      "fold": 1,
+      "train_rows": 540,
+      "test_rows": 148,
+      "train_start": "2004-02-12T10:32:39",
+      "train_end": "2004-02-16T04:22:39",
+      "test_start": "2004-02-16T04:32:39",
+      "test_end": "2004-02-17T05:02:39"
+    },
+    {
+      "fold": 2,
+      "train_rows": 688,
+      "test_rows": 148,
+      "train_start": "2004-02-12T10:32:39",
+      "train_end": "2004-02-17T05:02:39",
+      "test_start": "2004-02-17T05:12:39",
+      "test_end": "2004-02-18T05:42:39"
+    },
+    {
+      "fold": 3,
+      "train_rows": 836,
+      "test_rows": 148,
+      "train_start": "2004-02-12T10:32:39",
+      "train_end": "2004-02-18T05:42:39",
+      "test_start": "2004-02-18T05:52:39",
+      "test_end": "2004-02-19T06:22:39"
+    }
+  ],
   "n_backtest_points": 591,
   "mae_snapshots": 71.3322525024414,
   "mae_hours": 11.8887087504069,
   "rmse_snapshots": 100.30905367911713,
   "rmse_hours": 16.718175613186187,
+  "median_ae_snapshots": 59.954193115234375,
+  "baseline_mae_snapshots": 124.16580614563203,
+  "baseline_rmse_snapshots": 172.24219783466737,
+  "model_beats_baseline_mae": true,
+  "model_beats_baseline_rmse": true,
+  "horizon_mae_snapshots": {
+    "early-life": 0.10659898817539215,
+    "mid-life": 62.83615493774414,
+    "late-life": 151.05401611328125
+  },
   "asymmetric_score": 1470.1201361654319,
+  "pct_late_predictions": 67.68189509306261,
+  "mean_late_magnitude_snapshots": 105.393405418396,
+  "mean_early_magnitude_snapshots": -0.0,
   "interval_80_residual_low": 0.0,
   "interval_80_residual_high": 160.21701049804688,
+  "interval_note": "Global empirical uncertainty range derived from walk-forward residuals; not a conditionally calibrated guarantee.",
   "snapshot_minutes": 10,
   "rul_clip": 400,
   "scope_statement": "Trained and backtested on one confirmed failure trajectory (bearing 1, outer race defect). This demonstrates trajectory fitting and honest backtesting on real data, not a validated general bearing-failure model."

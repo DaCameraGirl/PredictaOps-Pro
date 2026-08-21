@@ -1,4 +1,21 @@
 .venv/
+venv/
 __pycache__/
 *.pyc
-data/ims_test2/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Raw dataset (~525MB): not committed, fetched via scripts/download_data.py
+data/raw/
+
+# Local environment overrides
+.env
+!.env.example
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+
+# Ad hoc local exports (committed screenshots in reports/ are the exception)
+reports/*.tmp.*

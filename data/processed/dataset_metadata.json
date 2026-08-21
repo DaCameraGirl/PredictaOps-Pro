@@ -1,0 +1,12 @@
+{
+  "dataset": "NASA/IMS Bearing Data Set, Test 2",
+  "generated_at": "2026-08-21T19:13:04.874992+00:00",
+  "code_version": "7e924860fa750cb0fb7f84cf335e89dd84beccc4",
+  "n_snapshots": 984,
+  "n_channels": 4,
+  "sampling_rate_hz": 20000,
+  "timestamp_min": "2004-02-12T10:32:39",
+  "timestamp_max": "2004-02-19T06:22:39",
+  "irregular_gaps": [],
+  "raw_sha256": "356e6f3ce810d09614d86bce779316d7acb2710b1e5b792c1ea33300fe57f2fe"
+}

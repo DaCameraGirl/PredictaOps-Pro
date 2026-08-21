@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Predictive Maintenance Studio</title>
 <style>
   :root {
@@ -11,172 +12,225 @@
     --text: #e8ecf4;
     --muted: #8b96ab;
     --accent: #5b8cff;
-    --danger: #ec835a;
     --critical: #d03b3b;
     --warn: #fab219;
+    --watch: #eda100;
     --ok: #0ca30c;
-    --series-actual: #3987e5;
-    --series-predicted: #199e70;
+    --series-1: #3987e5;
+    --series-2: #199e70;
   }
   * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-  }
-  header { padding: 16px 24px; border-bottom: 1px solid var(--border); }
+  body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); }
+  a { color: var(--accent); }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 8px; }
   header h1 { font-size: 18px; margin: 0; }
   header .subtitle { color: var(--muted); font-size: 13px; }
-  #profile-bar {
-    padding: 10px 24px;
-    font-size: 12px;
-    color: var(--muted);
-    border-bottom: 1px solid var(--border);
-  }
-  #profile-bar b { color: var(--text); }
-  #scope-banner {
-    padding: 10px 24px;
-    font-size: 12px;
-    color: var(--muted);
-    background: rgba(250,178,25,0.06);
-    border-bottom: 1px solid var(--border);
-    line-height: 1.5;
-  }
-  #scope-banner b { color: var(--warn); }
-  #time-control {
-    padding: 12px 24px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    gap: 16px;
-  }
-  #time-control input[type="range"] { flex: 1; accent-color: var(--accent); }
-  #time-label { font-size: 13px; color: var(--muted); min-width: 210px; text-align: right; font-variant-numeric: tabular-nums; }
+  #methodology-btn { background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px 14px; font-size: 12px; cursor: pointer; }
+  #methodology-btn:hover { background: var(--border); }
+  #profile-bar, #scope-banner { padding: 10px 24px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border); line-height: 1.6; }
+  #profile-bar b, #scope-banner b { color: var(--text); }
+  #scope-banner { background: rgba(250,178,25,0.06); }
+  #scope-banner b.warn { color: var(--warn); }
+  #time-control { padding: 12px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  #time-control input[type="range"] { flex: 1; min-width: 180px; accent-color: var(--accent); }
+  #time-control button { background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 6px; width: 34px; height: 30px; cursor: pointer; font-size: 13px; }
+  #time-control button:hover { background: var(--border); }
+  #time-label { font-size: 12px; color: var(--muted); min-width: 240px; text-align: right; font-variant-numeric: tabular-nums; }
   main { display: grid; grid-template-columns: 300px 1fr; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } #bearing-list { max-height: 260px; overflow-y: auto; } }
   #bearing-list { border-right: 1px solid var(--border); }
-  .bearing-row {
-    padding: 14px 20px;
-    border-bottom: 1px solid var(--border);
-    cursor: pointer;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
+  .bearing-row { padding: 14px 20px; border-bottom: 1px solid var(--border); cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
   .bearing-row:hover { background: var(--panel); }
   .bearing-row.selected { background: var(--panel); border-left: 3px solid var(--accent); }
   .bearing-name { display: flex; flex-direction: column; }
   .bearing-name .tag { font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; }
   .tag.verified { color: var(--critical); }
   .tag.unverified { color: var(--muted); }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
-  .badge.high { background: rgba(208,59,59,0.15); color: var(--critical); }
-  .badge.medium { background: rgba(250,178,25,0.15); color: var(--warn); }
-  .badge.low { background: rgba(12,163,12,0.15); color: var(--ok); }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 600; white-space: nowrap; }
+  .badge.critical { background: rgba(208,59,59,0.15); color: var(--critical); }
+  .badge.warning { background: rgba(250,178,25,0.15); color: var(--warn); }
+  .badge.watch { background: rgba(237,161,0,0.15); color: var(--watch); }
+  .badge.healthy { background: rgba(12,163,12,0.15); color: var(--ok); }
+  .badge.insufficient_evidence { background: rgba(139,150,171,0.15); color: var(--muted); }
   #detail { padding: 24px; }
-  .callout {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-left: 3px solid var(--muted);
-    border-radius: 6px;
-    padding: 14px 18px;
-    margin-bottom: 20px;
-    font-size: 13px;
-    line-height: 1.6;
-  }
-  .callout.degrading { border-left-color: var(--critical); }
+  .callout { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--muted); border-radius: 6px; padding: 14px 18px; margin-bottom: 20px; font-size: 13px; line-height: 1.6; }
+  .callout.critical, .callout.warning { border-left-color: var(--critical); }
+  .callout.watch { border-left-color: var(--watch); }
   .callout.healthy { border-left-color: var(--ok); }
   .callout .headline { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
   .stat-row { display: flex; gap: 16px; margin-bottom: 8px; flex-wrap: wrap; }
-  .stat-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; min-width: 170px; }
+  .stat-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; min-width: 170px; flex: 1; }
   .stat-card .label { color: var(--muted); font-size: 12px; }
   .stat-card .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
   .stat-card .sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
   .not-verifiable { color: var(--muted); font-size: 11px; margin: 4px 0 20px; }
   h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 28px 0 12px; }
   .contrib-row { display: flex; align-items: center; margin-bottom: 10px; font-size: 13px; }
-  .contrib-name { width: 110px; color: var(--muted); }
+  .contrib-name { width: 110px; color: var(--muted); cursor: help; border-bottom: 1px dotted var(--muted); }
   .contrib-bar-wrap { flex: 1; background: #0c1120; border-radius: 4px; height: 20px; position: relative; }
   .contrib-bar { position: absolute; top: 0; bottom: 0; border-radius: 4px; }
   .contrib-bar.neg { background: var(--critical); right: 50%; }
   .contrib-bar.pos { background: var(--ok); left: 50%; }
-  .contrib-value { width: 130px; text-align: right; font-variant-numeric: tabular-nums; }
+  .contrib-value { width: 150px; text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; }
+  .recon-note { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .timeline-list { list-style: none; padding: 0; margin: 0; font-size: 13px; }
+  .timeline-list li { padding: 6px 0; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; gap: 12px; }
+  .timeline-list .ev-label { color: var(--muted); }
+  .timeline-list .ev-time { font-variant-numeric: tabular-nums; }
+  .timeline-list .ev-time.unset { color: var(--muted); font-style: italic; }
+  .rec-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; margin-bottom: 8px; }
+  .rec-panel .action { font-size: 17px; font-weight: 600; margin-bottom: 6px; }
+  .rec-panel .disclaimer { color: var(--warn); font-size: 11px; margin-top: 8px; }
+  .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 8px; }
+  @media (max-width: 700px) { .chart-grid { grid-template-columns: 1fr; } }
+  .chart-box { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }
+  .chart-box h3 { font-size: 12px; color: var(--muted); margin: 0 0 8px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .chart-box svg { width: 100%; height: 140px; display: block; }
+  .quality-warning { color: var(--warn); font-size: 11px; margin-top: 6px; }
+  .small-multiples { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 8px; }
+  .small-multiple { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; }
+  .small-multiple h4 { font-size: 11px; color: var(--muted); margin: 0 0 4px; text-transform: uppercase; }
+  .small-multiple svg { width: 100%; height: 70px; display: block; }
+  .export-row { display: flex; gap: 10px; margin: 12px 0 4px; flex-wrap: wrap; }
+  .export-row button { background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px 14px; font-size: 12px; cursor: pointer; }
+  .export-row button:hover { background: var(--border); }
   #trend-section { padding: 24px; border-top: 1px solid var(--border); grid-column: 1 / -1; }
   #trend-legend { display: flex; gap: 20px; margin-bottom: 8px; font-size: 12px; color: var(--muted); }
   .legend-key { display: flex; align-items: center; gap: 6px; }
   .legend-swatch { width: 14px; height: 2px; border-radius: 1px; }
   #trend-chart { width: 100%; height: 220px; display: block; }
-  #trend-tooltip {
-    position: absolute; background: var(--panel); border: 1px solid var(--border);
-    border-radius: 6px; padding: 8px 10px; font-size: 12px; pointer-events: none;
-    display: none; white-space: nowrap;
-  }
   .chart-wrap { position: relative; }
+  .tooltip { position: absolute; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 12px; pointer-events: none; display: none; white-space: nowrap; z-index: 5; }
+  #methodology-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 20; align-items: center; justify-content: center; padding: 20px; }
+  #methodology-modal.open { display: flex; }
+  #methodology-body { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 24px 28px; max-width: 640px; max-height: 80vh; overflow-y: auto; font-size: 13px; line-height: 1.7; }
+  #methodology-body h2 { margin-top: 20px; }
+  #methodology-body h2:first-child { margin-top: 0; }
+  #methodology-close { float: right; background: none; border: none; color: var(--muted); font-size: 18px; cursor: pointer; }
+  .loading, .empty-state { color: var(--muted); padding: 40px; text-align: center; }
+  .error-state { color: var(--critical); padding: 20px; text-align: center; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Predictive Maintenance Studio</h1>
-  <div class="subtitle">NASA/IMS real bearing test-to-failure data &middot; remaining useful life</div>
+  <div>
+    <h1>Predictive Maintenance Studio</h1>
+    <div class="subtitle">NASA/IMS real bearing test-to-failure data &middot; remaining useful life</div>
+  </div>
+  <button id="methodology-btn" onclick="document.getElementById('methodology-modal').classList.add('open')">Methodology &amp; limitations</button>
 </header>
-<div id="profile-bar">Loading dataset profile&hellip;</div>
-<div id="scope-banner">Loading model scope&hellip;</div>
+<div id="profile-bar" class="loading">Loading dataset profile&hellip;</div>
+<div id="scope-banner" class="loading">Loading model scope&hellip;</div>
 <div id="time-control">
-  <span style="font-size:12px; color:var(--muted);">Current time</span>
+  <button id="btn-start" title="Jump to start">|&laquo;</button>
+  <button id="btn-prev" title="Previous snapshot">&lsaquo;</button>
+  <button id="btn-play" title="Play/pause">&#9654;</button>
+  <button id="btn-next" title="Next snapshot">&rsaquo;</button>
+  <button id="btn-end" title="Jump to end">&raquo;|</button>
   <input type="range" id="time-slider" min="0" max="0" value="0" />
   <span id="time-label">&nbsp;</span>
 </div>
 <main>
-  <div id="bearing-list">Loading bearings&hellip;</div>
-  <div id="detail"><div style="color:var(--muted); padding:40px; text-align:center;">Select a bearing to see its prediction and explanation.</div></div>
+  <div id="bearing-list" class="loading">Loading bearings&hellip;</div>
+  <div id="detail"><div class="empty-state">Select a bearing to see its prediction and explanation.</div></div>
   <div id="trend-section">
     <h2 style="margin-top:0;">Bearing 1 &middot; predicted vs. actual RUL across its full life (time-ordered)</h2>
     <div id="trend-legend">
-      <span class="legend-key"><span class="legend-swatch" style="background:var(--series-actual);"></span>Actual RUL (ground truth)</span>
-      <span class="legend-key"><span class="legend-swatch" style="background:var(--series-predicted);"></span>Predicted RUL (model)</span>
+      <span class="legend-key"><span class="legend-swatch" style="background:var(--series-1);"></span>Actual RUL (ground truth)</span>
+      <span class="legend-key"><span class="legend-swatch" style="background:var(--series-2);"></span>Estimated RUL (model)</span>
     </div>
     <div class="chart-wrap">
       <svg id="trend-chart" viewBox="0 0 900 220" preserveAspectRatio="none"></svg>
-      <div id="trend-tooltip"></div>
+      <div id="trend-tooltip" class="tooltip"></div>
     </div>
     <p style="color:var(--muted); font-size:11px; margin-top:8px;">
-      X-axis runs chronologically, oldest to newest. The model behind this chart was fit on the
-      whole trajectory for serving; its backtested accuracy (reported above) comes from a separate
+      X-axis runs chronologically, oldest to newest. The model behind this chart is fit on the whole
+      trajectory for serving; its backtested accuracy (reported above) comes from a separate
       walk-forward evaluation that never lets it see the future during training.
     </p>
   </div>
 </main>
+
+<div id="methodology-modal">
+  <div id="methodology-body">
+    <button id="methodology-close" onclick="document.getElementById('methodology-modal').classList.remove('open')">&times;</button>
+    <div id="methodology-content">Loading&hellip;</div>
+  </div>
+</div>
+
 <script>
 const API = "";
 let timestamps = [];
 let currentIndex = 0;
 let selectedBearing = null;
 let snapshotMinutes = 10;
+let playTimer = null;
+
+const FEATURE_GLOSSARY = {
+  mean: "Average of the raw vibration signal over the snapshot window. Near zero for a healthy bearing.",
+  std: "Standard deviation of the vibration signal &mdash; overall spread/energy of the vibration.",
+  rms: "Root-mean-square amplitude &mdash; the standard vibration-analysis measure of overall vibration energy.",
+  kurtosis: "\"Peakedness\" of the signal distribution. Rises sharply when short, sharp impacts (like a defect impact) appear.",
+  skew: "Asymmetry of the signal distribution around its mean.",
+  peak_to_peak: "Difference between the highest and lowest raw signal value in the window.",
+  crest_factor: "Peak amplitude divided by RMS &mdash; highlights sharp, impulsive events relative to the overall signal energy.",
+};
 
 function fmtRul(snapshots) {
   const hours = (snapshots * snapshotMinutes) / 60;
   return `${snapshots.toFixed(0)} snapshots (~${hours.toFixed(1)}h)`;
 }
-
-function fmtTime(iso) {
-  return iso.replace("T", " ").slice(0, 16);
-}
+function fmtTime(iso) { return iso.replace("T", " ").slice(0, 16); }
+function fmtEventTime(iso) { return iso ? fmtTime(iso) : "not observed"; }
 
 async function loadProfile() {
   const p = await (await fetch(`${API}/api/profile`)).json();
   const bar = document.getElementById("profile-bar");
+  bar.classList.remove("loading");
   bar.innerHTML = `<b>${p.n_bearings}</b> bearings on one motor shaft &middot; <b>${p.n_snapshots}</b> vibration snapshots ` +
     `over <b>${p.recording_span_days}</b> days at <b>${p.sampling_rate_hz.toLocaleString()}</b> Hz &middot; ` +
-    `<b>${p.failed_bearing}</b> failed (${p.failure_mode})`;
+    `<b>${p.failed_bearing}</b> failed (${p.failure_mode}) &middot; ` +
+    `dataset checksum <code>${(p.dataset_metadata && p.dataset_metadata.raw_sha256 || "n/a").slice(0, 12)}&hellip;</code>`;
 
   const m = p.model;
   const banner = document.getElementById("scope-banner");
-  banner.innerHTML = `<b>Model scope:</b> ${m.scope_statement}<br/>` +
-    `Backtested with a chronological walk-forward evaluation (${m.validation_method}, n=${m.n_backtest_points}): ` +
-    `MAE <b>${m.mae_snapshots.toFixed(0)} snapshots (~${m.mae_hours.toFixed(1)}h)</b>, ` +
-    `RMSE <b>${m.rmse_snapshots.toFixed(0)} snapshots (~${m.rmse_hours.toFixed(1)}h)</b>, ` +
-    `asymmetric late-prediction penalty <b>${m.asymmetric_score.toFixed(0)}</b> (mean per point, lower is better, ` +
-    `penalizes over-promising remaining life harder than under-promising it).`;
+  banner.classList.remove("loading");
+  banner.innerHTML = `<b class="warn">Model scope:</b> ${m.scope_statement}<br/>` +
+    `Backtested with a chronological walk-forward evaluation (n=${m.n_backtest_points}): ` +
+    `MAE <b>${fmtRul(m.mae_snapshots)}</b>, RMSE <b>${fmtRul(m.rmse_snapshots)}</b>, median AE <b>${m.median_ae_snapshots.toFixed(0)} snapshots</b> &middot; ` +
+    `beats the fold-mean baseline (MAE ${m.baseline_mae_snapshots.toFixed(0)}): <b>${m.model_beats_baseline_mae ? "yes" : "no"}</b> &middot; ` +
+    `<b class="warn">${m.pct_late_predictions.toFixed(0)}%</b> of backtested predictions were late/dangerous (over-promised life by ` +
+    `~${m.mean_late_magnitude_snapshots.toFixed(0)} snapshots on average).`;
+
+  renderMethodology(p);
+}
+
+function renderMethodology(profile) {
+  const m = profile.model;
+  const dm = profile.dataset_metadata;
+  const el = document.getElementById("methodology-content");
+  el.innerHTML = `
+    <h2 style="margin-top:0;">Dataset</h2>
+    <p>NASA/IMS Bearing Data Set, Test 2 &mdash; real accelerometer recordings from four
+    bearings on one motor shaft, ${profile.n_snapshots} snapshots every 10 minutes over
+    ${profile.recording_span_days} days, until ${profile.failed_bearing} actually failed
+    (${profile.failure_mode}). Source: NASA Prognostics Center of Excellence Data Set
+    Repository. Recorded ${dm ? dm.timestamp_min + " to " + dm.timestamp_max : "n/a"},
+    checksum <code>${dm ? dm.raw_sha256.slice(0, 16) : "n/a"}&hellip;</code>.</p>
+    <h2>Validation methodology</h2>
+    <p>${m.validation_method}, ${m.n_folds} folds. A random split across this single
+    trajectory would leak near-future shape into training, so training only ever uses
+    data strictly earlier than what it's asked to predict.</p>
+    <h2>Uncertainty</h2>
+    <p>${m.interval_note}</p>
+    <h2>Right-censored bearings</h2>
+    <p>Bearings 2-4 never failed during the test. Their RUL estimates are extrapolated
+    beyond the model's one observed failure label and are not independently verifiable.</p>
+    <h2>Scope</h2>
+    <p>${m.scope_statement}</p>
+    <h2>Source</h2>
+    <p><a href="https://github.com/DaCameraGirl/abb-predictive-maintenance-2026" target="_blank" rel="noopener">Repository</a></p>
+  `;
 }
 
 async function loadTimeline() {
@@ -187,17 +241,47 @@ async function loadTimeline() {
   slider.max = t.n_snapshots - 1;
   slider.value = t.default_index;
   currentIndex = t.default_index;
-  slider.addEventListener("input", () => {
-    currentIndex = Number(slider.value);
-    renderSnapshot();
-  });
+  slider.addEventListener("input", () => { stopPlaying(); currentIndex = Number(slider.value); renderSnapshot(); });
+
+  document.getElementById("btn-start").onclick = () => { stopPlaying(); currentIndex = 0; syncSlider(); };
+  document.getElementById("btn-end").onclick = () => { stopPlaying(); currentIndex = timestamps.length - 1; syncSlider(); };
+  document.getElementById("btn-prev").onclick = () => { stopPlaying(); step(-1); };
+  document.getElementById("btn-next").onclick = () => { stopPlaying(); step(1); };
+  document.getElementById("btn-play").onclick = togglePlay;
+
   renderSnapshot();
 }
 
+function syncSlider() { document.getElementById("time-slider").value = currentIndex; renderSnapshot(); }
+function step(delta) {
+  currentIndex = Math.max(0, Math.min(timestamps.length - 1, currentIndex + delta));
+  syncSlider();
+}
+function togglePlay() {
+  const btn = document.getElementById("btn-play");
+  if (playTimer) { stopPlaying(); return; }
+  btn.innerHTML = "&#10074;&#10074;";
+  playTimer = setInterval(() => {
+    if (currentIndex >= timestamps.length - 1) { stopPlaying(); return; }
+    step(1);
+  }, 400);
+}
+function stopPlaying() {
+  if (playTimer) { clearInterval(playTimer); playTimer = null; document.getElementById("btn-play").innerHTML = "&#9654;"; }
+}
+
 async function renderSnapshot() {
-  document.getElementById("time-label").textContent = fmtTime(timestamps[currentIndex]);
-  const snap = await (await fetch(`${API}/api/snapshot/${currentIndex}`)).json();
+  document.getElementById("time-label").textContent =
+    `${fmtTime(timestamps[currentIndex])} · snapshot ${currentIndex + 1} of ${timestamps.length}`;
+  let snap;
+  try {
+    snap = await (await fetch(`${API}/api/snapshot/${currentIndex}`)).json();
+  } catch (e) {
+    document.getElementById("bearing-list").innerHTML = `<div class="error-state">Failed to load snapshot data.</div>`;
+    return;
+  }
   const list = document.getElementById("bearing-list");
+  list.classList.remove("loading");
   const sorted = [...snap.bearings].sort((a, b) => a.predicted_rul - b.predicted_rul);
   list.innerHTML = "";
   for (const b of sorted) {
@@ -207,7 +291,7 @@ async function renderSnapshot() {
       ? `<span class="tag verified">real failure trajectory</span>`
       : `<span class="tag unverified">no failure observed &middot; extrapolated</span>`;
     row.innerHTML = `<span class="bearing-name"><span>${b.bearing.replace("_", " ")}</span>${tag}</span>` +
-      `<span class="badge ${b.risk}">~${b.predicted_rul.toFixed(0)} snapshots</span>`;
+      `<span class="badge ${b.health_state}">${b.health_state.replace("_", " ")}</span>`;
     row.onclick = () => { selectedBearing = b.bearing; renderSnapshot(); renderDetail(); };
     list.appendChild(row);
   }
@@ -215,65 +299,200 @@ async function renderSnapshot() {
   renderDetail();
 }
 
-async function renderDetail() {
-  const d = await (await fetch(`${API}/api/snapshot/${currentIndex}/bearing/${selectedBearing}`)).json();
-  const detail = document.getElementById("detail");
-  const maxAbs = Math.max(...d.top_contributors.map(c => Math.abs(c.shap_value)), 1e-6);
-  const rows = d.top_contributors.map(c => {
-    const pct = (Math.abs(c.shap_value) / maxAbs) * 50;
-    const cls = c.shap_value < 0 ? "neg" : "pos";
-    const hrs = (c.shap_value * snapshotMinutes) / 60;
-    return `<div class="contrib-row">
-      <div class="contrib-name">${c.feature}</div>
-      <div class="contrib-bar-wrap"><div class="contrib-bar ${cls}" style="width:${pct}%"></div></div>
-      <div class="contrib-value">${c.shap_value > 0 ? "+" : ""}${c.shap_value.toFixed(1)} snap (${hrs > 0 ? "+" : ""}${hrs.toFixed(1)}h)</div>
-    </div>`;
-  }).join("");
+function eventTimelineHtml(events) {
+  const labels = {
+    baseline_established: "Baseline established",
+    first_persistent_anomaly: "First persistent anomaly",
+    warning_threshold_crossed: "Warning threshold crossed",
+    critical_threshold_crossed: "Critical threshold crossed",
+  };
+  return `<ul class="timeline-list">` + Object.entries(labels).map(([key, label]) =>
+    `<li><span class="ev-label">${label}</span><span class="ev-time ${events[key] ? "" : "unset"}">${fmtEventTime(events[key])}</span></li>`
+  ).join("") + `</ul>`;
+}
 
-  const degradeClass = d.is_degrading ? "degrading" : "healthy";
-  const degradeHeadline = d.is_degrading
-    ? `Degrading &mdash; ${d.confidence} confidence`
-    : `No significant deviation from healthy baseline`;
+async function renderDetail() {
+  const detailEl = document.getElementById("detail");
+  let d;
+  try {
+    d = await (await fetch(`${API}/api/snapshot/${currentIndex}/bearing/${selectedBearing}`)).json();
+  } catch (e) {
+    detailEl.innerHTML = `<div class="error-state">Failed to load bearing detail.</div>`;
+    return;
+  }
+
+  const stateLabel = d.health_state.replace("_", " ");
+  const spikeNote = d.is_spike ? " (this reading looks like an isolated spike, not yet a sustained trend)" : "";
+  const deviationText = d.deviation_z === null
+    ? "not enough history yet to establish this bearing's healthy baseline"
+    : `smoothed deviation from this bearing's own healthy baseline: <b>${d.smoothed_z.toFixed(1)}&sigma;</b> (instantaneous: ${d.deviation_z.toFixed(1)}&sigma;), largest single contributor: <b>${d.top_feature}</b>${spikeNote}`;
 
   let claimBlock;
   if (d.has_ground_truth) {
     claimBlock = `
       <div class="stat-row">
-        <div class="stat-card"><div class="label">Predicted RUL</div><div class="value">~${d.predicted_rul.toFixed(0)}</div><div class="sub">${fmtRul(d.predicted_rul)} &middot; 80% range ${d.interval_80.low.toFixed(0)}&ndash;${d.interval_80.high.toFixed(0)} snapshots</div></div>
+        <div class="stat-card"><div class="label">Estimated RUL</div><div class="value">~${d.predicted_rul.toFixed(0)}</div><div class="sub">${fmtRul(d.predicted_rul)} &middot; 80% range ${d.interval_80.low.toFixed(0)}&ndash;${d.interval_80.high.toFixed(0)} snapshots</div></div>
         <div class="stat-card"><div class="label">Actual RUL (ground truth)</div><div class="value">${d.true_rul}</div><div class="sub">${fmtRul(d.true_rul)} &middot; known from recorded failure time</div></div>
-        <div class="stat-card"><div class="label">Average model output</div><div class="value">${d.average_model_output.toFixed(0)}</div><div class="sub">${fmtRul(d.average_model_output)} &middot; SHAP contributions below move the prediction away from this</div></div>
+        <div class="stat-card"><div class="label">Average model output</div><div class="value">${d.average_model_output != null ? d.average_model_output.toFixed(0) : "n/a"}</div><div class="sub">${d.average_model_output != null ? fmtRul(d.average_model_output) : ""} &middot; SHAP contributions below move the estimate away from this model average</div></div>
       </div>
-      <p class="not-verifiable">This is the one bearing with a confirmed real failure (${d.failure_mode}), so the point estimate can be checked against ground truth &mdash; still a separate, less certain claim than the degradation status above.</p>
+      <p class="not-verifiable">This is the one bearing with a confirmed real failure (${d.failure_mode}), so the estimate can be checked against ground truth &mdash; still a separate, less certain claim than the degradation status above.</p>
     `;
   } else {
     claimBlock = `
       <div class="stat-row">
-        <div class="stat-card"><div class="label">Model estimate</div><div class="value">~${d.predicted_rul.toFixed(0)}</div><div class="sub">${fmtRul(d.predicted_rul)} &middot; 80% range ${d.interval_80.low.toFixed(0)}&ndash;${d.interval_80.high.toFixed(0)} snapshots</div></div>
-        <div class="stat-card"><div class="label">Average model output</div><div class="value">${d.average_model_output.toFixed(0)}</div><div class="sub">${fmtRul(d.average_model_output)} &middot; SHAP contributions below move the prediction away from this</div></div>
+        <div class="stat-card"><div class="label">Model estimate (extrapolated)</div><div class="value">~${d.predicted_rul.toFixed(0)}</div><div class="sub">${fmtRul(d.predicted_rul)} &middot; 80% range ${d.interval_80.low.toFixed(0)}&ndash;${d.interval_80.high.toFixed(0)} snapshots</div></div>
+        <div class="stat-card"><div class="label">Average model output</div><div class="value">${d.average_model_output != null ? d.average_model_output.toFixed(0) : "n/a"}</div><div class="sub">${d.average_model_output != null ? fmtRul(d.average_model_output) : ""} &middot; SHAP contributions below move the estimate away from this model average</div></div>
       </div>
-      <p class="not-verifiable">Recording ended while this bearing was still running &mdash; no failure was observed, so this estimate is extrapolated beyond the model's only observed failure label and is not independently verifiable.</p>
+      <p class="not-verifiable"><b>No failure observed</b> &mdash; recording ended while this bearing was still running. This estimate is extrapolated beyond the model's only observed failure label and is <b>not independently verifiable</b>.</p>
     `;
   }
 
-  detail.innerHTML = `
-    <div class="callout ${degradeClass}">
-      <div class="headline">${d.bearing.replace("_", " ")} &mdash; ${degradeHeadline}</div>
-      <div>Deviation from this bearing's own healthy baseline: <b>${d.deviation_z.toFixed(1)}&sigma;</b>.
-      This is a separate statistical check, independent of the RUL regression below, and is generally more
-      reliable than any specific remaining-life number.</div>
+  const shapSection = d.shap_unavailable
+    ? `<p class="not-verifiable">SHAP explanation unavailable for this snapshot &mdash; showing the estimate only.</p>`
+    : (() => {
+        const maxAbs = Math.max(...d.top_contributors.map(c => Math.abs(c.shap_value)), 1e-6);
+        const rows = d.top_contributors.map(c => {
+          const pct = (Math.abs(c.shap_value) / maxAbs) * 50;
+          const cls = c.shap_value < 0 ? "neg" : "pos";
+          const hrs = (c.shap_value * snapshotMinutes) / 60;
+          return `<div class="contrib-row">
+            <div class="contrib-name" title="${FEATURE_GLOSSARY[c.feature] || ""}">${c.feature}</div>
+            <div class="contrib-bar-wrap"><div class="contrib-bar ${cls}" style="width:${pct}%"></div></div>
+            <div class="contrib-value">${c.shap_value > 0 ? "+" : ""}${c.shap_value.toFixed(1)} snap (${hrs > 0 ? "+" : ""}${hrs.toFixed(1)}h)</div>
+          </div>`;
+        }).join("");
+        const recon = d.reconciliation;
+        const reconNote = recon
+          ? `<div class="recon-note">${recon.within_tolerance ? "✓" : "⚠"} average model output + SHAP contributions = ${recon.base_value_plus_shap_sum.toFixed(2)} vs. model output ${recon.model_output.toFixed(2)} (difference ${recon.difference.toFixed(4)})</div>`
+          : "";
+        return `${rows}${reconNote}`;
+      })();
+
+  detailEl.innerHTML = `
+    <div class="callout ${d.health_state}">
+      <div class="headline">${d.bearing.replace("_", " ")} &mdash; ${stateLabel}</div>
+      <div>${deviationText}. This is a separate statistical check, independent of the RUL regression below, and is generally more reliable than any specific remaining-life number.</div>
     </div>
+
+    <div class="rec-panel">
+      <div class="action">Recommended action: ${d.recommendation.action_label}</div>
+      <div>${d.recommendation.evidence}</div>
+      <div class="disclaimer">${d.recommendation.disclaimer}</div>
+    </div>
+
     ${claimBlock}
-    <h2>Why this ${d.has_ground_truth ? "prediction" : "estimate"} (SHAP)</h2>
-    ${rows}
+
+    <h2>Event timeline</h2>
+    ${eventTimelineHtml(d.event_timeline)}
+
+    <h2>Why this ${d.has_ground_truth ? "estimate" : "estimate"} (SHAP)</h2>
+    ${shapSection}
     <p style="color:var(--muted); font-size:12px; margin-top:16px;">
-      Red bars push RUL down, green bars push it up, both shown in snapshots and hours. Values are
-      vibration-analysis statistics (RMS, kurtosis, etc.) computed from the real accelerometer reading
-      at this snapshot.
+      Red bars push RUL down, green bars push it up, both shown in snapshots and hours. SHAP explains
+      the <em>model's</em> prediction, not the physical cause of wear. Hover a feature name for its definition.
     </p>
+
+    <h2>Vibration analysis (this snapshot)</h2>
+    <div class="chart-grid" id="vibration-charts"><div class="loading">Loading waveform&hellip;</div></div>
+
+    <h2>Feature trends across observed life</h2>
+    <div class="small-multiples" id="feature-trends"><div class="loading">Loading trends&hellip;</div></div>
+
+    <div class="export-row">
+      <button id="export-json">Download this prediction as JSON</button>
+      <a href="${API}/api/export/trajectory/${d.bearing}.csv" download><button type="button">Download full trajectory as CSV</button></a>
+    </div>
+  `;
+
+  document.getElementById("export-json").onclick = () => {
+    const blob = new Blob([JSON.stringify(d, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `${d.bearing}_snapshot_${currentIndex}_prediction.json`;
+    a.click();
+  };
+
+  loadVibrationCharts(selectedBearing, currentIndex);
+  loadFeatureTrends(selectedBearing);
+}
+
+// --- vibration analysis: time-domain waveform + FFT spectrum ---
+async function loadVibrationCharts(bearing, index) {
+  const container = document.getElementById("vibration-charts");
+  let w;
+  try {
+    const resp = await fetch(`${API}/api/waveform/${index}/bearing/${bearing}`);
+    if (resp.status === 503) {
+      container.innerHTML = `<div class="empty-state">Waveform data not available on this deployment.</div>`;
+      return;
+    }
+    w = await resp.json();
+  } catch (e) {
+    container.innerHTML = `<div class="error-state">Failed to load waveform.</div>`;
+    return;
+  }
+  container.innerHTML = `
+    <div class="chart-box"><h3>Time-domain waveform</h3><svg id="waveform-svg" viewBox="0 0 400 140" preserveAspectRatio="none"></svg></div>
+    <div class="chart-box"><h3>Frequency spectrum (FFT)</h3><svg id="fft-svg" viewBox="0 0 400 140" preserveAspectRatio="none"></svg>
+      ${w.quality_warnings.length ? `<div class="quality-warning">${w.quality_warnings.join("; ")}</div>` : ""}
+    </div>
+  `;
+  drawLine("waveform-svg", w.time_domain.time_s, w.time_domain.amplitude, "var(--series-1)");
+  drawLine("fft-svg", w.fft.freq_hz, w.fft.magnitude, "var(--series-2)");
+}
+
+function drawLine(svgId, xs, ys, color) {
+  const svg = document.getElementById(svgId);
+  const W = 400, H = 140, pad = 6;
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const range = maxY - minY || 1;
+  const x = i => pad + (i / (xs.length - 1)) * (W - 2 * pad);
+  const y = v => H - pad - ((v - minY) / range) * (H - 2 * pad);
+  const step = Math.max(1, Math.floor(xs.length / 400));
+  let d = "";
+  for (let i = 0; i < xs.length; i += step) {
+    d += `${d ? "L" : "M"} ${x(i)} ${y(ys[i])} `;
+  }
+  svg.innerHTML = `<path d="${d}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>`;
+}
+
+// --- feature trends: small multiples, one per feature, each its own scale ---
+async function loadFeatureTrends(bearing) {
+  const container = document.getElementById("feature-trends");
+  let data;
+  try {
+    data = await (await fetch(`${API}/api/feature-trend/${bearing}`)).json();
+  } catch (e) {
+    container.innerHTML = `<div class="error-state">Failed to load feature trends.</div>`;
+    return;
+  }
+  const features = Object.keys(FEATURE_GLOSSARY);
+  container.innerHTML = features.map(f =>
+    `<div class="small-multiple" title="${FEATURE_GLOSSARY[f]}"><h4>${f}</h4><svg id="trend-${f}" viewBox="0 0 200 70" preserveAspectRatio="none"></svg></div>`
+  ).join("");
+  for (const f of features) {
+    const values = data.points.map(p => p[f]);
+    drawSmallMultiple(`trend-${f}`, values, data.baseline_snapshots);
+  }
+}
+
+function drawSmallMultiple(svgId, values, baselineN) {
+  const svg = document.getElementById(svgId);
+  const W = 200, H = 70, pad = 4;
+  const minY = Math.min(...values), maxY = Math.max(...values);
+  const range = maxY - minY || 1;
+  const x = i => pad + (i / (values.length - 1)) * (W - 2 * pad);
+  const y = v => H - pad - ((v - minY) / range) * (H - 2 * pad);
+  const baselineX = Math.min(W - pad, pad + (baselineN / values.length) * (W - 2 * pad));
+  let d = "";
+  values.forEach((v, i) => { d += `${i === 0 ? "M" : "L"} ${x(i)} ${y(v)} `; });
+  svg.innerHTML = `
+    <rect x="0" y="0" width="${baselineX}" height="${H}" fill="var(--series-1)" opacity="0.08"/>
+    <path d="${d}" fill="none" stroke="var(--series-1)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
   `;
 }
 
-// --- trend chart ---
+// --- bearing 1 trend chart ---
 function buildTrendChart(points) {
   const svg = document.getElementById("trend-chart");
   const W = 900, H = 220, padL = 40, padR = 10, padT = 10, padB = 24;
@@ -292,11 +511,7 @@ function buildTrendChart(points) {
     return `<path d="${d}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
   };
 
-  svg.innerHTML = `
-    ${gridlines}
-    ${linePath("true_rul", "var(--series-actual)")}
-    ${linePath("predicted_rul", "var(--series-predicted)")}
-  `;
+  svg.innerHTML = `${gridlines}${linePath("true_rul", "var(--series-1)")}${linePath("predicted_rul", "var(--series-2)")}`;
 
   const tooltip = document.getElementById("trend-tooltip");
   svg.addEventListener("mousemove", (e) => {
@@ -308,7 +523,7 @@ function buildTrendChart(points) {
     tooltip.style.display = "block";
     tooltip.style.left = `${e.clientX - rect.left + 12}px`;
     tooltip.style.top = `${e.clientY - rect.top - 10}px`;
-    tooltip.innerHTML = `<div>${fmtTime(p.timestamp)}</div><div style="color:var(--series-actual)">actual: ${fmtRul(p.true_rul)}</div><div style="color:var(--series-predicted)">predicted: ${fmtRul(p.predicted_rul)}</div>`;
+    tooltip.innerHTML = `<div>${fmtTime(p.timestamp)}</div><div style="color:var(--series-1)">actual: ${fmtRul(p.true_rul)}</div><div style="color:var(--series-2)">estimated: ${fmtRul(p.predicted_rul)}</div>`;
   });
   svg.addEventListener("mouseleave", () => { tooltip.style.display = "none"; });
 }

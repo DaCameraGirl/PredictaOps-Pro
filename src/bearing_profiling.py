@@ -31,6 +31,17 @@ def degradation_trends(df: pd.DataFrame) -> pd.Series:
     )
 
 
+def feature_trend(df: pd.DataFrame, bearing: str, max_points: int = 200) -> list[dict]:
+    """Downsampled per-feature time series for one bearing's whole observed life."""
+    sub = df[df["bearing"] == bearing].sort_values("timestamp")
+    step = max(1, len(sub) // max_points)
+    sampled = sub.iloc[::step]
+    return [
+        {"timestamp": row["timestamp"].isoformat(), **{f: float(row[f]) for f in FEATURE_NAMES}}
+        for _, row in sampled.iterrows()
+    ]
+
+
 def summarize(df: pd.DataFrame) -> dict:
     trends = degradation_trends(df)
     span = df["timestamp"].max() - df["timestamp"].min()

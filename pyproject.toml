@@ -1,0 +1,12 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# DTZ (naive-datetime) deliberately not selected: the dataset's timestamps have no
+# recorded timezone (2004 lab bench data) — tagging them tz-aware would fabricate
+# information we don't have.
+select = ["E", "F", "I", "B", "UP", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
