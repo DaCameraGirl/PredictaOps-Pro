@@ -17,17 +17,30 @@ prediction with SHAP, and serves both through a dashboard.
 - **Model** (`src/train_bearing.py`): XGBoost regressor trained on bearing
   1, the one bearing that actually failed (outer race defect) during the
   test. RUL is clipped at 400 snapshots since the vibration signal stays
-  flat for roughly the first 600 snapshots of this bearing's life. Because
-  there's only one real failure trajectory (not 100 independent engines
-  like a simulated dataset would give you), validation holds out a random
-  slice of snapshots from across that trajectory rather than a held-out
-  unit — see the comment in `train_bearing.py` for why.
+  flat for roughly the first 600 snapshots of this bearing's life.
+  Validated with a chronological, expanding-window walk-forward backtest
+  (train only on the past, predict the next block, roll forward) since
+  there's only one real failure trajectory to learn from and a random
+  split across it would leak near-future shape into training. Reports
+  MAE/RMSE in snapshots and hours, plus an asymmetric score that
+  penalizes late (over-optimistic) predictions harder than early ones.
+  The model actually served by the app is refit on the full trajectory
+  afterward, same as a real deployment would use all history collected
+  so far — see `train_bearing.py` for the reasoning.
+- **Degradation signal** (`src/degradation_signal.py`): a separate,
+  simpler statistical check (deviation from each bearing's own healthy
+  baseline) for "is this degrading at all," kept independent from the
+  RUL regression's point estimate, since the two claims have very
+  different reliability.
 - **Explainability** (`src/explain_bearing.py`): SHAP TreeExplainer,
   returns the top vibration features driving each bearing's prediction.
 - **API + dashboard** (`app/`): FastAPI backend, single-page dashboard
-  with a time slider over the ~7-day test, a live 4-bearing risk list, a
-  per-bearing SHAP breakdown, and a predicted-vs-actual RUL trend chart
-  for bearing 1's whole life.
+  with a time slider over the ~7-day test, a live 4-bearing risk list
+  with 80% prediction intervals, a per-bearing SHAP breakdown, and a
+  time-ordered predicted-vs-actual RUL trend chart for bearing 1's whole
+  life. Bearings 2-4 never failed during the test, so their estimates are
+  explicitly labeled as extrapolated and not independently verifiable,
+  never presented as known values.
 
 ## Run it
 

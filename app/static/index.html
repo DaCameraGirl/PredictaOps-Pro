@@ -25,10 +25,7 @@
     background: var(--bg);
     color: var(--text);
   }
-  header {
-    padding: 16px 24px;
-    border-bottom: 1px solid var(--border);
-  }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--border); }
   header h1 { font-size: 18px; margin: 0; }
   header .subtitle { color: var(--muted); font-size: 13px; }
   #profile-bar {
@@ -38,6 +35,15 @@
     border-bottom: 1px solid var(--border);
   }
   #profile-bar b { color: var(--text); }
+  #scope-banner {
+    padding: 10px 24px;
+    font-size: 12px;
+    color: var(--muted);
+    background: rgba(250,178,25,0.06);
+    border-bottom: 1px solid var(--border);
+    line-height: 1.5;
+  }
+  #scope-banner b { color: var(--warn); }
   #time-control {
     padding: 12px 24px;
     border-bottom: 1px solid var(--border);
@@ -47,10 +53,7 @@
   }
   #time-control input[type="range"] { flex: 1; accent-color: var(--accent); }
   #time-label { font-size: 13px; color: var(--muted); min-width: 210px; text-align: right; font-variant-numeric: tabular-nums; }
-  main {
-    display: grid;
-    grid-template-columns: 300px 1fr;
-  }
+  main { display: grid; grid-template-columns: 300px 1fr; }
   #bearing-list { border-right: 1px solid var(--border); }
   .bearing-row {
     padding: 14px 20px;
@@ -63,27 +66,33 @@
   .bearing-row:hover { background: var(--panel); }
   .bearing-row.selected { background: var(--panel); border-left: 3px solid var(--accent); }
   .bearing-name { display: flex; flex-direction: column; }
-  .bearing-name .failed-tag { font-size: 10px; color: var(--critical); text-transform: uppercase; letter-spacing: 0.03em; }
-  .badge {
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 10px;
-    font-weight: 600;
-  }
+  .bearing-name .tag { font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; }
+  .tag.verified { color: var(--critical); }
+  .tag.unverified { color: var(--muted); }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
   .badge.high { background: rgba(208,59,59,0.15); color: var(--critical); }
   .badge.medium { background: rgba(250,178,25,0.15); color: var(--warn); }
   .badge.low { background: rgba(12,163,12,0.15); color: var(--ok); }
   #detail { padding: 24px; }
-  .stat-row { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
-  .stat-card {
+  .callout {
     background: var(--panel);
     border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 16px 20px;
-    min-width: 150px;
+    border-left: 3px solid var(--muted);
+    border-radius: 6px;
+    padding: 14px 18px;
+    margin-bottom: 20px;
+    font-size: 13px;
+    line-height: 1.6;
   }
+  .callout.degrading { border-left-color: var(--critical); }
+  .callout.healthy { border-left-color: var(--ok); }
+  .callout .headline { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+  .stat-row { display: flex; gap: 16px; margin-bottom: 8px; flex-wrap: wrap; }
+  .stat-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; min-width: 170px; }
   .stat-card .label { color: var(--muted); font-size: 12px; }
-  .stat-card .value { font-size: 28px; font-weight: 600; margin-top: 4px; }
+  .stat-card .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+  .stat-card .sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .not-verifiable { color: var(--muted); font-size: 11px; margin: 4px 0 20px; }
   h2 { font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 28px 0 12px; }
   .contrib-row { display: flex; align-items: center; margin-bottom: 10px; font-size: 13px; }
   .contrib-name { width: 110px; color: var(--muted); }
@@ -91,7 +100,7 @@
   .contrib-bar { position: absolute; top: 0; bottom: 0; border-radius: 4px; }
   .contrib-bar.neg { background: var(--critical); right: 50%; }
   .contrib-bar.pos { background: var(--ok); left: 50%; }
-  .contrib-value { width: 80px; text-align: right; font-variant-numeric: tabular-nums; }
+  .contrib-value { width: 130px; text-align: right; font-variant-numeric: tabular-nums; }
   #trend-section { padding: 24px; border-top: 1px solid var(--border); grid-column: 1 / -1; }
   #trend-legend { display: flex; gap: 20px; margin-bottom: 8px; font-size: 12px; color: var(--muted); }
   .legend-key { display: flex; align-items: center; gap: 6px; }
@@ -111,6 +120,7 @@
   <div class="subtitle">NASA/IMS real bearing test-to-failure data &middot; remaining useful life</div>
 </header>
 <div id="profile-bar">Loading dataset profile&hellip;</div>
+<div id="scope-banner">Loading model scope&hellip;</div>
 <div id="time-control">
   <span style="font-size:12px; color:var(--muted);">Current time</span>
   <input type="range" id="time-slider" min="0" max="0" value="0" />
@@ -120,7 +130,7 @@
   <div id="bearing-list">Loading bearings&hellip;</div>
   <div id="detail"><div style="color:var(--muted); padding:40px; text-align:center;">Select a bearing to see its prediction and explanation.</div></div>
   <div id="trend-section">
-    <h2 style="margin-top:0;">Bearing 1 &middot; predicted vs. actual RUL across its full life</h2>
+    <h2 style="margin-top:0;">Bearing 1 &middot; predicted vs. actual RUL across its full life (time-ordered)</h2>
     <div id="trend-legend">
       <span class="legend-key"><span class="legend-swatch" style="background:var(--series-actual);"></span>Actual RUL (ground truth)</span>
       <span class="legend-key"><span class="legend-swatch" style="background:var(--series-predicted);"></span>Predicted RUL (model)</span>
@@ -129,6 +139,11 @@
       <svg id="trend-chart" viewBox="0 0 900 220" preserveAspectRatio="none"></svg>
       <div id="trend-tooltip"></div>
     </div>
+    <p style="color:var(--muted); font-size:11px; margin-top:8px;">
+      X-axis runs chronologically, oldest to newest. The model behind this chart was fit on the
+      whole trajectory for serving; its backtested accuracy (reported above) comes from a separate
+      walk-forward evaluation that never lets it see the future during training.
+    </p>
   </div>
 </main>
 <script>
@@ -136,6 +151,16 @@ const API = "";
 let timestamps = [];
 let currentIndex = 0;
 let selectedBearing = null;
+let snapshotMinutes = 10;
+
+function fmtRul(snapshots) {
+  const hours = (snapshots * snapshotMinutes) / 60;
+  return `${snapshots.toFixed(0)} snapshots (~${hours.toFixed(1)}h)`;
+}
+
+function fmtTime(iso) {
+  return iso.replace("T", " ").slice(0, 16);
+}
 
 async function loadProfile() {
   const p = await (await fetch(`${API}/api/profile`)).json();
@@ -143,11 +168,21 @@ async function loadProfile() {
   bar.innerHTML = `<b>${p.n_bearings}</b> bearings on one motor shaft &middot; <b>${p.n_snapshots}</b> vibration snapshots ` +
     `over <b>${p.recording_span_days}</b> days at <b>${p.sampling_rate_hz.toLocaleString()}</b> Hz &middot; ` +
     `<b>${p.failed_bearing}</b> failed (${p.failure_mode})`;
+
+  const m = p.model;
+  const banner = document.getElementById("scope-banner");
+  banner.innerHTML = `<b>Model scope:</b> ${m.scope_statement}<br/>` +
+    `Backtested with a chronological walk-forward evaluation (${m.validation_method}, n=${m.n_backtest_points}): ` +
+    `MAE <b>${m.mae_snapshots.toFixed(0)} snapshots (~${m.mae_hours.toFixed(1)}h)</b>, ` +
+    `RMSE <b>${m.rmse_snapshots.toFixed(0)} snapshots (~${m.rmse_hours.toFixed(1)}h)</b>, ` +
+    `asymmetric late-prediction penalty <b>${m.asymmetric_score.toFixed(0)}</b> (mean per point, lower is better, ` +
+    `penalizes over-promising remaining life harder than under-promising it).`;
 }
 
 async function loadTimeline() {
   const t = await (await fetch(`${API}/api/timeline`)).json();
   timestamps = t.timestamps;
+  snapshotMinutes = t.snapshot_minutes;
   const slider = document.getElementById("time-slider");
   slider.max = t.n_snapshots - 1;
   slider.value = t.default_index;
@@ -159,10 +194,6 @@ async function loadTimeline() {
   renderSnapshot();
 }
 
-function fmtTime(iso) {
-  return iso.replace("T", " ").slice(0, 16);
-}
-
 async function renderSnapshot() {
   document.getElementById("time-label").textContent = fmtTime(timestamps[currentIndex]);
   const snap = await (await fetch(`${API}/api/snapshot/${currentIndex}`)).json();
@@ -172,9 +203,11 @@ async function renderSnapshot() {
   for (const b of sorted) {
     const row = document.createElement("div");
     row.className = "bearing-row" + (b.bearing === selectedBearing ? " selected" : "");
-    const truth = b.has_ground_truth ? `<span class="failed-tag">real failure trajectory</span>` : `<span class="failed-tag" style="color:var(--muted);">no ground truth (still healthy)</span>`;
-    row.innerHTML = `<span class="bearing-name"><span>${b.bearing.replace("_", " ")}</span>${truth}</span>` +
-      `<span class="badge ${b.risk}">${b.predicted_rul} left</span>`;
+    const tag = b.has_ground_truth
+      ? `<span class="tag verified">real failure trajectory</span>`
+      : `<span class="tag unverified">no failure observed &middot; extrapolated</span>`;
+    row.innerHTML = `<span class="bearing-name"><span>${b.bearing.replace("_", " ")}</span>${tag}</span>` +
+      `<span class="badge ${b.risk}">~${b.predicted_rul.toFixed(0)} snapshots</span>`;
     row.onclick = () => { selectedBearing = b.bearing; renderSnapshot(); renderDetail(); };
     list.appendChild(row);
   }
@@ -189,25 +222,53 @@ async function renderDetail() {
   const rows = d.top_contributors.map(c => {
     const pct = (Math.abs(c.shap_value) / maxAbs) * 50;
     const cls = c.shap_value < 0 ? "neg" : "pos";
+    const hrs = (c.shap_value * snapshotMinutes) / 60;
     return `<div class="contrib-row">
       <div class="contrib-name">${c.feature}</div>
       <div class="contrib-bar-wrap"><div class="contrib-bar ${cls}" style="width:${pct}%"></div></div>
-      <div class="contrib-value">${c.shap_value > 0 ? "+" : ""}${c.shap_value.toFixed(1)}</div>
+      <div class="contrib-value">${c.shap_value > 0 ? "+" : ""}${c.shap_value.toFixed(1)} snap (${hrs > 0 ? "+" : ""}${hrs.toFixed(1)}h)</div>
     </div>`;
   }).join("");
 
+  const degradeClass = d.is_degrading ? "degrading" : "healthy";
+  const degradeHeadline = d.is_degrading
+    ? `Degrading &mdash; ${d.confidence} confidence`
+    : `No significant deviation from healthy baseline`;
+
+  let claimBlock;
+  if (d.has_ground_truth) {
+    claimBlock = `
+      <div class="stat-row">
+        <div class="stat-card"><div class="label">Predicted RUL</div><div class="value">~${d.predicted_rul.toFixed(0)}</div><div class="sub">${fmtRul(d.predicted_rul)} &middot; 80% range ${d.interval_80.low.toFixed(0)}&ndash;${d.interval_80.high.toFixed(0)} snapshots</div></div>
+        <div class="stat-card"><div class="label">Actual RUL (ground truth)</div><div class="value">${d.true_rul}</div><div class="sub">${fmtRul(d.true_rul)} &middot; known from recorded failure time</div></div>
+        <div class="stat-card"><div class="label">Average model output</div><div class="value">${d.average_model_output.toFixed(0)}</div><div class="sub">${fmtRul(d.average_model_output)} &middot; SHAP contributions below move the prediction away from this</div></div>
+      </div>
+      <p class="not-verifiable">This is the one bearing with a confirmed real failure (${d.failure_mode}), so the point estimate can be checked against ground truth &mdash; still a separate, less certain claim than the degradation status above.</p>
+    `;
+  } else {
+    claimBlock = `
+      <div class="stat-row">
+        <div class="stat-card"><div class="label">Model estimate</div><div class="value">~${d.predicted_rul.toFixed(0)}</div><div class="sub">${fmtRul(d.predicted_rul)} &middot; 80% range ${d.interval_80.low.toFixed(0)}&ndash;${d.interval_80.high.toFixed(0)} snapshots</div></div>
+        <div class="stat-card"><div class="label">Average model output</div><div class="value">${d.average_model_output.toFixed(0)}</div><div class="sub">${fmtRul(d.average_model_output)} &middot; SHAP contributions below move the prediction away from this</div></div>
+      </div>
+      <p class="not-verifiable">Recording ended while this bearing was still running &mdash; no failure was observed, so this estimate is extrapolated beyond the model's only observed failure label and is not independently verifiable.</p>
+    `;
+  }
+
   detail.innerHTML = `
-    <div class="stat-row">
-      <div class="stat-card"><div class="label">Bearing</div><div class="value">${d.bearing.replace("_", " ")}</div></div>
-      <div class="stat-card"><div class="label">Predicted RUL (snapshots)</div><div class="value">${d.predicted_rul.toFixed(0)}</div></div>
-      <div class="stat-card"><div class="label">Trained-model baseline</div><div class="value">${d.base_value.toFixed(0)}</div></div>
+    <div class="callout ${degradeClass}">
+      <div class="headline">${d.bearing.replace("_", " ")} &mdash; ${degradeHeadline}</div>
+      <div>Deviation from this bearing's own healthy baseline: <b>${d.deviation_z.toFixed(1)}&sigma;</b>.
+      This is a separate statistical check, independent of the RUL regression below, and is generally more
+      reliable than any specific remaining-life number.</div>
     </div>
-    <h2>Why this prediction (SHAP)</h2>
+    ${claimBlock}
+    <h2>Why this ${d.has_ground_truth ? "prediction" : "estimate"} (SHAP)</h2>
     ${rows}
     <p style="color:var(--muted); font-size:12px; margin-top:16px;">
-      Red bars push RUL down, green bars push it up. Values are vibration-analysis statistics
-      (RMS, kurtosis, etc.) computed from the real accelerometer reading at this snapshot.
-      ${d.failure_mode ? `This bearing's real failure mode was: <b>${d.failure_mode}</b>.` : "This bearing never failed during the test, so there's no ground truth RUL to compare against."}
+      Red bars push RUL down, green bars push it up, both shown in snapshots and hours. Values are
+      vibration-analysis statistics (RMS, kurtosis, etc.) computed from the real accelerometer reading
+      at this snapshot.
     </p>
   `;
 }
@@ -216,7 +277,6 @@ async function renderDetail() {
 function buildTrendChart(points) {
   const svg = document.getElementById("trend-chart");
   const W = 900, H = 220, padL = 40, padR = 10, padT = 10, padB = 24;
-  const xs = points.map((_, i) => i);
   const maxRul = Math.max(...points.map(p => Math.max(p.true_rul, p.predicted_rul)));
   const x = i => padL + (i / (points.length - 1)) * (W - padL - padR);
   const y = v => H - padB - (v / maxRul) * (H - padT - padB);
@@ -248,7 +308,7 @@ function buildTrendChart(points) {
     tooltip.style.display = "block";
     tooltip.style.left = `${e.clientX - rect.left + 12}px`;
     tooltip.style.top = `${e.clientY - rect.top - 10}px`;
-    tooltip.innerHTML = `<div>${fmtTime(p.timestamp)}</div><div style="color:var(--series-actual)">actual: ${p.true_rul}</div><div style="color:var(--series-predicted)">predicted: ${p.predicted_rul}</div>`;
+    tooltip.innerHTML = `<div>${fmtTime(p.timestamp)}</div><div style="color:var(--series-actual)">actual: ${fmtRul(p.true_rul)}</div><div style="color:var(--series-predicted)">predicted: ${fmtRul(p.predicted_rul)}</div>`;
   });
   svg.addEventListener("mouseleave", () => { tooltip.style.display = "none"; });
 }

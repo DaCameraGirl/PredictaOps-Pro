@@ -1,4 +1,5 @@
 """FastAPI backend serving bearing RUL predictions, SHAP explanations, and dataset profiling."""
+import json
 import sys
 from pathlib import Path
 
@@ -11,9 +12,11 @@ from fastapi.staticfiles import StaticFiles
 
 from bearing_data import BEARING_COLS, FAILED_BEARING, FAILURE_MODE
 from bearing_profiling import summarize
+from degradation_signal import DegradationSignal
 from explain_bearing import BearingRulExplainer
 
 DATA_CACHE = Path(__file__).resolve().parent.parent / "data" / "ims_test2_features.csv"
+MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 
 app = FastAPI(title="Predictive Maintenance Studio")
 app.add_middleware(
@@ -23,6 +26,8 @@ app.add_middleware(
 _explainer = BearingRulExplainer()
 _table = pd.read_csv(DATA_CACHE, parse_dates=["timestamp"])
 _timestamps = sorted(_table["timestamp"].unique())
+_degradation = DegradationSignal(_table)
+_metrics = json.loads((MODEL_DIR / "bearing_metrics.json").read_text())
 
 _failed = _table[_table["bearing"] == FAILED_BEARING].sort_values("timestamp").reset_index(drop=True)
 _failed["true_rul"] = len(_failed) - 1 - _failed.index
@@ -42,6 +47,37 @@ def _risk(predicted_rul: float) -> str:
     return "high" if predicted_rul < 50 else "medium" if predicted_rul < 200 else "low"
 
 
+def _interval(predicted_rul: float) -> dict:
+    """80% interval built from walk-forward backtest residuals: true = pred - residual."""
+    lo = max(0.0, predicted_rul - _metrics["interval_80_residual_high"])
+    hi = max(0.0, predicted_rul - _metrics["interval_80_residual_low"])
+    return {"low": round(lo, 1), "high": round(hi, 1)}
+
+
+def _true_rul_at(bearing: str, ts) -> int | None:
+    if bearing != FAILED_BEARING:
+        return None
+    true_row = _failed[_failed["timestamp"] == ts]
+    return int(true_row.iloc[0]["true_rul"]) if not true_row.empty else None
+
+
+def _prediction_payload(bearing: str, row: pd.DataFrame, ts) -> dict:
+    predicted = _explainer.predict(row)
+    degradation = _degradation.evaluate(bearing, row.iloc[0])
+    true_rul = _true_rul_at(bearing, ts)
+    payload = {
+        "bearing": bearing,
+        "predicted_rul": round(predicted, 1),
+        "interval_80": _interval(predicted),
+        "risk": _risk(predicted),
+        "has_ground_truth": bearing == FAILED_BEARING,
+        **degradation,
+    }
+    if true_rul is not None:
+        payload["true_rul"] = true_rul
+    return payload
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
@@ -49,7 +85,7 @@ def health():
 
 @app.get("/api/profile")
 def profile():
-    return summarize(_table)
+    return {**summarize(_table), "model": _metrics}
 
 
 @app.get("/api/timeline")
@@ -58,6 +94,7 @@ def timeline():
         "n_snapshots": len(_timestamps),
         "timestamps": [ts.isoformat() for ts in _timestamps],
         "default_index": len(_timestamps) - 50,
+        "snapshot_minutes": _metrics["snapshot_minutes"],
     }
 
 
@@ -67,22 +104,7 @@ def snapshot(index: int):
     if ts is None:
         raise HTTPException(status_code=404, detail="snapshot index out of range")
 
-    bearings = []
-    for bearing in BEARING_COLS:
-        row = _row_at(bearing, index)
-        predicted = _explainer.predict(row)
-        entry = {
-            "bearing": bearing,
-            "predicted_rul": round(predicted, 1),
-            "risk": _risk(predicted),
-            "has_ground_truth": bearing == FAILED_BEARING,
-        }
-        if bearing == FAILED_BEARING:
-            true_row = _failed[_failed["timestamp"] == ts]
-            if not true_row.empty:
-                entry["true_rul"] = int(true_row.iloc[0]["true_rul"])
-        bearings.append(entry)
-
+    bearings = [_prediction_payload(bearing, _row_at(bearing, index), ts) for bearing in BEARING_COLS]
     return {"index": index, "timestamp": ts.isoformat(), "bearings": bearings}
 
 
@@ -92,11 +114,12 @@ def bearing_detail(index: int, bearing_id: str):
         raise HTTPException(status_code=404, detail=f"unknown bearing {bearing_id}")
     row = _row_at(bearing_id, index)
     explanation = _explainer.explain(row)
+    payload = _prediction_payload(bearing_id, row, _timestamps[index])
     return {
-        "bearing": bearing_id,
         "timestamp": _timestamps[index].isoformat(),
         "failure_mode": FAILURE_MODE if bearing_id == FAILED_BEARING else None,
         **explanation,
+        **payload,
     }
 
 

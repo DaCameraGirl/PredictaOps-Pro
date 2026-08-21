@@ -1,3 +1,14 @@
 {
-  "val_rmse_snapshots": 26.377637975304953
+  "validation_method": "chronological walk-forward, expanding window, no shuffling",
+  "n_backtest_points": 591,
+  "mae_snapshots": 71.3322525024414,
+  "mae_hours": 11.8887087504069,
+  "rmse_snapshots": 100.30905367911713,
+  "rmse_hours": 16.718175613186187,
+  "asymmetric_score": 1470.1201361654319,
+  "interval_80_residual_low": 0.0,
+  "interval_80_residual_high": 160.21701049804688,
+  "snapshot_minutes": 10,
+  "rul_clip": 400,
+  "scope_statement": "Trained and backtested on one confirmed failure trajectory (bearing 1, outer race defect). This demonstrates trajectory fitting and honest backtesting on real data, not a validated general bearing-failure model."
 }

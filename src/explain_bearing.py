@@ -35,6 +35,6 @@ class BearingRulExplainer:
         )
         return {
             "predicted_rul": self.predict(row),
-            "base_value": float(shap_values.base_values[0]),
+            "average_model_output": float(shap_values.base_values[0]),
             "top_contributors": contributions[:top_k],
         }
