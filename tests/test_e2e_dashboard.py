@@ -26,7 +26,7 @@ def _wait_for(url: str, timeout: float = 30.0) -> bool:
         try:
             urllib.request.urlopen(url, timeout=1)
             return True
-        except Exception:  # noqa: BLE001 - polling until the server answers
+        except Exception:
             time.sleep(0.5)
     return False
 

@@ -1,3 +1,5 @@
+import importlib
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -92,3 +94,21 @@ def test_snapshot_and_bearing_detail_report_the_same_predicted_rul(client):
     list_value = next(b for b in list_resp["bearings"] if b["bearing"] == "bearing_1")["predicted_rul"]
     detail_resp = client.get("/api/snapshot/930/bearing/bearing_1").json()
     assert detail_resp["predicted_rul"] == list_value
+
+
+def test_api_starts_when_shap_initialization_fails(monkeypatch):
+    import main
+
+    import explain_bearing
+
+    def fail_to_build(_model):
+        raise OSError("simulated SHAP import failure")
+
+    monkeypatch.setattr(explain_bearing, "_build_shap_explainer", fail_to_build)
+    reloaded_main = importlib.reload(main)
+    local_client = TestClient(reloaded_main.app)
+
+    assert local_client.get("/api/health").status_code == 200
+    detail = local_client.get("/api/snapshot/930/bearing/bearing_1").json()
+    assert detail["shap_unavailable"] is True
+    assert "simulated SHAP import failure" in detail["shap_error"]
