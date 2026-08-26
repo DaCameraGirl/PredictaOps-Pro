@@ -14,6 +14,10 @@ The project deliberately separates what is **served today** from what is **prepa
 
 Tests 1 and 3 are **not yet used to train the served RUL model**. That is intentional. The next modeling stage is a separate cross-run validator that holds out entire test runs/trajectories instead of mixing neighboring time-series rows across train and test.
 
+The target is the full production Predictive Maintenance Studio, built through
+reviewable production slices rather than one untestable mega-change. See
+[`ROADMAP.md`](ROADMAP.md) for the platform target and PR sequence.
+
 ## What it does
 
 - **Run-aware data contracts** (`src/bearing_data.py`): immutable metadata for the three documented IMS test runs, including channel-to-bearing mapping, sensor identity, structural validation, run-specific cache paths, and documented failure endpoints/modes.
@@ -22,8 +26,9 @@ Tests 1 and 3 are **not yet used to train the served RUL model**. That is intent
 - **Current RUL model** (`src/train_bearing.py`): XGBoost trained only on the documented Test 2 failure trajectory. Validation is chronological expanding-window walk-forward rather than a random split. The current Test 2 target remains clipped at 400 snapshots for the existing model; that assumption is not applied to Tests 1 or 3.
 - **Leakage guards:** the current single-trajectory trainer only exposes `ims_test2`. Newly registered runs can be validated and feature-extracted, but cannot accidentally flow through the old trainer before cross-run validation exists.
 - **Degradation signal** (`src/degradation_signal.py`): an independent baseline-deviation signal for whether a bearing appears to be degrading, separate from the RUL point estimate.
+- **Model abstention** (`app/main.py`): RUL predictions are only emitted when the asset is inside the validated RUL domain. For right-censored bearings or snapshots with insufficient baseline history, the API says `unsupported` or `insufficient_evidence`, reports what evidence is known, and demotes the raw model number to diagnostic context.
 - **Explainability** (`src/explain_bearing.py`): SHAP TreeExplainer when SHAP is available. If SHAP import/initialization fails, prediction serving stays alive and reports the explanation as unavailable rather than crashing the API.
-- **API + dashboard** (`app/`): FastAPI backend and single-page studio with playback, bearing risk/health state, waveform and FFT views, feature trends, anomaly/spike context, maintenance decision support, RUL history, exports, and explicit labeling of censored bearings whose true failure time is unknown.
+- **API + dashboard** (`app/`): FastAPI backend and single-page studio with playback, bearing risk/health state, waveform and FFT views, feature trends, anomaly/spike context, maintenance decision support, RUL history, exports, explicit abstention, and explicit labeling of censored bearings whose true failure time is unknown.
 
 ## Run the existing studio
 
@@ -48,6 +53,43 @@ uvicorn app.main:app --reload
 ```
 
 Open `http://127.0.0.1:8000`.
+
+## Platform Core database
+
+Production Slice 6 introduces the persistent platform registry underneath the existing IMS
+studio. The current dashboard still reads the committed IMS feature/model
+artifacts, while the new database layer provides the production identity model
+that later ingestion, serving, security, and operations slices build on.
+
+Local development defaults to SQLite at `data/platform_core.db` when
+`PMS_DATABASE_URL` is unset. Production should set `PMS_DATABASE_URL` to a
+PostgreSQL connection string, for example:
+
+```text
+PMS_DATABASE_URL=postgresql+psycopg://user:password@host:5432/predictive_maintenance
+```
+
+Run migrations and register the documented NASA/IMS runs as normal platform
+entities:
+
+```bash
+alembic upgrade head
+python scripts/bootstrap_platform.py
+```
+
+The bootstrap maps the existing dataset into the same hierarchy a plant uses:
+
+```text
+NASA/IMS Bearing Data Set -> IMS Bearing Test Rigs -> IMS Test 2 Machine -> Bearing 1 -> Sensor 1
+```
+
+Useful platform endpoints:
+
+```text
+GET  /api/platform/health
+POST /api/platform/bootstrap/ims
+GET  /api/platform/inventory
+```
 
 ## Rebuild the current Test 2 model
 

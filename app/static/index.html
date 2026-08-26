@@ -282,14 +282,18 @@ async function renderSnapshot() {
   }
   const list = document.getElementById("bearing-list");
   list.classList.remove("loading");
-  const sorted = [...snap.bearings].sort((a, b) => a.predicted_rul - b.predicted_rul);
+  const riskRank = { critical: 0, warning: 1, watch: 2, healthy: 3, insufficient_evidence: 4 };
+  const sorted = [...snap.bearings].sort((a, b) =>
+    (riskRank[a.health_state] - riskRank[b.health_state]) ||
+    ((a.predicted_rul ?? Number.POSITIVE_INFINITY) - (b.predicted_rul ?? Number.POSITIVE_INFINITY))
+  );
   list.innerHTML = "";
   for (const b of sorted) {
     const row = document.createElement("div");
     row.className = "bearing-row" + (b.bearing === selectedBearing ? " selected" : "");
-    const tag = b.has_ground_truth
-      ? `<span class="tag verified">real failure trajectory</span>`
-      : `<span class="tag unverified">no failure observed &middot; extrapolated</span>`;
+    const tag = b.rul_prediction_supported
+      ? `<span class="tag verified">RUL ${b.prediction_status_label.toLowerCase()} &middot; real failure trajectory</span>`
+      : `<span class="tag unverified">RUL ${b.prediction_status_label.toLowerCase()}</span>`;
     row.innerHTML = `<span class="bearing-name"><span>${b.bearing.replace("_", " ")}</span>${tag}</span>` +
       `<span class="badge ${b.health_state}">${b.health_state.replace("_", " ")}</span>`;
     row.onclick = () => { selectedBearing = b.bearing; renderSnapshot(); renderDetail(); };
@@ -328,7 +332,7 @@ async function renderDetail() {
     : `smoothed deviation from this bearing's own healthy baseline: <b>${d.smoothed_z.toFixed(1)}&sigma;</b> (instantaneous: ${d.deviation_z.toFixed(1)}&sigma;), largest single contributor: <b>${d.top_feature}</b>${spikeNote}`;
 
   let claimBlock;
-  if (d.has_ground_truth) {
+  if (d.rul_prediction_supported && d.has_ground_truth) {
     claimBlock = `
       <div class="stat-row">
         <div class="stat-card"><div class="label">Estimated RUL</div><div class="value">~${d.predicted_rul.toFixed(0)}</div><div class="sub">${fmtRul(d.predicted_rul)} &middot; 80% range ${d.interval_80.low.toFixed(0)}&ndash;${d.interval_80.high.toFixed(0)} snapshots</div></div>
@@ -338,12 +342,19 @@ async function renderDetail() {
       <p class="not-verifiable">This is the one bearing with a confirmed real failure (${d.failure_mode}), so the estimate can be checked against ground truth &mdash; still a separate, less certain claim than the degradation status above.</p>
     `;
   } else {
+    const truthCard = d.has_ground_truth
+      ? `<div class="stat-card"><div class="label">Recorded actual RUL</div><div class="value">${d.true_rul}</div><div class="sub">${fmtRul(d.true_rul)} &middot; shown because this historical run has known failure time</div></div>`
+      : "";
+    const knownEvidence = (d.known_evidence || []).map(item => `<li>${item}</li>`).join("");
     claimBlock = `
       <div class="stat-row">
-        <div class="stat-card"><div class="label">Model estimate (extrapolated)</div><div class="value">~${d.predicted_rul.toFixed(0)}</div><div class="sub">${fmtRul(d.predicted_rul)} &middot; 80% range ${d.interval_80.low.toFixed(0)}&ndash;${d.interval_80.high.toFixed(0)} snapshots</div></div>
+        <div class="stat-card"><div class="label">RUL prediction</div><div class="value">${d.prediction_status_label}</div><div class="sub">${d.abstention_reason}</div></div>
+        <div class="stat-card"><div class="label">Diagnostic model output</div><div class="value">~${d.diagnostic_model_output_rul.toFixed(0)}</div><div class="sub">${fmtRul(d.diagnostic_model_output_rul)} &middot; not emitted as a supported prediction</div></div>
         <div class="stat-card"><div class="label">Average model output</div><div class="value">${d.average_model_output != null ? d.average_model_output.toFixed(0) : "n/a"}</div><div class="sub">${d.average_model_output != null ? fmtRul(d.average_model_output) : ""} &middot; SHAP contributions below move the estimate away from this model average</div></div>
+        ${truthCard}
       </div>
-      <p class="not-verifiable"><b>No failure observed</b> &mdash; recording ended while this bearing was still running. This estimate is extrapolated beyond the model's only observed failure label and is <b>not independently verifiable</b>.</p>
+      <p class="not-verifiable"><b>Validated RUL domain:</b> ${d.validated_domain}</p>
+      <ul class="timeline-list">${knownEvidence}</ul>
     `;
   }
 
@@ -385,11 +396,12 @@ async function renderDetail() {
     <h2>Event timeline</h2>
     ${eventTimelineHtml(d.event_timeline)}
 
-    <h2>Why this ${d.has_ground_truth ? "estimate" : "estimate"} (SHAP)</h2>
+    <h2>${d.rul_prediction_supported ? "Why this estimate" : "Diagnostic model output"} (SHAP)</h2>
     ${shapSection}
     <p style="color:var(--muted); font-size:12px; margin-top:16px;">
       Red bars push RUL down, green bars push it up, both shown in snapshots and hours. SHAP explains
-      the <em>model's</em> prediction, not the physical cause of wear. Hover a feature name for its definition.
+      the <em>model's</em> raw output, not the physical cause of wear or whether a supported RUL claim exists.
+      Hover a feature name for its definition.
     </p>
 
     <h2>Vibration analysis (this snapshot)</h2>

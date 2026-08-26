@@ -9,6 +9,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # retrains or re-extracts anything at build or start time.
 COPY app/ app/
 COPY src/ src/
+COPY alembic.ini alembic.ini
+COPY alembic/ alembic/
+COPY scripts/ scripts/
 COPY models/ models/
 COPY data/processed/ data/processed/
 

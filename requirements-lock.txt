@@ -1,3 +1,7 @@
+Mako==1.4.1
+MarkupSafe==3.0.3
+SQLAlchemy==2.0.45
+alembic==1.17.2
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.14.2
@@ -25,6 +29,8 @@ pydantic==2.13.4
 pydantic_core==2.46.4
 pyee==13.0.1
 Pygments==2.21.0
+psycopg==3.3.2
+psycopg-binary==3.3.2
 pytest==9.1.1
 python-dateutil==2.9.0.post0
 ruff==0.16.4
