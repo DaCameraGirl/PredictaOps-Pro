@@ -7,16 +7,14 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "app"))
 
-import pandas as pd  # noqa: E402
-
-from bearing_data import FEATURES_CACHE  # noqa: E402
+from bearing_data import DEFAULT_RUN, FEATURES_CACHE, load_feature_table  # noqa: E402
 
 
 @pytest.fixture(scope="session")
 def feature_table():
     if not FEATURES_CACHE.exists():
         pytest.skip(f"processed features not found at {FEATURES_CACHE}; run src/train_bearing.py first")
-    return pd.read_csv(FEATURES_CACHE, parse_dates=["timestamp"])
+    return load_feature_table(DEFAULT_RUN)
 
 
 @pytest.fixture(scope="session")

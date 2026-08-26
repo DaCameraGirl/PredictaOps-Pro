@@ -15,7 +15,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from bearing_data import BEARING_COLS, FAILED_BEARING, FAILURE_MODE, FEATURE_NAMES, FEATURES_CACHE, METADATA_PATH
+from bearing_data import (
+    BEARING_COLS,
+    DEFAULT_RUN,
+    FAILED_BEARING,
+    FAILURE_MODE,
+    FEATURE_NAMES,
+    METADATA_PATH,
+    load_feature_table,
+)
 from bearing_profiling import feature_trend, summarize
 from degradation_signal import DegradationSignal
 from explain_bearing import BearingRulExplainer
@@ -33,7 +41,7 @@ app.add_middleware(
 )
 
 _explainer = BearingRulExplainer()
-_table = pd.read_csv(FEATURES_CACHE, parse_dates=["timestamp"])
+_table = load_feature_table(DEFAULT_RUN)
 _timestamps = sorted(_table["timestamp"].unique())
 _degradation = DegradationSignal(_table)
 _metrics = json.loads((MODEL_DIR / "bearing_metrics.json").read_text())

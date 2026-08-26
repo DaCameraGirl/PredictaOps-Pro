@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 
 from bearing_data import FEATURE_NAMES, add_rul
-from train_bearing import walk_forward_backtest
+from train_bearing import MultiTrajectoryTrainingError, parse_args, walk_forward_backtest
 
 
 @pytest.fixture(scope="module")
@@ -75,3 +75,27 @@ def test_no_duplicate_timestamps_cross_a_fold_boundary(labeled):
     all_timestamps = pd.to_datetime(labeled["timestamp"])
     for ts in boundary_timestamps:
         assert (all_timestamps == pd.Timestamp(ts)).sum() <= 1, f"duplicate snapshot at fold boundary {ts}"
+
+
+def test_single_trajectory_trainer_refuses_multiple_failure_trajectories():
+    rng = np.random.default_rng(0)
+    n = 20
+    timestamps = list(pd.date_range("2004-01-01", periods=n, freq="10min"))
+    rows = []
+    for trajectory_id in ("ims_test2:bearing_1", "ims_other:bearing_3"):
+        for i, ts in enumerate(timestamps):
+            rows.append({
+                "trajectory_id": trajectory_id,
+                "timestamp": ts,
+                "RUL": n - 1 - i,
+                **{feature: rng.normal() for feature in FEATURE_NAMES},
+            })
+    labeled = pd.DataFrame(rows)
+
+    with pytest.raises(MultiTrajectoryTrainingError, match="multiple independent failure trajectories"):
+        walk_forward_backtest(labeled)
+
+
+def test_training_cli_selects_ims_test2_run():
+    args = parse_args(["--run", "ims_test2"])
+    assert args.run == "ims_test2"

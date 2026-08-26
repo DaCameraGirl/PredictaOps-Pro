@@ -1,4 +1,4 @@
-"""Build features, validate the dataset, backtest, and train the RUL regressor.
+"""Build features, validate a selected run, backtest, and train the RUL regressor.
 
 Only one bearing in this test actually failed, so there's no second unit to hold
 out the way a turbofan model would hold out whole engines. A random split across
@@ -13,8 +13,9 @@ XGBoost trains directly on the raw extracted features — so there's no separate
 "fit only on the training fold" concern beyond the RUL clip, which is a fixed
 constant chosen from a visual read of the data, not fit from labels.
 
-Run: python src/train_bearing.py
+Run: python src/train_bearing.py --run ims_test2
 """
+import argparse
 import json
 import subprocess
 from datetime import UTC, datetime
@@ -27,12 +28,13 @@ import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error, median_absolute_error
 
 from bearing_data import (
+    DEFAULT_RUN,
     FEATURE_NAMES,
-    FEATURES_CACHE,
-    METADATA_PATH,
-    RAW_DIR,
+    RUN_SPECS,
     add_rul,
     build_feature_table,
+    get_run_spec,
+    load_feature_table,
     raw_dataset_checksum,
     validate_raw_dataset,
 )
@@ -45,6 +47,10 @@ RUL_CLIP = 400
 SNAPSHOT_MINUTES = 10
 N_FOLDS = 4
 MIN_TRAIN_FRACTION = 0.4  # first fold trains on this much history before predicting anything
+
+
+class MultiTrajectoryTrainingError(ValueError):
+    """Raised when the single-trajectory trainer is given multiple failure paths."""
 
 
 def make_model():
@@ -88,6 +94,13 @@ def walk_forward_backtest(labeled: pd.DataFrame):
     timestamp in fold i's test slice. Re-sorts defensively rather than trusting the
     caller already sorted it — a shuffled input here would silently reintroduce the
     exact leakage this function exists to prevent."""
+    if "trajectory_id" in labeled.columns and labeled["trajectory_id"].nunique() > 1:
+        trajectories = ", ".join(sorted(labeled["trajectory_id"].unique()))
+        raise MultiTrajectoryTrainingError(
+            "single-trajectory walk-forward training cannot flatten multiple independent "
+            f"failure trajectories: {trajectories}"
+        )
+
     labeled = labeled.sort_values("timestamp").reset_index(drop=True)
     n = len(labeled)
     fold_bounds = np.linspace(int(n * MIN_TRAIN_FRACTION), n, N_FOLDS + 1, dtype=int)
@@ -136,30 +149,53 @@ def git_commit() -> str:
         return "unknown"
 
 
-def main():
-    if FEATURES_CACHE.exists():
-        table = pd.read_csv(FEATURES_CACHE, parse_dates=["timestamp"])
-        print(f"loaded cached features from {FEATURES_CACHE} ({len(table)} rows)")
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--run",
+        choices=sorted(RUN_SPECS),
+        default=DEFAULT_RUN.run_id,
+        help="documented bearing run to train against",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None):
+    args = parse_args(argv)
+    run_spec = get_run_spec(args.run)
+
+    if run_spec.features_cache.exists():
+        table = load_feature_table(run_spec)
+        print(f"loaded cached features from {run_spec.features_cache} ({len(table)} rows)")
     else:
-        print(f"no cached features, building from raw data in {RAW_DIR} ...")
-        validation = validate_raw_dataset()
+        print(f"no cached features, building {run_spec.run_id} from raw data in {run_spec.raw_dir} ...")
+        validation = validate_raw_dataset(run_spec=run_spec)
         if validation["irregular_gaps"]:
             print(f"warning: {len(validation['irregular_gaps'])} irregular timestamp gap(s) in raw data")
-        table = build_feature_table()
-        FEATURES_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        table.to_csv(FEATURES_CACHE, index=False)
+        table = build_feature_table(run_spec=run_spec)
+        run_spec.features_cache.parent.mkdir(parents=True, exist_ok=True)
+        table.to_csv(run_spec.features_cache, index=False)
 
-        METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-        METADATA_PATH.write_text(json.dumps({
-            "dataset": "NASA/IMS Bearing Data Set, Test 2",
+        run_spec.metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        run_spec.metadata_path.write_text(json.dumps({
+            "run_id": run_spec.run_id,
+            "dataset": run_spec.dataset_name,
+            "documented_failures": [
+                {
+                    "bearing": failure.bearing,
+                    "failure_timestamp": failure.failure_timestamp.isoformat(),
+                    "failure_mode": failure.failure_mode,
+                }
+                for failure in run_spec.failures
+            ],
             "generated_at": datetime.now(UTC).isoformat(),
             "code_version": git_commit(),
             **validation,
-            "raw_sha256": raw_dataset_checksum(),
+            "raw_sha256": raw_dataset_checksum(run_spec=run_spec),
         }, indent=2))
-        print(f"wrote dataset metadata to {METADATA_PATH}")
+        print(f"wrote dataset metadata to {run_spec.metadata_path}")
 
-    labeled = add_rul(table)
+    labeled = add_rul(table, run_spec)
     labeled["RUL"] = labeled["RUL"].clip(upper=RUL_CLIP)
 
     y_true, y_pred, y_base, fold_meta = walk_forward_backtest(labeled)
