@@ -6,6 +6,10 @@ Predicts remaining useful life (RUL) for a set of real motor bearings from
 the NASA/IMS bearing run-to-failure vibration dataset, explains each
 prediction with SHAP, and serves both through a dashboard.
 
+The target is the full production Predictive Maintenance Studio, built through
+reviewable production slices rather than one untestable mega-change. See
+[`ROADMAP.md`](ROADMAP.md) for the platform target and PR sequence.
+
 ## What it does
 
 - **Feature extraction** (`src/bearing_data.py`): reads the raw 20kHz
@@ -32,6 +36,11 @@ prediction with SHAP, and serves both through a dashboard.
   baseline) for "is this degrading at all," kept independent from the
   RUL regression's point estimate, since the two claims have very
   different reliability.
+- **Model abstention** (`app/main.py`): RUL predictions are only emitted
+  when the asset is inside the validated RUL domain. For right-censored
+  bearings or snapshots with insufficient baseline history, the API says
+  `unsupported` or `insufficient_evidence`, reports what evidence is
+  known, and demotes the raw model number to diagnostic context.
 - **Explainability** (`src/explain_bearing.py`): SHAP TreeExplainer,
   returns the top vibration features driving each bearing's prediction.
 - **API + dashboard** (`app/`): FastAPI backend, single-page dashboard
