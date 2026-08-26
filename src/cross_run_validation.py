@@ -24,11 +24,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, median_abso
 
 from bearing_data import FEATURE_NAMES, RunSpec, get_run_spec, load_feature_table
 
-AGGREGATED_FEATURES = tuple(
-    name
-    for feature in FEATURE_NAMES
-    for name in (f"{feature}_sensor_mean", f"{feature}_sensor_max_abs")
-)
+AGGREGATED_FEATURES = tuple(f"{feature}_sensor_max_abs" for feature in FEATURE_NAMES)
 
 
 class CrossRunValidationError(ValueError):
@@ -56,12 +52,12 @@ def aggregate_physical_bearing_features(table: pd.DataFrame) -> pd.DataFrame:
 
     Test 1 has two orthogonal accelerometers per bearing; Tests 2 and 3 have one.
     Treating Test 1's two sensors as two independent target trajectories would
-    duplicate labels and overstate sample independence. We therefore retain sensor
-    evidence through two orientation-agnostic summaries while emitting one target
-    row per physical bearing/time point.
+    duplicate labels and overstate sample independence. For each vibration feature,
+    the strongest absolute sensor value is kept. A single-sensor run uses that same
+    transform, so every run presents one harmonized feature per statistic.
 
     ``sensor_count`` is retained as provenance only and is intentionally excluded
-    from ``AGGREGATED_FEATURES`` so the model cannot trivially identify Test 1 from
+    from ``AGGREGATED_FEATURES`` so the model cannot directly identify Test 1 from
     its two-sensor layout.
     """
     required = {"run_id", "bearing", "sensor_id", "timestamp", *FEATURE_NAMES}
@@ -88,7 +84,6 @@ def aggregate_physical_bearing_features(table: pd.DataFrame) -> pd.DataFrame:
         }
         for feature in FEATURE_NAMES:
             values = sensor_rows[feature].astype(float).to_numpy()
-            row[f"{feature}_sensor_mean"] = float(values.mean())
             row[f"{feature}_sensor_max_abs"] = float(np.max(np.abs(values)))
         rows.append(row)
 
@@ -258,7 +253,7 @@ def run_leave_one_run_out_validation(
     return {
         "validation_method": "leave-one-entire-IMS-run-out",
         "target": "RUL_hours_to_documented_experiment_endpoint",
-        "feature_aggregation": "one physical bearing/timestamp; sensor mean + sensor max-absolute",
+        "feature_aggregation": "one physical bearing/timestamp; sensor max-absolute",
         "baseline": "training-fold mean RUL_hours",
         "model_features": list(AGGREGATED_FEATURES),
         "n_runs": len(fold_results),
