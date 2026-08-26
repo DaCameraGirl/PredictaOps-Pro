@@ -67,6 +67,10 @@ HUMAN_VERIFICATION_NOTICE = (
     "This recommendation is generated from transparent threshold rules over model "
     "output and requires human verification before any maintenance action is taken."
 )
+VALIDATED_RUL_DOMAIN = (
+    "IMS Test 2 bearing 1, documented outer-race defect, same rig, sensors, "
+    "sampling cadence, and extracted vibration feature schema."
+)
 
 
 def _row_at(bearing: str, index: int) -> pd.DataFrame:
@@ -120,18 +124,74 @@ def _recommend_action(health_state: str, interval_high: float) -> dict:
     }
 
 
+def _rul_support(bearing: str, degradation: dict) -> dict:
+    if degradation["health_state"] == "insufficient_evidence":
+        return {
+            "rul_prediction_supported": False,
+            "prediction_status": "insufficient_evidence",
+            "prediction_status_label": "Insufficient evidence",
+            "abstention_reason": (
+                "This asset has not accumulated enough baseline history for a "
+                "defensible remaining-life claim. The degradation signal reports "
+                "what is known so far instead."
+            ),
+            "validated_domain": VALIDATED_RUL_DOMAIN,
+            "known_evidence": [
+                "RUL model artifact loaded successfully.",
+                "Healthy-baseline window is still being established.",
+                "No supported remaining-life claim is emitted for this snapshot.",
+            ],
+        }
+    if bearing != FAILED_BEARING:
+        return {
+            "rul_prediction_supported": False,
+            "prediction_status": "unsupported",
+            "prediction_status_label": "Unsupported",
+            "abstention_reason": (
+                "No failure was observed for this bearing in the source run, so "
+                "there is no validated remaining-life label for this asset. The "
+                "system can report degradation evidence, but it must abstain from "
+                "claiming a verified RUL prediction."
+            ),
+            "validated_domain": VALIDATED_RUL_DOMAIN,
+            "known_evidence": [
+                "Same IMS Test 2 rig and sensor cadence as the trained trajectory.",
+                "This bearing was right-censored: it was still running when recording ended.",
+                "The degradation state is computed from this bearing's own baseline.",
+            ],
+        }
+    return {
+        "rul_prediction_supported": True,
+        "prediction_status": "supported",
+        "prediction_status_label": "Supported",
+        "abstention_reason": None,
+        "validated_domain": VALIDATED_RUL_DOMAIN,
+        "known_evidence": [
+            "Documented failure trajectory with ground-truth RUL labels.",
+            "Failure mode matches the model's validated domain.",
+            "Prediction interval is derived from chronological walk-forward residuals.",
+        ],
+    }
+
+
 def _prediction_payload(bearing: str, row: pd.DataFrame, ts) -> dict:
-    predicted = _explainer.predict(row)
+    diagnostic_output = _explainer.predict(row)
     degradation = _degradation.evaluate(bearing, ts)
     true_rul = _true_rul_at(bearing, ts)
-    interval = _interval(predicted)
+    support = _rul_support(bearing, degradation)
+    interval = _interval(diagnostic_output) if support["rul_prediction_supported"] else None
     payload = {
         "bearing": bearing,
-        "predicted_rul": round(predicted, 1),
+        "predicted_rul": round(diagnostic_output, 1) if support["rul_prediction_supported"] else None,
+        "diagnostic_model_output_rul": round(diagnostic_output, 1),
         "interval_80": interval,
         "has_ground_truth": bearing == FAILED_BEARING,
+        **support,
         **degradation,
-        "recommendation": _recommend_action(degradation["health_state"], interval["high"]),
+        "recommendation": _recommend_action(
+            degradation["health_state"],
+            interval["high"] if interval is not None else None,
+        ),
     }
     if true_rul is not None:
         payload["true_rul"] = true_rul
