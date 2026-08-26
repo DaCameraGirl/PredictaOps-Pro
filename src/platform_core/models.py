@@ -5,11 +5,13 @@ from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
     ForeignKeyConstraint,
+    Integer,
     String,
     UniqueConstraint,
     func,
@@ -68,6 +70,10 @@ class Organization(Base, TimestampMixin, LifecycleMixin):
         back_populates="organization",
         cascade="all, delete-orphan",
         overlaps="component,sensors",
+    )
+    ingestion_sources: Mapped[list["IngestionSource"]] = relationship(
+        back_populates="organization",
+        cascade="all, delete-orphan",
     )
     memberships: Mapped[list["OrganizationMembership"]] = relationship(
         back_populates="organization",
@@ -223,6 +229,7 @@ class Sensor(Base, TimestampMixin, LifecycleMixin):
     organization: Mapped[Organization] = relationship(back_populates="sensors", overlaps="component,sensors")
     component: Mapped[Component] = relationship(back_populates="sensors", overlaps="organization,sensors")
     readings: Mapped[list["MachineReading"]] = relationship(back_populates="sensor", cascade="all, delete-orphan")
+    waveforms: Mapped[list["WaveformRecord"]] = relationship(back_populates="sensor", cascade="all, delete-orphan")
 
 
 class MachineReading(Base, TimestampMixin):
@@ -245,3 +252,153 @@ class MachineReading(Base, TimestampMixin):
     payload: Mapped[dict | None] = mapped_column(JSON)
 
     sensor: Mapped[Sensor] = relationship(back_populates="readings")
+
+
+class IngestionSource(Base, TimestampMixin):
+    __tablename__ = "ingestion_sources"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_ingestion_sources_org_id"),
+        UniqueConstraint("organization_id", "name", name="uq_ingestion_sources_org_name"),
+        UniqueConstraint("organization_id", "source_type", "external_ref", name="uq_ingestion_sources_org_external"),
+        CheckConstraint(
+            "source_type in ('csv', 'parquet', 'rest', 'mqtt', 'opcua', 'abb', 'replay')",
+            name="ck_ingestion_source_type",
+        ),
+        CheckConstraint("status in ('active', 'paused', 'unhealthy')", name="ck_ingestion_source_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_ref: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    config: Mapped[dict | None] = mapped_column(JSON)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    organization: Mapped[Organization] = relationship(back_populates="ingestion_sources")
+    batches: Mapped[list["IngestionBatch"]] = relationship(back_populates="source", cascade="all, delete-orphan")
+
+
+class IngestionBatch(Base, TimestampMixin):
+    __tablename__ = "ingestion_batches"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_ingestion_batches_org_id"),
+        UniqueConstraint("organization_id", "source_id", "idempotency_key", name="uq_ingestion_batches_source_key"),
+        ForeignKeyConstraint(
+            ["organization_id", "source_id"],
+            ["ingestion_sources.organization_id", "ingestion_sources.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "replay_of_batch_id"],
+            ["ingestion_batches.organization_id", "ingestion_batches.id"],
+        ),
+        CheckConstraint(
+            "source_type in ('csv', 'parquet', 'rest', 'mqtt', 'opcua', 'abb', 'replay')",
+            name="ck_batch_source_type",
+        ),
+        CheckConstraint("status in ('accepted', 'partial', 'failed')", name="ck_ingestion_batch_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    source_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="accepted")
+    idempotency_key: Mapped[str | None] = mapped_column(String(120))
+    source_uri: Mapped[str | None] = mapped_column(String(1024))
+    replay_of_batch_id: Mapped[str | None] = mapped_column(String(36))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    accepted_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duplicate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    scalar_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    waveform_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    provenance: Mapped[dict | None] = mapped_column(JSON)
+
+    source: Mapped[IngestionSource] = relationship(back_populates="batches")
+
+
+class IngestedRecord(Base, TimestampMixin):
+    __tablename__ = "ingested_records"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "source_id", "idempotency_key", name="uq_ingested_records_source_key"),
+        ForeignKeyConstraint(
+            ["organization_id", "source_id"],
+            ["ingestion_sources.organization_id", "ingestion_sources.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "batch_id"],
+            ["ingestion_batches.organization_id", "ingestion_batches.id"],
+        ),
+        CheckConstraint("target_type in ('scalar_reading', 'waveform')", name="ck_ingested_record_target_type"),
+        CheckConstraint("quality in ('good', 'suspect', 'bad', 'missing')", name="ck_ingested_record_quality"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    source_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    batch_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    metric: Mapped[str | None] = mapped_column(String(120))
+    quality: Mapped[str] = mapped_column(String(32), nullable=False)
+    provenance: Mapped[dict | None] = mapped_column(JSON)
+
+
+class IngestionFailure(Base, TimestampMixin):
+    __tablename__ = "ingestion_failures"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "source_id"],
+            ["ingestion_sources.organization_id", "ingestion_sources.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "batch_id"],
+            ["ingestion_batches.organization_id", "ingestion_batches.id"],
+        ),
+        CheckConstraint("quality in ('bad', 'missing', 'suspect')", name="ck_ingestion_failure_quality"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    source_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    batch_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    source_record_id: Mapped[str | None] = mapped_column(String(255))
+    quality: Mapped[str] = mapped_column(String(32), nullable=False, default="bad")
+    reason: Mapped[str] = mapped_column(String(255), nullable=False)
+    detail: Mapped[dict | None] = mapped_column(JSON)
+    payload: Mapped[dict | None] = mapped_column(JSON)
+    dead_letter: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class WaveformRecord(Base, TimestampMixin):
+    __tablename__ = "waveform_records"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_waveform_records_org_id"),
+        ForeignKeyConstraint(["organization_id", "sensor_id"], ["sensors.organization_id", "sensors.id"]),
+        ForeignKeyConstraint(
+            ["organization_id", "batch_id"],
+            ["ingestion_batches.organization_id", "ingestion_batches.id"],
+        ),
+        CheckConstraint("quality in ('good', 'suspect', 'bad', 'missing')", name="ck_waveform_quality"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    sensor_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    batch_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    unit: Mapped[str] = mapped_column(String(64), nullable=False)
+    sampling_rate_hz: Mapped[float] = mapped_column(Float, nullable=False)
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    source: Mapped[str] = mapped_column(String(120), nullable=False)
+    quality: Mapped[str] = mapped_column(String(32), nullable=False, default="good")
+    storage_uri: Mapped[str] = mapped_column(String(1024), nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    metadata_json: Mapped[dict | None] = mapped_column(JSON)
+
+    sensor: Mapped[Sensor] = relationship(back_populates="waveforms")

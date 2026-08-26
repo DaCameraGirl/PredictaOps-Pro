@@ -67,8 +67,8 @@ jobs:
       - name: Run Platform Core migrations on PostgreSQL
         run: alembic upgrade head
 
-      - name: Test Platform Core against PostgreSQL
-        run: pytest tests/test_platform_core.py -v
+      - name: Test Platform Core and Industrial Ingestion against PostgreSQL
+        run: pytest tests/test_platform_core.py tests/test_industrial_ingestion.py -v
 
       - name: Recreate PostgreSQL schema for bootstrap
         run: alembic upgrade head

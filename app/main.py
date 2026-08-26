@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -29,6 +29,8 @@ from bearing_data import (
 from bearing_profiling import feature_trend, summarize
 from degradation_signal import DegradationSignal
 from explain_bearing import BearingRulExplainer
+from industrial_ingestion.contracts import SourceRegistration
+from industrial_ingestion.service import IngestionService
 from platform_core.config import database_settings, safe_database_label
 from platform_core.database import SessionLocal, check_database
 from platform_core.models import Base
@@ -251,6 +253,123 @@ def platform_inventory():
     with SessionLocal() as session:
         try:
             return get_platform_inventory(session)
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/ingestion/sources")
+def register_ingestion_source(registration: SourceRegistration):
+    with SessionLocal() as session:
+        try:
+            source = IngestionService(session).register_source(registration)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return {
+            "id": source.id,
+            "organization_id": source.organization_id,
+            "name": source.name,
+            "source_type": source.source_type,
+            "status": source.status,
+        }
+
+
+def _ingest_payload(organization_id: str, source_type: str, payload, source_name: str, **options):
+    with SessionLocal() as session:
+        try:
+            receipt = IngestionService(session).ingest(
+                organization_id,
+                source_type=source_type,
+                payload=payload,
+                source_name=source_name,
+                **options,
+            )
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return receipt.model_dump()
+
+
+async def _json_body(request: Request):
+    try:
+        return await request.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON request body") from exc
+
+
+@app.post("/api/ingestion/{organization_id}/rest")
+async def ingest_rest(organization_id: str, request: Request, source_name: str = "REST Push"):
+    return _ingest_payload(organization_id, "rest", await _json_body(request), source_name)
+
+
+@app.post("/api/ingestion/{organization_id}/mqtt")
+async def ingest_mqtt(
+    organization_id: str,
+    request: Request,
+    source_name: str = "MQTT Bridge",
+    topic: str | None = None,
+):
+    return _ingest_payload(organization_id, "mqtt", await request.body(), source_name, topic=topic)
+
+
+@app.post("/api/ingestion/{organization_id}/opcua")
+async def ingest_opcua(organization_id: str, request: Request, source_name: str = "OPC-UA Bridge"):
+    return _ingest_payload(organization_id, "opcua", await _json_body(request), source_name)
+
+
+@app.post("/api/ingestion/{organization_id}/abb")
+async def ingest_abb(organization_id: str, request: Request, source_name: str = "ABB Adapter"):
+    return _ingest_payload(organization_id, "abb", await _json_body(request), source_name)
+
+
+@app.post("/api/ingestion/{organization_id}/files/csv")
+async def ingest_csv_file(
+    organization_id: str,
+    request: Request,
+    source_name: str = "CSV File",
+    source_uri: str | None = None,
+):
+    return _ingest_payload(organization_id, "csv", await request.body(), source_name, source_uri=source_uri)
+
+
+@app.post("/api/ingestion/{organization_id}/files/parquet")
+async def ingest_parquet_file(
+    organization_id: str,
+    request: Request,
+    source_name: str = "Parquet File",
+    source_uri: str | None = None,
+):
+    return _ingest_payload(organization_id, "parquet", await request.body(), source_name, source_uri=source_uri)
+
+
+@app.post("/api/ingestion/{organization_id}/replay/{batch_id}")
+def replay_ingestion_batch(organization_id: str, batch_id: str, source_name: str = "Replay"):
+    with SessionLocal() as session:
+        try:
+            receipt = IngestionService(session).replay_batch(organization_id, batch_id, source_name=source_name)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return receipt.model_dump()
+
+
+@app.get("/api/ingestion/{organization_id}/health")
+def ingestion_health(organization_id: str):
+    with SessionLocal() as session:
+        try:
+            return IngestionService(session).health(organization_id)
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 

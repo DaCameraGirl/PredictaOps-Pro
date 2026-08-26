@@ -91,6 +91,32 @@ POST /api/platform/bootstrap/ims
 GET  /api/platform/inventory
 ```
 
+## Industrial ingestion
+
+Production Slice 7 adds the canonical ingestion layer on top of the Platform Core
+registry. CSV, Parquet, REST, MQTT, OPC-UA, ABB, and replay adapters all produce
+the same internal ingestion contract before validation, unit normalization,
+UTC timestamp normalization, sensor resolution, persistence, and receipt
+generation.
+
+Scalar readings persist to `machine_readings`. Waveforms are first-class
+`waveform_records` with sample count, sampling rate, checksum, storage URI, and
+provenance; waveform samples are landed outside `MachineReading.payload`.
+
+Useful ingestion endpoints:
+
+```text
+POST /api/ingestion/sources
+POST /api/ingestion/{organization_id}/rest
+POST /api/ingestion/{organization_id}/mqtt
+POST /api/ingestion/{organization_id}/opcua
+POST /api/ingestion/{organization_id}/abb
+POST /api/ingestion/{organization_id}/files/csv
+POST /api/ingestion/{organization_id}/files/parquet
+POST /api/ingestion/{organization_id}/replay/{batch_id}
+GET  /api/ingestion/{organization_id}/health
+```
+
 ## Rebuild the current Test 2 model
 
 The existing downloader is intentionally Test-2-only:
