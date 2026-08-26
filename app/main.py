@@ -14,6 +14,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import inspect
+from sqlalchemy.exc import SQLAlchemyError
 
 from bearing_data import (
     BEARING_COLS,
@@ -27,6 +29,10 @@ from bearing_data import (
 from bearing_profiling import feature_trend, summarize
 from degradation_signal import DegradationSignal
 from explain_bearing import BearingRulExplainer
+from platform_core.config import database_settings, safe_database_label
+from platform_core.database import SessionLocal, check_database
+from platform_core.models import Base
+from platform_core.services import PlatformService, get_platform_inventory
 from vibration_analysis import analyze
 from waveform_cache import WaveformCache
 
@@ -201,6 +207,52 @@ def _prediction_payload(bearing: str, row: pd.DataFrame, ts) -> dict:
 @app.get("/api/health")
 def health():
     return {"status": "ok", "n_snapshots": len(_timestamps), "model_loaded": _explainer.model is not None}
+
+
+@app.get("/api/platform/health")
+def platform_health():
+    settings = database_settings()
+    database_label = safe_database_label(settings.url)
+    with SessionLocal() as session:
+        try:
+            check_database(session)
+            existing_tables = set(inspect(session.bind).get_table_names())
+            expected_tables = set(Base.metadata.tables)
+            missing_tables = sorted(expected_tables.difference(existing_tables))
+        except SQLAlchemyError as exc:
+            return {
+                "status": "unhealthy",
+                "database_url": database_label,
+                "migrated": False,
+                "error": str(exc),
+            }
+        return {
+            "status": "ok" if not missing_tables else "unmigrated",
+            "database_url": database_label,
+            "migrated": not missing_tables,
+            "missing_tables": missing_tables,
+        }
+
+
+@app.post("/api/platform/bootstrap/ims")
+def bootstrap_platform_ims():
+    with SessionLocal() as session:
+        try:
+            summary = PlatformService(session).bootstrap_ims_registry()
+            session.commit()
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return summary.model_dump()
+
+
+@app.get("/api/platform/inventory")
+def platform_inventory():
+    with SessionLocal() as session:
+        try:
+            return get_platform_inventory(session)
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
 @app.get("/api/profile")

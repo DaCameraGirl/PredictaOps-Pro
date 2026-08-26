@@ -54,6 +54,43 @@ uvicorn app.main:app --reload
 
 Open `http://127.0.0.1:8000`.
 
+## Platform Core database
+
+PR #6 introduces the persistent platform registry underneath the existing IMS
+studio. The current dashboard still reads the committed IMS feature/model
+artifacts, while the new database layer provides the production identity model
+that later ingestion, serving, security, and operations slices build on.
+
+Local development defaults to SQLite at `data/platform_core.db` when
+`PMS_DATABASE_URL` is unset. Production should set `PMS_DATABASE_URL` to a
+PostgreSQL connection string, for example:
+
+```text
+PMS_DATABASE_URL=postgresql+psycopg://user:password@host:5432/predictive_maintenance
+```
+
+Run migrations and register the documented NASA/IMS runs as normal platform
+entities:
+
+```bash
+alembic upgrade head
+python scripts/bootstrap_platform.py
+```
+
+The bootstrap maps the existing dataset into the same hierarchy a plant uses:
+
+```text
+NASA/IMS Bearing Data Set -> IMS Bearing Test Rigs -> IMS Test 2 Machine -> Bearing 1 -> Sensor 1
+```
+
+Useful platform endpoints:
+
+```text
+GET  /api/platform/health
+POST /api/platform/bootstrap/ims
+GET  /api/platform/inventory
+```
+
 ## Rebuild the current Test 2 model
 
 The existing downloader is intentionally Test-2-only:
