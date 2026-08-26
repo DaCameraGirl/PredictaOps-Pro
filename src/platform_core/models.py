@@ -4,13 +4,13 @@ from datetime import datetime
 from uuid import uuid4
 
 from sqlalchemy import (
+    JSON,
     CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
     ForeignKeyConstraint,
     String,
-    Text,
     UniqueConstraint,
     func,
 )
@@ -242,6 +242,6 @@ class MachineReading(Base, TimestampMixin):
     unit: Mapped[str] = mapped_column(String(64), nullable=False)
     source: Mapped[str] = mapped_column(String(120), nullable=False)
     quality: Mapped[str] = mapped_column(String(32), nullable=False, default="good")
-    payload_json: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[dict | None] = mapped_column(JSON)
 
     sensor: Mapped[Sensor] = relationship(back_populates="readings")

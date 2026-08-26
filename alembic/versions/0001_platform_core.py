@@ -176,7 +176,7 @@ def upgrade() -> None:
         sa.Column("unit", sa.String(length=64), nullable=False),
         sa.Column("source", sa.String(length=120), nullable=False),
         sa.Column("quality", sa.String(length=32), nullable=False),
-        sa.Column("payload_json", sa.Text(), nullable=True),
+        sa.Column("payload", sa.JSON(), nullable=True),
         *timestamps(),
         sa.CheckConstraint("quality in ('good', 'suspect', 'bad', 'missing')", name="ck_reading_quality"),
         sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"]),

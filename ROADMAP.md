@@ -51,28 +51,29 @@ unsupported diagnostic model output into a supported maintenance prediction.
 
 ## Consecutive Production Slices
 
-These slices are ordered so every pull request can be reviewed and tested as a
-coherent production increment.
+These slices are ordered so every review branch can be reviewed and tested as a
+coherent production increment. Slice numbers are product architecture labels;
+GitHub pull request numbers may drift after branch renames or replacement PRs.
 
-1. **PR #6 - Platform Core**
+1. **Production Slice 6 - Platform Core**
    Database, organizations, users, sites, assets, components, sensors, canonical schemas, migrations, and persistence.
-2. **PR #7 - Industrial Ingestion**
+2. **Production Slice 7 - Industrial Ingestion**
    File ingestion, REST, MQTT, OPC-UA, adapter architecture, replay, validation, and units.
-3. **PR #8 - Analytics Pipeline**
+3. **Production Slice 8 - Analytics Pipeline**
    Streaming feature extraction, waveform storage, FFT, anomaly/degradation engine, and health state.
-4. **PR #9 - ML Platform**
+4. **Production Slice 9 - ML Platform**
    Dataset versions, experiments, model registry, cross-run validation, uncertainty, abstention, promotion, and rollback.
-5. **PR #10 - Production Serving**
+5. **Production Slice 10 - Production Serving**
    Per-asset model resolution, live predictions, drift, monitoring, and retraining triggers.
-6. **PR #11 - Maintenance Operations**
+6. **Production Slice 11 - Maintenance Operations**
    Alerts, cases, inspections, acknowledgement, technician notes, work orders, and CMMS adapter contract.
-7. **PR #12 - Enterprise Security**
+7. **Production Slice 12 - Enterprise Security**
    RBAC, SSO/OIDC, tenant isolation, audit logs, secrets, and security hardening.
-8. **PR #13 - Full Studio UI**
+8. **Production Slice 13 - Full Studio UI**
    Fleet to site to machine to bearing to sensor drill-down, health, risk, work-order, and model views.
-9. **PR #14 - Agentic Copilot**
+9. **Production Slice 14 - Agentic Copilot**
    Tool-using maintenance agent, citations, permissions, and human approval gates.
-10. **PR #15 - Production Hardening**
+10. **Production Slice 15 - Production Hardening**
     Load tests, failure recovery, backup/restore, observability, docs, deployment, and E2E gauntlet.
 
 The point is not to defer the real system. The point is to build the full system

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable
 
 from sqlalchemy import Select, func, select
@@ -39,6 +38,14 @@ class PlatformRepository:
 
     def count(self, model: type) -> int:
         return int(self.session.scalar(select(func.count()).select_from(model)) or 0)
+
+    def count_for_organization(self, model: type, organization_id: str) -> int:
+        return int(
+            self.session.scalar(
+                select(func.count()).select_from(model).where(model.organization_id == organization_id)
+            )
+            or 0
+        )
 
     def health_counts(self) -> dict[str, int]:
         return {
@@ -217,7 +224,7 @@ class PlatformRepository:
             unit=data.unit,
             source=data.source,
             quality=data.quality,
-            payload_json=json.dumps(data.payload, sort_keys=True) if data.payload is not None else None,
+            payload=data.payload,
         )
         self.session.add(reading)
         self.session.flush()
@@ -234,4 +241,3 @@ class PlatformRepository:
     def add_all(self, rows: Iterable[object]) -> None:
         self.session.add_all(rows)
         self.session.flush()
-

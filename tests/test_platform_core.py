@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -8,7 +9,7 @@ from uuid import UUID
 import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import sessionmaker
 
 from alembic import command
@@ -31,10 +32,23 @@ ROOT = Path(__file__).resolve().parent.parent
 
 @pytest.fixture
 def migrated_db(tmp_path, monkeypatch):
-    db_path = tmp_path / "platform.db"
-    url = f"sqlite:///{db_path.as_posix()}"
-    monkeypatch.setenv("PMS_DATABASE_URL", url)
+    external_url = os.environ.get("PMS_PLATFORM_CORE_TEST_DATABASE_URL")
+    if external_url:
+        url = external_url
+    else:
+        db_path = tmp_path / "platform.db"
+        url = f"sqlite:///{db_path.as_posix()}"
+        monkeypatch.setenv("PMS_DATABASE_URL", url)
+
     cfg = Config(str(ROOT / "alembic.ini"))
+    if external_url:
+        clean_engine = make_engine(url)
+        try:
+            Base.metadata.drop_all(clean_engine)
+            with clean_engine.begin() as connection:
+                connection.execute(text("DROP TABLE IF EXISTS alembic_version"))
+        finally:
+            clean_engine.dispose()
     command.upgrade(cfg, "head")
     engine = make_engine(url)
     session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
@@ -43,6 +57,10 @@ def migrated_db(tmp_path, monkeypatch):
     try:
         yield engine, session_factory
     finally:
+        if external_url:
+            Base.metadata.drop_all(engine)
+            with engine.begin() as connection:
+                connection.execute(text("DROP TABLE IF EXISTS alembic_version"))
         engine.dispose()
 
 
@@ -82,6 +100,9 @@ def test_bootstrap_registers_ims_as_normal_platform_entities(migrated_db):
         sensors = session.query(Sensor).filter_by(organization_id=org.id).all()
         assert {sensor.unit for sensor in sensors} == {"g"}
         assert {sensor.sampling_rate_hz for sensor in sensors} == {20000.0}
+        assert {sensor.manufacturer for sensor in sensors} == {None}
+        assert {sensor.model for sensor in sensors} == {None}
+        assert {sensor.axis for sensor in sensors} == {None}
 
 
 def test_ims_bootstrap_is_idempotent(migrated_db):
@@ -93,6 +114,44 @@ def test_ims_bootstrap_is_idempotent(migrated_db):
         session.commit()
 
     assert first == second
+
+
+def test_ims_bootstrap_counts_are_scoped_to_ims_organization(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        repo = PlatformRepository(session)
+        other_org = repo.create_organization(OrganizationCreate(slug="acme", name="Acme Manufacturing"))
+        site = repo.create_site(other_org.id, SiteCreate(slug="atlanta", name="Atlanta Plant"))
+        asset = repo.create_asset(
+            other_org.id,
+            AssetCreate(site_id=site.id, slug="pump-p-104", name="Pump P-104", asset_type="pump"),
+        )
+        component = repo.create_component(
+            other_org.id,
+            ComponentCreate(
+                asset_id=asset.id,
+                slug="drive-end-bearing",
+                name="Drive-End Bearing",
+                component_type="bearing",
+            ),
+        )
+        repo.create_sensor(
+            other_org.id,
+            SensorCreate(
+                component_id=component.id,
+                slug="vs-017",
+                name="Accelerometer VS-017",
+                sensor_type="accelerometer",
+                unit="g",
+            ),
+        )
+
+        summary = PlatformService(session).bootstrap_ims_registry()
+        session.commit()
+
+    assert summary.asset_count == 3
+    assert summary.component_count == 12
+    assert summary.sensor_count == 16
 
 
 def test_repository_blocks_cross_tenant_relationships(migrated_db):
@@ -180,7 +239,7 @@ def test_canonical_machine_reading_is_tenant_owned(migrated_db):
         assert saved is not None
         assert saved.organization_id == org.id
         assert saved.sensor_id == sensor.id
-        assert saved.payload_json == '{"schema": "canonical.machine_reading.v1"}'
+        assert saved.payload == {"schema": "canonical.machine_reading.v1"}
 
 
 def test_platform_api_health_bootstrap_and_inventory(migrated_db, model_dir, feature_table):
@@ -202,6 +261,9 @@ def test_platform_api_health_bootstrap_and_inventory(migrated_db, model_dir, fea
     assert inventory["organizations"][0]["slug"] == NASA_IMS_ORG_SLUG
     assert len(inventory["assets"]) == 3
     assert len(inventory["sensors"]) == 16
+    assert {sensor["axis"] for sensor in inventory["sensors"]} == {None}
+    assert {sensor["manufacturer"] for sensor in inventory["sensors"]} == {None}
+    assert {sensor["model"] for sensor in inventory["sensors"]} == {None}
 
 
 def test_existing_ims_dashboard_api_still_serves_after_platform_core(migrated_db, model_dir, feature_table):

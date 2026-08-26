@@ -51,9 +51,9 @@ class PlatformService:
         return PlatformBootstrapSummary(
             organization_id=org.id,
             site_id=site.id,
-            asset_count=self.repo.count(Asset),
-            component_count=self.repo.count(Component),
-            sensor_count=self.repo.count(Sensor),
+            asset_count=self.repo.count_for_organization(Asset, org.id),
+            component_count=self.repo.count_for_organization(Component, org.id),
+            sensor_count=self.repo.count_for_organization(Sensor, org.id),
         )
 
     def _bootstrap_components(
@@ -97,9 +97,6 @@ class PlatformService:
                     unit="g",
                     sampling_rate_hz=float(run_spec.sampling_rate_hz),
                     channel_name=f"channel_{channel.channel_index}",
-                    axis=channel.sensor_id.removeprefix("sensor_") or None,
-                    manufacturer="IMS Center, University of Cincinnati",
-                    model="NASA/IMS bearing test accelerometer",
                     external_ref=f"{run_spec.run_id}:{channel.bearing}:{channel.sensor_id}",
                 ),
             )
@@ -142,6 +139,9 @@ def get_platform_inventory(session: Session) -> dict:
                 "unit": sensor.unit,
                 "sampling_rate_hz": sensor.sampling_rate_hz,
                 "channel_name": sensor.channel_name,
+                "axis": sensor.axis,
+                "manufacturer": sensor.manufacturer,
+                "model": sensor.model,
             }
             for sensor in repo.list_sensors(org.id)
         ],

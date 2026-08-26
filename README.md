@@ -56,7 +56,7 @@ Open `http://127.0.0.1:8000`.
 
 ## Platform Core database
 
-PR #6 introduces the persistent platform registry underneath the existing IMS
+Production Slice 6 introduces the persistent platform registry underneath the existing IMS
 studio. The current dashboard still reads the committed IMS feature/model
 artifacts, while the new database layer provides the production identity model
 that later ingestion, serving, security, and operations slices build on.

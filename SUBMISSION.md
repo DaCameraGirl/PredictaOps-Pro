@@ -153,9 +153,9 @@ exports, production tests, browser E2E, and an agentic maintenance
 copilot with tool use, citations, permissions, and human approval gates.
 
 That scope should be built through consecutive production slices, not
-one giant pull request. PR #6 establishes platform core: database,
-organizations, users, sites, assets, components, sensors, canonical
-schemas, migrations, and persistence. The following slices add
+one giant pull request. Production Slice 6 establishes platform core:
+database, organizations, users, sites, assets, components, sensors,
+canonical schemas, migrations, and persistence. The following slices add
 industrial ingestion, analytics, ML platform, production serving,
 maintenance operations, enterprise security, full studio UI, agentic
 copilot, and production hardening. The sequence is documented in
