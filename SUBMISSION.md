@@ -94,6 +94,14 @@ second depends on a regression model generalizing from one observed
 failure pattern. Collapsing them into a single confident-sounding number
 would overstate what the system actually knows.
 
+We also treat **model abstention** as a production feature. If an asset
+or snapshot falls outside the model's validated RUL domain, the API does
+not turn the raw model output into a supported prediction. It responds
+with `unsupported` or `insufficient_evidence`, names the validated
+domain, and reports what evidence is still known: degradation state,
+observed baseline status, right-censoring status, and the diagnostic
+model output for inspection.
+
 ## Honest handling of censored data
 
 Only bearing 1 failed during this test. Bearings 2, 3, and 4 were still
@@ -131,24 +139,24 @@ scrutiny, not a minimum viable product aimed at shipping.
 
 ## Path to production
 
-The single biggest limitation here is the single failure trajectory,
-and the fix is more real data, not more modeling cleverness:
+The target is the complete production Predictive Maintenance Studio,
+not a demo that adds the real concerns later. The full system includes
+multi-company and multi-site asset management, sensor registries,
+canonical schemas, file/REST/MQTT/OPC-UA ingestion, ABB integration
+points, waveform and feature storage, real-time vibration analytics,
+multiple failure modes, model registry, experiment tracking,
+cross-asset validation, calibrated uncertainty, abstention, model
+promotion/rollback, drift detection, retraining triggers, maintenance
+workflows, CMMS integration, RBAC, SSO/OIDC, audit logs, tenant
+isolation, observability, backups, deployment automation, API docs,
+exports, production tests, browser E2E, and an agentic maintenance
+copilot with tool use, citations, permissions, and human approval gates.
 
-1. **Incorporate the other IMS test runs.** The same dataset includes
-   two more test sets with additional real failures (inner race and
-   rolling-element defects), giving multiple independent failure
-   trajectories instead of one.
-2. **Move to cross-run validation.** With multiple real failures, we can
-   hold out entire failure runs the way the original design held out
-   whole turbofan engines, real generalization testing across assets,
-   not just across time within one asset.
-3. **Calibrated, conditional prediction intervals**, once there's enough
-   data to fit them properly (quantile regression or conformal
-   prediction) instead of the current global residual-based range.
-4. **Streaming ingestion** from live accelerometer feeds instead of
-   static files, with the same feature extraction and degradation
-   signal running continuously.
-5. **Model monitoring and retraining triggers** as new failure events
-   accumulate, so the model's confirmed-failure sample size actually
-   grows over time in deployment, closing the gap this submission is
-   upfront about.
+That scope should be built through consecutive production slices, not
+one giant pull request. PR #6 establishes platform core: database,
+organizations, users, sites, assets, components, sensors, canonical
+schemas, migrations, and persistence. The following slices add
+industrial ingestion, analytics, ML platform, production serving,
+maintenance operations, enterprise security, full studio UI, agentic
+copilot, and production hardening. The sequence is documented in
+`ROADMAP.md`.

@@ -29,6 +29,31 @@ def test_only_bearing_1_ever_carries_true_rul(client):
             assert b["has_ground_truth"] is False
 
 
+def test_rul_prediction_abstains_for_right_censored_bearings(client):
+    resp = client.get("/api/snapshot/930")
+    assert resp.status_code == 200
+    for b in resp.json()["bearings"]:
+        if b["bearing"] == "bearing_1":
+            assert b["rul_prediction_supported"] is True
+            assert b["prediction_status"] == "supported"
+            assert b["predicted_rul"] is not None
+            continue
+        assert b["rul_prediction_supported"] is False
+        assert b["prediction_status"] == "unsupported"
+        assert b["predicted_rul"] is None
+        assert b["diagnostic_model_output_rul"] >= 0.0
+        assert "right-censored" in " ".join(b["known_evidence"])
+
+
+def test_rul_prediction_abstains_until_baseline_is_established(client):
+    detail = client.get("/api/snapshot/0/bearing/bearing_1").json()
+    assert detail["rul_prediction_supported"] is False
+    assert detail["prediction_status"] == "insufficient_evidence"
+    assert detail["predicted_rul"] is None
+    assert detail["diagnostic_model_output_rul"] >= 0.0
+    assert "baseline" in detail["abstention_reason"]
+
+
 def test_interval_is_explicitly_labeled_as_not_calibrated(client):
     resp = client.get("/api/snapshot/930/bearing/bearing_1")
     note = resp.json()["interval_80"]["note"]
@@ -56,7 +81,9 @@ def test_predicted_rul_is_never_negative_across_the_full_timeline(client):
     for index in (0, n // 4, n // 2, 3 * n // 4, n - 1):
         snap = client.get(f"/api/snapshot/{index}")
         for b in snap.json()["bearings"]:
-            assert b["predicted_rul"] >= 0.0
+            if b["predicted_rul"] is not None:
+                assert b["predicted_rul"] >= 0.0
+            assert b["diagnostic_model_output_rul"] >= 0.0
 
 
 def test_out_of_range_snapshot_index_is_a_clean_404(client):
