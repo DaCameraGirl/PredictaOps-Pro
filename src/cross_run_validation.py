@@ -181,6 +181,13 @@ def leave_one_run_out_folds(labeled: pd.DataFrame) -> list[tuple[str, pd.DataFra
     return folds
 
 
+def equal_run_sample_weights(train: pd.DataFrame) -> np.ndarray:
+    """Give every training run equal total weight regardless of duration/row count."""
+    counts = train.groupby("run_id")["run_id"].transform("size").to_numpy(dtype=float)
+    weights = 1.0 / counts
+    return weights / weights.mean()
+
+
 def _fold_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     residual = y_pred - y_true
     dangerous = residual > 0
@@ -207,14 +214,27 @@ def run_leave_one_run_out_validation(
     all_baseline: list[np.ndarray] = []
 
     for held_out_run, train, test in leave_one_run_out_folds(labeled):
+        sample_weight = equal_run_sample_weights(train)
         model = model_factory()
-        model.fit(train[list(AGGREGATED_FEATURES)], train["RUL_hours"])
+        model.fit(
+            train[list(AGGREGATED_FEATURES)],
+            train["RUL_hours"],
+            sample_weight=sample_weight,
+        )
         prediction = np.asarray(model.predict(test[list(AGGREGATED_FEATURES)]), dtype=float)
         truth = test["RUL_hours"].to_numpy(dtype=float)
-        baseline = np.full(len(test), float(train["RUL_hours"].mean()))
+        baseline_value = float(np.average(train["RUL_hours"].to_numpy(), weights=sample_weight))
+        baseline = np.full(len(test), baseline_value)
 
         model_metrics = _fold_metrics(truth, prediction)
         baseline_metrics = _fold_metrics(truth, baseline)
+        run_weight_frame = pd.DataFrame(
+            {"run_id": train["run_id"].astype(str).to_numpy(), "weight": sample_weight}
+        )
+        run_weight_totals = {
+            run_id: float(weight)
+            for run_id, weight in run_weight_frame.groupby("run_id")["weight"].sum().items()
+        }
         fold_result = {
             "held_out_run": held_out_run,
             "train_runs": sorted(train["run_id"].astype(str).unique().tolist()),
@@ -222,6 +242,7 @@ def run_leave_one_run_out_validation(
             "held_out_trajectories": sorted(test["trajectory_id"].astype(str).unique().tolist()),
             "train_rows": int(len(train)),
             "test_rows": int(len(test)),
+            "train_run_weight_totals": run_weight_totals,
             **model_metrics,
             "baseline_mae_hours": baseline_metrics["mae_hours"],
             "baseline_rmse_hours": baseline_metrics["rmse_hours"],
@@ -254,7 +275,8 @@ def run_leave_one_run_out_validation(
         "validation_method": "leave-one-entire-IMS-run-out",
         "target": "RUL_hours_to_documented_experiment_endpoint",
         "feature_aggregation": "one physical bearing/timestamp; sensor max-absolute",
-        "baseline": "training-fold mean RUL_hours",
+        "training_weighting": "equal total sample weight per training run",
+        "baseline": "equal-run-weighted training mean RUL_hours",
         "model_features": list(AGGREGATED_FEATURES),
         "n_runs": len(fold_results),
         "folds": fold_results,
