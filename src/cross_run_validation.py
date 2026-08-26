@@ -209,13 +209,17 @@ def run_leave_one_run_out_validation(
     fold_results: list[dict] = []
     all_true: list[np.ndarray] = []
     all_pred: list[np.ndarray] = []
+    all_baseline: list[np.ndarray] = []
 
     for held_out_run, train, test in leave_one_run_out_folds(labeled):
         model = model_factory()
         model.fit(train[list(AGGREGATED_FEATURES)], train["RUL_hours"])
         prediction = np.asarray(model.predict(test[list(AGGREGATED_FEATURES)]), dtype=float)
         truth = test["RUL_hours"].to_numpy(dtype=float)
+        baseline = np.full(len(test), float(train["RUL_hours"].mean()))
 
+        model_metrics = _fold_metrics(truth, prediction)
+        baseline_metrics = _fold_metrics(truth, baseline)
         fold_result = {
             "held_out_run": held_out_run,
             "train_runs": sorted(train["run_id"].astype(str).unique().tolist()),
@@ -223,7 +227,10 @@ def run_leave_one_run_out_validation(
             "held_out_trajectories": sorted(test["trajectory_id"].astype(str).unique().tolist()),
             "train_rows": int(len(train)),
             "test_rows": int(len(test)),
-            **_fold_metrics(truth, prediction),
+            **model_metrics,
+            "baseline_mae_hours": baseline_metrics["mae_hours"],
+            "baseline_rmse_hours": baseline_metrics["rmse_hours"],
+            "beats_baseline_mae": model_metrics["mae_hours"] < baseline_metrics["mae_hours"],
         }
 
         late_life = test["life_fraction_remaining"].to_numpy(dtype=float) <= 0.25
@@ -237,17 +244,26 @@ def run_leave_one_run_out_validation(
         fold_results.append(fold_result)
         all_true.append(truth)
         all_pred.append(prediction)
+        all_baseline.append(baseline)
 
     combined_true = np.concatenate(all_true)
     combined_pred = np.concatenate(all_pred)
+    combined_baseline = np.concatenate(all_baseline)
+    overall = _fold_metrics(combined_true, combined_pred)
+    overall_baseline = _fold_metrics(combined_true, combined_baseline)
+    overall["baseline_mae_hours"] = overall_baseline["mae_hours"]
+    overall["baseline_rmse_hours"] = overall_baseline["rmse_hours"]
+    overall["beats_baseline_mae"] = overall["mae_hours"] < overall_baseline["mae_hours"]
+
     return {
         "validation_method": "leave-one-entire-IMS-run-out",
         "target": "RUL_hours_to_documented_experiment_endpoint",
         "feature_aggregation": "one physical bearing/timestamp; sensor mean + sensor max-absolute",
+        "baseline": "training-fold mean RUL_hours",
         "model_features": list(AGGREGATED_FEATURES),
         "n_runs": len(fold_results),
         "folds": fold_results,
-        "overall": _fold_metrics(combined_true, combined_pred),
+        "overall": overall,
     }
 
 
