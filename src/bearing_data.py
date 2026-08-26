@@ -36,6 +36,11 @@ class FailureSpec:
     endpoint_timestamp: datetime
     failure_mode: str
 
+    @property
+    def failure_timestamp(self) -> datetime:
+        """Compatibility alias for code written before endpoint semantics were explicit."""
+        return self.endpoint_timestamp
+
 
 @dataclass(frozen=True)
 class ChannelSpec:
@@ -168,11 +173,14 @@ IMS_TEST3 = RunSpec(
     ),
 )
 
-RUN_SPECS = {
+ALL_RUN_SPECS = {
     IMS_TEST1.run_id: IMS_TEST1,
     IMS_TEST2.run_id: IMS_TEST2,
     IMS_TEST3.run_id: IMS_TEST3,
 }
+# The existing trainer remains Test-2-only until cross-run validation and
+# per-run model artifacts are implemented. Preparation tools use ALL_RUN_SPECS.
+RUN_SPECS = {IMS_TEST2.run_id: IMS_TEST2}
 DEFAULT_RUN = IMS_TEST2
 
 # Backward-compatible names for the existing Test 2 dashboard and artifacts.
@@ -194,9 +202,9 @@ class DatasetValidationError(Exception):
 
 def get_run_spec(run_id: str) -> RunSpec:
     try:
-        return RUN_SPECS[run_id]
+        return ALL_RUN_SPECS[run_id]
     except KeyError as exc:
-        known = ", ".join(sorted(RUN_SPECS))
+        known = ", ".join(sorted(ALL_RUN_SPECS))
         raise ValueError(f"unknown run {run_id!r}; expected one of: {known}") from exc
 
 
