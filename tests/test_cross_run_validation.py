@@ -182,6 +182,8 @@ def test_leave_one_run_out_validation_reports_baseline_and_disjoint_folds():
     for fold in result["folds"]:
         assert fold["held_out_run"] not in fold["train_runs"]
         assert "baseline_mae_hours" in fold
+        weight_totals = list(fold["train_run_weight_totals"].values())
+        assert max(weight_totals) == pytest.approx(min(weight_totals))
         assert fold["beats_baseline_mae"] is False
     assert result["overall"]["beats_baseline_mae"] is False
 
@@ -201,5 +203,5 @@ def test_missing_prepared_runs_fail_loudly_before_validation(tmp_path, monkeypat
     }
     monkeypatch.setattr(cross_run_validation, "get_run_spec", lambda run_id: specs[run_id])
 
-    with pytest.raises(MissingPreparedRunError, match="prepare_bearing_run.py"):
+    with pytest.raises(MissingPreparedRunError, match=r"prepare_bearing_run\.py"):
         load_prepared_failure_data(["ims_test1", "ims_test3"])
