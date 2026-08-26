@@ -70,5 +70,8 @@ jobs:
       - name: Test Platform Core against PostgreSQL
         run: pytest tests/test_platform_core.py -v
 
+      - name: Recreate PostgreSQL schema for bootstrap
+        run: alembic upgrade head
+
       - name: Bootstrap IMS registry on PostgreSQL
         run: python scripts/bootstrap_platform.py
