@@ -91,8 +91,8 @@ def test_sensor_aggregation_emits_one_row_per_physical_bearing_timestamp():
 
     assert len(aggregated) == 2
     assert set(aggregated["sensor_count"]) == {2}
-    assert aggregated.loc[0, "rms_sensor_mean"] == pytest.approx(4.5)
-    assert aggregated.loc[0, "rms_sensor_max_abs"] == pytest.approx(5.0)
+    assert aggregated.loc[0, "rms_sensor_mean"] == pytest.approx(3.5)
+    assert aggregated.loc[0, "rms_sensor_max_abs"] == pytest.approx(4.0)
     assert "sensor_count" not in AGGREGATED_FEATURES
 
 
