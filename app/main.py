@@ -45,6 +45,8 @@ from platform_core.config import database_settings, safe_database_label
 from platform_core.database import SessionLocal, check_database
 from platform_core.models import Base
 from platform_core.services import PlatformService, get_platform_inventory
+from production_serving.contracts import PredictionRequest, ServingBindingCreate
+from production_serving.service import ProductionServingService
 from vibration_analysis import analyze
 from waveform_cache import WaveformCache
 
@@ -558,6 +560,55 @@ def rollback_ml_model_version(organization_id: str, registry_id: str, request: R
         return _model_version_payload(model_version)
 
 
+@app.post("/api/serving/{organization_id}/bindings")
+def create_serving_binding(organization_id: str, request: ServingBindingCreate):
+    with SessionLocal() as session:
+        try:
+            binding = ProductionServingService(session).bind_model(organization_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return _serving_binding_payload(binding)
+
+
+@app.post("/api/serving/{organization_id}/predict/rul")
+def predict_production_rul(organization_id: str, request: PredictionRequest):
+    with SessionLocal() as session:
+        try:
+            prediction = ProductionServingService(session).predict_rul(organization_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return prediction.model_dump()
+
+
+@app.get("/api/serving/{organization_id}/predictions")
+def list_production_predictions(organization_id: str, sensor_id: str | None = None):
+    with SessionLocal() as session:
+        try:
+            predictions = ProductionServingService(session).prediction_history(organization_id, sensor_id=sensor_id)
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return {"predictions": predictions}
+
+
+@app.get("/api/serving/{organization_id}/health")
+def production_serving_health(organization_id: str):
+    with SessionLocal() as session:
+        try:
+            return ProductionServingService(session).health(organization_id)
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
 def _dataset_version_payload(dataset) -> dict:
     return {
         "id": dataset.id,
@@ -628,6 +679,22 @@ def _model_version_payload(model_version) -> dict:
         "provenance": model_version.provenance,
         "approved_by_user_id": model_version.approved_by_user_id,
         "approved_at": model_version.approved_at.isoformat() if model_version.approved_at else None,
+    }
+
+
+def _serving_binding_payload(binding) -> dict:
+    return {
+        "id": binding.id,
+        "organization_id": binding.organization_id,
+        "registry_id": binding.registry_id,
+        "model_version_id": binding.model_version_id,
+        "scope_type": binding.scope_type,
+        "scope_id": binding.scope_id,
+        "status": binding.status,
+        "approved_by_user_id": binding.approved_by_user_id,
+        "activated_at": binding.activated_at.isoformat() if binding.activated_at else None,
+        "reason": binding.reason,
+        "provenance": binding.provenance,
     }
 
 

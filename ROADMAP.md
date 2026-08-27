@@ -72,7 +72,10 @@ GitHub pull request numbers may drift after branch renames or replacement PRs.
    abstention contracts, candidate to validated to production promotion with explicit human approval, rollback, per-model
    provenance, tenant isolation, API endpoints, and PostgreSQL migration/CI coverage.
 5. **Production Slice 10 - Production Serving**
-   Per-asset model resolution, live predictions, drift, monitoring, and retraining triggers.
+   Tenant-aware model-serving bindings, per-organization/site/asset/component/sensor model resolution, verified
+   production-stage artifact loading, live feature vectors from canonical analytics, executable abstention, prediction
+   provenance, persisted model-resolution decisions, drift and data-quality monitoring, retraining triggers without
+   silent auto-promotion, REST endpoints, and PostgreSQL migration/CI coverage.
 6. **Production Slice 11 - Maintenance Operations**
    Alerts, cases, inspections, acknowledgement, technician notes, work orders, and CMMS adapter contract.
 7. **Production Slice 12 - Enterprise Security**

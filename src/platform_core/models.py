@@ -679,3 +679,169 @@ class MLModelPromotionEvent(Base, TimestampMixin):
     approved_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     reason: Mapped[str | None] = mapped_column(String(1024))
     event_metadata: Mapped[dict | None] = mapped_column(JSON)
+
+
+class ModelServingBinding(Base, TimestampMixin):
+    __tablename__ = "model_serving_bindings"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_model_serving_bindings_org_id"),
+        ForeignKeyConstraint(
+            ["organization_id", "registry_id"],
+            ["ml_model_registries.organization_id", "ml_model_registries.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "model_version_id"],
+            ["ml_model_versions.organization_id", "ml_model_versions.id"],
+        ),
+        CheckConstraint(
+            "scope_type in ('organization', 'site', 'asset', 'component', 'sensor')",
+            name="ck_model_serving_binding_scope",
+        ),
+        CheckConstraint("status in ('active', 'disabled')", name="ck_model_serving_binding_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    registry_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    model_version_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    scope_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    scope_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    approved_by_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    activated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    reason: Mapped[str | None] = mapped_column(String(1024))
+    provenance: Mapped[dict | None] = mapped_column(JSON)
+
+
+class ProductionModelResolution(Base, TimestampMixin):
+    __tablename__ = "production_model_resolutions"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_production_model_resolutions_org_id"),
+        ForeignKeyConstraint(
+            ["organization_id", "binding_id"],
+            ["model_serving_bindings.organization_id", "model_serving_bindings.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "registry_id"],
+            ["ml_model_registries.organization_id", "ml_model_registries.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "model_version_id"],
+            ["ml_model_versions.organization_id", "ml_model_versions.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "dataset_version_id"],
+            ["ml_dataset_versions.organization_id", "ml_dataset_versions.id"],
+        ),
+        ForeignKeyConstraint(["organization_id", "sensor_id"], ["sensors.organization_id", "sensors.id"]),
+        CheckConstraint("status in ('resolved', 'abstained', 'failed')", name="ck_production_model_resolution_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    binding_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    registry_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    model_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    dataset_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    sensor_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(120), nullable=False)
+    reason: Mapped[str] = mapped_column(String(255), nullable=False)
+    artifact_sha256: Mapped[str | None] = mapped_column(String(64))
+    feature_schema: Mapped[list[str] | None] = mapped_column(JSON)
+    abstention_policy: Mapped[dict | None] = mapped_column(JSON)
+    resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    evidence: Mapped[dict | None] = mapped_column(JSON)
+
+
+class PredictionRecord(Base, TimestampMixin):
+    __tablename__ = "prediction_records"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_prediction_records_org_id"),
+        ForeignKeyConstraint(
+            ["organization_id", "model_resolution_id"],
+            ["production_model_resolutions.organization_id", "production_model_resolutions.id"],
+        ),
+        ForeignKeyConstraint(["organization_id", "sensor_id"], ["sensors.organization_id", "sensors.id"]),
+        ForeignKeyConstraint(
+            ["organization_id", "registry_id"],
+            ["ml_model_registries.organization_id", "ml_model_registries.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "model_version_id"],
+            ["ml_model_versions.organization_id", "ml_model_versions.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "dataset_version_id"],
+            ["ml_dataset_versions.organization_id", "ml_dataset_versions.id"],
+        ),
+        CheckConstraint(
+            "prediction_status in ('supported', 'unsupported', 'insufficient_evidence')",
+            name="ck_prediction_record_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    model_resolution_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    registry_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    model_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    dataset_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    sensor_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    prediction_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    predicted_rul_hours: Mapped[float | None] = mapped_column(Float)
+    abstention_code: Mapped[str | None] = mapped_column(String(120))
+    uncertainty: Mapped[dict | None] = mapped_column(JSON)
+    feature_vector: Mapped[dict | None] = mapped_column(JSON)
+    feature_record_ids: Mapped[list[str] | None] = mapped_column(JSON)
+    abstention_reason: Mapped[str | None] = mapped_column(String(1024))
+    provenance: Mapped[dict | None] = mapped_column(JSON)
+
+
+class ModelServingMonitor(Base, TimestampMixin):
+    __tablename__ = "model_serving_monitors"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "model_version_id"],
+            ["ml_model_versions.organization_id", "ml_model_versions.id"],
+        ),
+        ForeignKeyConstraint(["organization_id", "sensor_id"], ["sensors.organization_id", "sensors.id"]),
+        CheckConstraint(
+            "status in ('ok', 'drifted', 'insufficient_evidence', 'failed')",
+            name="ck_model_serving_monitor_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    model_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    sensor_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    metric_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    drift_score: Mapped[float | None] = mapped_column(Float)
+    threshold: Mapped[float | None] = mapped_column(Float)
+    evidence: Mapped[dict | None] = mapped_column(JSON)
+
+
+class RetrainingTrigger(Base, TimestampMixin):
+    __tablename__ = "retraining_triggers"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "model_version_id"],
+            ["ml_model_versions.organization_id", "ml_model_versions.id"],
+        ),
+        ForeignKeyConstraint(["organization_id", "sensor_id"], ["sensors.organization_id", "sensors.id"]),
+        CheckConstraint("status in ('open', 'acknowledged', 'resolved')", name="ck_retraining_trigger_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    model_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    sensor_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    trigger_kind: Mapped[str] = mapped_column(String(120), nullable=False)
+    reason: Mapped[str] = mapped_column(String(1024), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
+    triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    evidence: Mapped[dict | None] = mapped_column(JSON)
