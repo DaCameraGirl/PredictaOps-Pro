@@ -4,6 +4,7 @@ import importlib
 import io
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -13,6 +14,7 @@ from sqlalchemy import func, inspect, select, text
 from sqlalchemy.orm import sessionmaker
 
 from alembic import command
+from industrial_ingestion.connectors import AbbApiConnector, MqttIngestionConnector, OpcUaIngestionConnector, run_async
 from industrial_ingestion.service import IngestionService
 from industrial_ingestion.waveform_store import LocalWaveformStore
 from platform_core.contracts import (
@@ -319,6 +321,182 @@ def test_mqtt_opcua_and_abb_adapters_emit_canonical_scalars(migrated_db, tenant_
         assert session.scalar(select(func.count()).select_from(MachineReading)) == 3
 
 
+def test_native_mqtt_connector_subscribes_and_ingests_messages(migrated_db, tenant_sensor):
+    class FakeMqttClient:
+        def __init__(self):
+            self.subscriptions = []
+            self.connected = None
+            self.loop_started = False
+            self.on_message = None
+
+        def username_pw_set(self, username, password):
+            self.credentials = (username, password)
+
+        def connect(self, host, port, keepalive):
+            self.connected = (host, port, keepalive)
+
+        def subscribe(self, topic):
+            self.subscriptions.append(topic)
+
+        def loop_start(self):
+            self.loop_started = True
+
+        def loop_stop(self):
+            self.loop_started = False
+
+        def disconnect(self):
+            self.disconnected = True
+
+    fake_client = FakeMqttClient()
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        service = IngestionService(session)
+        handle = MqttIngestionConnector(service, client_factory=lambda: fake_client).start_subscription(
+            tenant_sensor["organization_id"],
+            broker_host="mqtt.example.test",
+            topics=["plant/acme/vs-017"],
+            username="service",
+            password="secret",
+        )
+        message = SimpleNamespace(
+            topic="plant/acme/vs-017",
+            payload=(
+                '{"records":[{"kind":"scalar","sensor_external_ref":"'
+                + tenant_sensor["sensor_external_ref"]
+                + '","observed_at":"2026-08-26T12:00:00Z","metric":"rms","value":0.2,'
+                '"unit":"g","source_record_id":"native-mqtt-1"}]}'
+            ).encode(),
+        )
+        fake_client.on_message(fake_client, None, message)
+        handle.stop()
+        session.commit()
+
+        assert fake_client.connected == ("mqtt.example.test", 1883, 60)
+        assert fake_client.credentials == ("service", "secret")
+        assert fake_client.subscriptions == ["plant/acme/vs-017"]
+        assert fake_client.disconnected is True
+        assert session.scalar(select(func.count()).select_from(MachineReading)) == 1
+
+
+def test_native_opcua_connector_connects_subscribes_and_polls(migrated_db, tenant_sensor):
+    class FakeOpcNode:
+        def __init__(self, node_id):
+            self.node_id = node_id
+
+        async def read_value(self):
+            return 0.33
+
+        def __str__(self):
+            return self.node_id
+
+    class FakeSubscription:
+        def __init__(self):
+            self.nodes = []
+
+        async def subscribe_data_change(self, nodes):
+            self.nodes = nodes
+
+    class FakeOpcClient:
+        def __init__(self, endpoint):
+            self.endpoint = endpoint
+            self.connected = False
+            self.disconnected = False
+            self.subscription = FakeSubscription()
+
+        async def connect(self):
+            self.connected = True
+
+        async def disconnect(self):
+            self.disconnected = True
+
+        def get_node(self, node_id):
+            return FakeOpcNode(node_id)
+
+        async def create_subscription(self, publishing_interval_ms, handler):
+            self.publishing_interval_ms = publishing_interval_ms
+            self.handler = handler
+            return self.subscription
+
+    clients = []
+
+    def client_factory(endpoint):
+        client = FakeOpcClient(endpoint)
+        clients.append(client)
+        return client
+
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        connector = OpcUaIngestionConnector(IngestionService(session), client_factory=client_factory)
+        subscription = run_async(
+            connector.subscribe_data_changes(
+                tenant_sensor["organization_id"],
+                endpoint="opc.tcp://localhost:4840",
+                node_ids=[tenant_sensor["sensor_external_ref"]],
+            )
+        )
+        receipts = run_async(
+            connector.poll_once(
+                tenant_sensor["organization_id"],
+                endpoint="opc.tcp://localhost:4840",
+                node_ids=[tenant_sensor["sensor_external_ref"]],
+            )
+        )
+        session.commit()
+
+        assert subscription.nodes[0].node_id == tenant_sensor["sensor_external_ref"]
+        assert clients[0].connected is True
+        assert clients[0].publishing_interval_ms == 1000
+        assert clients[1].disconnected is True
+        assert receipts[0].accepted_count == 1
+        assert session.scalar(select(func.count()).select_from(MachineReading)) == 1
+
+
+def test_abb_api_connector_fetches_with_credentials_and_ingests(migrated_db, tenant_sensor):
+    class FakeResponse:
+        def raise_for_status(self):
+            self.raised = True
+
+        def json(self):
+            return {
+                "measurements": [
+                    {
+                        "sensorExternalRef": tenant_sensor["sensor_external_ref"],
+                        "observedAt": "2026-08-26T12:00:00Z",
+                        "metric": "rms",
+                        "value": 0.28,
+                        "unit": "g",
+                        "id": "abb-native-1",
+                    }
+                ]
+            }
+
+    class FakeHttpClient:
+        def get(self, path, params=None, headers=None):
+            self.request = {"path": path, "params": params, "headers": headers}
+            return FakeResponse()
+
+    fake_client = FakeHttpClient()
+
+    def client_factory(**_kwargs):
+        return fake_client
+
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        receipt = AbbApiConnector(IngestionService(session), client_factory=client_factory).fetch_measurements(
+            tenant_sensor["organization_id"],
+            base_url="https://abb.example.test/api",
+            token="token-123",
+            asset_id="pump-p-104",
+        )
+        session.commit()
+
+        assert receipt.accepted_count == 1
+        assert fake_client.request["path"] == "/measurements"
+        assert fake_client.request["params"] == {"asset_id": "pump-p-104"}
+        assert fake_client.request["headers"] == {"Authorization": "Bearer token-123"}
+        assert session.scalar(select(func.count()).select_from(MachineReading)) == 1
+
+
 def test_waveform_ingestion_uses_first_class_records_not_machine_reading_payload(migrated_db, tenant_sensor, tmp_path):
     _engine, session_factory = migrated_db
     with session_factory() as session:
@@ -348,6 +526,70 @@ def test_waveform_ingestion_uses_first_class_records_not_machine_reading_payload
         assert session.scalar(select(func.count()).select_from(MachineReading)) == 0
         assert waveform.sample_count == 4
         assert Path(waveform.storage_uri).exists()
+        assert ".." not in Path(waveform.storage_uri).name
+
+
+def test_waveform_store_hashes_external_record_ids_for_object_names(migrated_db, tenant_sensor, tmp_path):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        service = IngestionService(session, waveform_store=LocalWaveformStore(tmp_path / "waveforms"))
+        service.ingest(
+            tenant_sensor["organization_id"],
+            source_type="rest",
+            source_name="Waveform REST",
+            payload={
+                "records": [
+                    {
+                        "kind": "waveform",
+                        "sensor_id": tenant_sensor["sensor_id"],
+                        "observed_at": "2026-08-26T12:00:00Z",
+                        "unit": "g",
+                        "sampling_rate_hz": 20000.0,
+                        "samples": [0.1, 0.2],
+                        "source_record_id": "../escape",
+                    }
+                ]
+            },
+        )
+        session.commit()
+
+        waveform = session.scalar(select(WaveformRecord))
+        path = Path(waveform.storage_uri)
+        assert path.exists()
+        assert path.parent.parent == tmp_path / "waveforms" / tenant_sensor["organization_id"]
+        assert "escape" not in path.name
+        assert "/" not in path.name
+        assert "\\" not in path.name
+
+
+def test_external_waveform_without_content_checksum_remains_unverified(migrated_db, tenant_sensor):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        receipt = IngestionService(session).ingest(
+            tenant_sensor["organization_id"],
+            source_type="rest",
+            source_name="Waveform REST",
+            payload={
+                "records": [
+                    {
+                        "kind": "waveform",
+                        "sensor_id": tenant_sensor["sensor_id"],
+                        "observed_at": "2026-08-26T12:00:00Z",
+                        "unit": "g",
+                        "sampling_rate_hz": 20000.0,
+                        "storage_uri": "s3://bucket/vibration.bin",
+                        "sample_count": 20480,
+                        "source_record_id": "external-wave-1",
+                    }
+                ]
+            },
+        )
+        session.commit()
+
+        waveform = session.scalar(select(WaveformRecord))
+        assert receipt.waveform_count == 1
+        assert waveform.storage_uri == "s3://bucket/vibration.bin"
+        assert waveform.sha256 is None
 
 
 def test_replay_reingests_previous_batch_through_replay_adapter(migrated_db, tenant_sensor):

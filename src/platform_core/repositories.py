@@ -430,7 +430,7 @@ class PlatformRepository:
         source: str,
         quality: str,
         storage_uri: str,
-        sha256: str,
+        sha256: str | None,
         metadata_json: dict | None,
     ) -> WaveformRecord:
         sensor = self.session.get(Sensor, sensor_id)

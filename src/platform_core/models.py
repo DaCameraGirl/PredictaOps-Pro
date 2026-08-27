@@ -398,7 +398,7 @@ class WaveformRecord(Base, TimestampMixin):
     source: Mapped[str] = mapped_column(String(120), nullable=False)
     quality: Mapped[str] = mapped_column(String(32), nullable=False, default="good")
     storage_uri: Mapped[str] = mapped_column(String(1024), nullable=False)
-    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    sha256: Mapped[str | None] = mapped_column(String(64))
     metadata_json: Mapped[dict | None] = mapped_column(JSON)
 
     sensor: Mapped[Sensor] = relationship(back_populates="waveforms")

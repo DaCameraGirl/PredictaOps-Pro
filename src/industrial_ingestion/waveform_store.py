@@ -34,10 +34,16 @@ class LocalWaveformStore:
         digest = hashlib.sha256(raw).hexdigest()
         directory = self.root / organization_id / batch_id
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{record_key}-{digest[:12]}.json"
+        object_key = hashlib.sha256(record_key.encode("utf-8")).hexdigest()
+        path = directory / f"{object_key}.json"
         path.write_bytes(raw)
         return path.as_posix(), digest, len(samples)
 
-    def describe_external(self, *, storage_uri: str, sha256: str | None, sample_count: int) -> tuple[str, str, int]:
-        digest = sha256 or hashlib.sha256(storage_uri.encode("utf-8")).hexdigest()
-        return storage_uri, digest, sample_count
+    def describe_external(
+        self,
+        *,
+        storage_uri: str,
+        sha256: str | None,
+        sample_count: int,
+    ) -> tuple[str, str | None, int]:
+        return storage_uri, sha256, sample_count

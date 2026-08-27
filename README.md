@@ -99,6 +99,11 @@ the same internal ingestion contract before validation, unit normalization,
 UTC timestamp normalization, sensor resolution, persistence, and receipt
 generation.
 
+Native connector classes in `src/industrial_ingestion/connectors.py` provide
+MQTT broker subscription, OPC-UA data-change subscription/polling, and
+credentialed ABB API fetch paths. The API routes below are HTTP bridge endpoints
+for pushing source payloads into the same adapter pipeline.
+
 Scalar readings persist to `machine_readings`. Waveforms are first-class
 `waveform_records` with sample count, sampling rate, checksum, storage URI, and
 provenance; waveform samples are landed outside `MachineReading.payload`.

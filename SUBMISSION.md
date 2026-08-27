@@ -157,8 +157,9 @@ one giant pull request. Production Slice 6 establishes platform core:
 database, organizations, users, sites, assets, components, sensors,
 canonical schemas, migrations, and persistence. Production Slice 7 adds
 industrial ingestion across CSV, Parquet, REST, MQTT, OPC-UA, ABB/vendor
-adapters, replay, normalization, provenance, idempotency, dead-letter
-handling, tenant boundaries, and first-class waveform ingestion metadata.
+adapters, native protocol connectors, replay, normalization, provenance,
+idempotency, dead-letter handling, tenant boundaries, and first-class waveform
+ingestion metadata.
 The following slices add analytics, ML platform, production serving,
 maintenance operations, enterprise security, full studio UI, agentic
 copilot, and production hardening. The sequence is documented in

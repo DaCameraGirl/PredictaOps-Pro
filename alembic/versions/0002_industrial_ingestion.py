@@ -161,7 +161,7 @@ def upgrade() -> None:
         sa.Column("source", sa.String(length=120), nullable=False),
         sa.Column("quality", sa.String(length=32), nullable=False),
         sa.Column("storage_uri", sa.String(length=1024), nullable=False),
-        sa.Column("sha256", sa.String(length=64), nullable=False),
+        sa.Column("sha256", sa.String(length=64), nullable=True),
         sa.Column("metadata_json", sa.JSON(), nullable=True),
         *timestamps(),
         sa.CheckConstraint(f"quality in ({QUALITY_STATES})", name="ck_waveform_quality"),
