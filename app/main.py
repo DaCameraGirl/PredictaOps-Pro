@@ -32,6 +32,15 @@ from degradation_signal import DegradationSignal
 from explain_bearing import BearingRulExplainer
 from industrial_ingestion.contracts import SourceRegistration
 from industrial_ingestion.service import IngestionService
+from ml_platform.contracts import (
+    DatasetVersionCreate,
+    ExperimentCreate,
+    ModelVersionCreate,
+    PromoteModelVersion,
+    RegistryCreate,
+    RollbackModelVersion,
+)
+from ml_platform.service import MLPlatformService
 from platform_core.config import database_settings, safe_database_label
 from platform_core.database import SessionLocal, check_database
 from platform_core.models import Base
@@ -412,6 +421,214 @@ def analytics_health(organization_id: str):
             return AnalyticsService(session).health(organization_id)
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/ml/{organization_id}/dataset-versions")
+def create_ml_dataset_version(organization_id: str, request: DatasetVersionCreate):
+    with SessionLocal() as session:
+        try:
+            dataset = MLPlatformService(session).create_dataset_version(organization_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return _dataset_version_payload(dataset)
+
+
+@app.get("/api/ml/{organization_id}/dataset-versions")
+def list_ml_dataset_versions(organization_id: str):
+    with SessionLocal() as session:
+        try:
+            datasets = MLPlatformService(session).list_dataset_versions(organization_id)
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return {"dataset_versions": [_dataset_version_payload(dataset) for dataset in datasets]}
+
+
+@app.post("/api/ml/{organization_id}/experiments")
+def run_ml_experiment(organization_id: str, request: ExperimentCreate):
+    with SessionLocal() as session:
+        try:
+            experiment = MLPlatformService(session).run_experiment(organization_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return _experiment_payload(experiment)
+
+
+@app.get("/api/ml/{organization_id}/experiments")
+def list_ml_experiments(organization_id: str):
+    with SessionLocal() as session:
+        try:
+            experiments = MLPlatformService(session).list_experiments(organization_id)
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return {"experiments": [_experiment_payload(experiment) for experiment in experiments]}
+
+
+@app.get("/api/ml/{organization_id}/experiments/{experiment_run_id}")
+def get_ml_experiment(organization_id: str, experiment_run_id: str):
+    with SessionLocal() as session:
+        try:
+            experiment = MLPlatformService(session).get_experiment(organization_id, experiment_run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return _experiment_payload(experiment)
+
+
+@app.post("/api/ml/{organization_id}/registries")
+def create_ml_registry(organization_id: str, request: RegistryCreate):
+    with SessionLocal() as session:
+        try:
+            registry = MLPlatformService(session).create_registry(organization_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return _registry_payload(registry)
+
+
+@app.get("/api/ml/{organization_id}/registries")
+def list_ml_registries(organization_id: str):
+    with SessionLocal() as session:
+        try:
+            return {"registries": MLPlatformService(session).list_registries(organization_id)}
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/ml/{organization_id}/model-versions")
+def register_ml_model_version(organization_id: str, request: ModelVersionCreate):
+    with SessionLocal() as session:
+        try:
+            model_version = MLPlatformService(session).register_model_version(organization_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return _model_version_payload(model_version)
+
+
+@app.post("/api/ml/{organization_id}/model-versions/{model_version_id}/promote")
+def promote_ml_model_version(organization_id: str, model_version_id: str, request: PromoteModelVersion):
+    with SessionLocal() as session:
+        try:
+            model_version = MLPlatformService(session).promote_model_version(
+                organization_id,
+                model_version_id,
+                request,
+            )
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return _model_version_payload(model_version)
+
+
+@app.post("/api/ml/{organization_id}/registries/{registry_id}/rollback")
+def rollback_ml_model_version(organization_id: str, registry_id: str, request: RollbackModelVersion):
+    with SessionLocal() as session:
+        try:
+            model_version = MLPlatformService(session).rollback_model_version(organization_id, registry_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return _model_version_payload(model_version)
+
+
+def _dataset_version_payload(dataset) -> dict:
+    return {
+        "id": dataset.id,
+        "organization_id": dataset.organization_id,
+        "name": dataset.name,
+        "version": dataset.version,
+        "status": dataset.status,
+        "source_algorithm_version": dataset.source_algorithm_version,
+        "target_name": dataset.target_name,
+        "target_unit": dataset.target_unit,
+        "feature_names": dataset.feature_names,
+        "row_count": dataset.row_count,
+        "validation_group_count": dataset.validation_group_count,
+        "fingerprint": dataset.fingerprint,
+        "filters": dataset.filters,
+        "provenance": dataset.provenance,
+    }
+
+
+def _experiment_payload(experiment) -> dict:
+    return {
+        "id": experiment.id,
+        "organization_id": experiment.organization_id,
+        "dataset_version_id": experiment.dataset_version_id,
+        "name": experiment.name,
+        "status": experiment.status,
+        "algorithm": experiment.algorithm,
+        "validation_method": experiment.validation_method,
+        "code_version": experiment.code_version,
+        "training_config": experiment.training_config,
+        "metrics": experiment.metrics,
+        "baseline_metrics": experiment.baseline_metrics,
+        "uncertainty": experiment.uncertainty,
+        "abstention_policy": experiment.abstention_policy,
+        "artifact_uri": experiment.artifact_uri,
+        "artifact_sha256": experiment.artifact_sha256,
+        "provenance": experiment.provenance,
+    }
+
+
+def _registry_payload(registry) -> dict:
+    return {
+        "id": registry.id,
+        "organization_id": registry.organization_id,
+        "name": registry.name,
+        "task": registry.task,
+        "status": registry.status,
+        "description": registry.description,
+    }
+
+
+def _model_version_payload(model_version) -> dict:
+    return {
+        "id": model_version.id,
+        "organization_id": model_version.organization_id,
+        "registry_id": model_version.registry_id,
+        "experiment_run_id": model_version.experiment_run_id,
+        "dataset_version_id": model_version.dataset_version_id,
+        "version": model_version.version,
+        "stage": model_version.stage,
+        "approval_status": model_version.approval_status,
+        "artifact_uri": model_version.artifact_uri,
+        "artifact_sha256": model_version.artifact_sha256,
+        "metrics": model_version.metrics,
+        "baseline_metrics": model_version.baseline_metrics,
+        "uncertainty": model_version.uncertainty,
+        "abstention_policy": model_version.abstention_policy,
+        "provenance": model_version.provenance,
+        "approved_by_user_id": model_version.approved_by_user_id,
+        "approved_at": model_version.approved_at.isoformat() if model_version.approved_at else None,
+    }
 
 
 @app.get("/api/profile")

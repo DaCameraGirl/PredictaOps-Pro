@@ -28,6 +28,11 @@ from platform_core.models import (
     IngestionFailure,
     IngestionSource,
     MachineReading,
+    MLDatasetVersion,
+    MLExperimentRun,
+    MLModelPromotionEvent,
+    MLModelRegistry,
+    MLModelVersion,
     Organization,
     OrganizationMembership,
     Sensor,
@@ -73,6 +78,11 @@ class PlatformRepository:
             "analytics_feature_records": self.count(AnalyticsFeatureRecord),
             "analytics_health_states": self.count(AnalyticsHealthState),
             "analytics_failures": self.count(AnalyticsFailure),
+            "ml_dataset_versions": self.count(MLDatasetVersion),
+            "ml_experiment_runs": self.count(MLExperimentRun),
+            "ml_model_registries": self.count(MLModelRegistry),
+            "ml_model_versions": self.count(MLModelVersion),
+            "ml_model_promotion_events": self.count(MLModelPromotionEvent),
         }
 
     def get_organization_by_slug(self, slug: str) -> Organization | None:
@@ -735,6 +745,288 @@ class PlatformRepository:
             .order_by(AnalyticsHealthState.observed_at.desc(), AnalyticsHealthState.sensor_id)
         )
         return list(self.session.scalars(statement))
+
+    def list_analytics_features_for_dataset(
+        self,
+        organization_id: str,
+        *,
+        algorithm_version: str | None = None,
+        sensor_ids: list[str] | None = None,
+        feature_names: list[str] | None = None,
+    ) -> list[AnalyticsFeatureRecord]:
+        statement = select(AnalyticsFeatureRecord).where(AnalyticsFeatureRecord.organization_id == organization_id)
+        if algorithm_version:
+            statement = statement.where(AnalyticsFeatureRecord.algorithm_version == algorithm_version)
+        if sensor_ids:
+            statement = statement.where(AnalyticsFeatureRecord.sensor_id.in_(sensor_ids))
+        if feature_names:
+            statement = statement.where(AnalyticsFeatureRecord.feature_name.in_(feature_names))
+        return list(
+            self.session.scalars(
+                statement.order_by(
+                    AnalyticsFeatureRecord.sensor_id,
+                    AnalyticsFeatureRecord.observed_at,
+                    AnalyticsFeatureRecord.feature_name,
+                    AnalyticsFeatureRecord.id,
+                )
+            )
+        )
+
+    def create_ml_dataset_version(
+        self,
+        organization_id: str,
+        *,
+        name: str,
+        version: str,
+        source_algorithm_version: str,
+        target_name: str,
+        target_unit: str | None,
+        feature_names: list[str],
+        row_count: int,
+        validation_group_count: int,
+        fingerprint: str,
+        filters: dict | None,
+        provenance: dict | None,
+    ) -> MLDatasetVersion:
+        if self.session.get(Organization, organization_id) is None:
+            raise TenantBoundaryError("ML dataset organization does not exist")
+        dataset = MLDatasetVersion(
+            organization_id=organization_id,
+            name=name,
+            version=version,
+            status="created",
+            source_algorithm_version=source_algorithm_version,
+            target_name=target_name,
+            target_unit=target_unit,
+            feature_names=feature_names,
+            row_count=row_count,
+            validation_group_count=validation_group_count,
+            fingerprint=fingerprint,
+            filters=filters,
+            provenance=provenance,
+        )
+        self.session.add(dataset)
+        self.session.flush()
+        return dataset
+
+    def get_ml_dataset_version(self, organization_id: str, dataset_version_id: str) -> MLDatasetVersion | None:
+        return self.session.scalar(
+            select(MLDatasetVersion).where(
+                MLDatasetVersion.organization_id == organization_id,
+                MLDatasetVersion.id == dataset_version_id,
+            )
+        )
+
+    def list_ml_dataset_versions(self, organization_id: str) -> list[MLDatasetVersion]:
+        statement = (
+            select(MLDatasetVersion)
+            .where(MLDatasetVersion.organization_id == organization_id)
+            .order_by(MLDatasetVersion.name, MLDatasetVersion.version)
+        )
+        return list(self.session.scalars(statement))
+
+    def create_ml_experiment_run(
+        self,
+        organization_id: str,
+        *,
+        dataset_version_id: str,
+        name: str,
+        algorithm: str,
+        validation_method: str,
+        code_version: str,
+        training_config: dict | None,
+        abstention_policy: dict | None,
+        provenance: dict | None,
+    ) -> MLExperimentRun:
+        if self.get_ml_dataset_version(organization_id, dataset_version_id) is None:
+            raise TenantBoundaryError("experiment dataset version must belong to the same organization")
+        experiment = MLExperimentRun(
+            organization_id=organization_id,
+            dataset_version_id=dataset_version_id,
+            name=name,
+            status="running",
+            algorithm=algorithm,
+            validation_method=validation_method,
+            code_version=code_version,
+            training_config=training_config,
+            abstention_policy=abstention_policy,
+            provenance=provenance,
+        )
+        self.session.add(experiment)
+        self.session.flush()
+        return experiment
+
+    def get_ml_experiment_run(self, organization_id: str, experiment_run_id: str) -> MLExperimentRun | None:
+        return self.session.scalar(
+            select(MLExperimentRun).where(
+                MLExperimentRun.organization_id == organization_id,
+                MLExperimentRun.id == experiment_run_id,
+            )
+        )
+
+    def list_ml_experiment_runs(self, organization_id: str) -> list[MLExperimentRun]:
+        statement = (
+            select(MLExperimentRun)
+            .where(MLExperimentRun.organization_id == organization_id)
+            .order_by(MLExperimentRun.created_at.desc(), MLExperimentRun.id)
+        )
+        return list(self.session.scalars(statement))
+
+    def get_or_create_ml_model_registry(
+        self,
+        organization_id: str,
+        *,
+        name: str,
+        task: str,
+        description: str | None = None,
+    ) -> MLModelRegistry:
+        if self.session.get(Organization, organization_id) is None:
+            raise TenantBoundaryError("model registry organization does not exist")
+        existing = self.session.scalar(
+            select(MLModelRegistry).where(
+                MLModelRegistry.organization_id == organization_id,
+                MLModelRegistry.name == name,
+            )
+        )
+        if existing:
+            return existing
+        registry = MLModelRegistry(
+            organization_id=organization_id,
+            name=name,
+            task=task,
+            status="active",
+            description=description,
+        )
+        self.session.add(registry)
+        self.session.flush()
+        return registry
+
+    def get_ml_model_registry(self, organization_id: str, registry_id: str) -> MLModelRegistry | None:
+        return self.session.scalar(
+            select(MLModelRegistry).where(
+                MLModelRegistry.organization_id == organization_id,
+                MLModelRegistry.id == registry_id,
+            )
+        )
+
+    def list_ml_model_registries(self, organization_id: str) -> list[MLModelRegistry]:
+        statement = (
+            select(MLModelRegistry)
+            .where(MLModelRegistry.organization_id == organization_id)
+            .order_by(MLModelRegistry.name)
+        )
+        return list(self.session.scalars(statement))
+
+    def create_ml_model_version(
+        self,
+        organization_id: str,
+        *,
+        registry_id: str,
+        experiment_run_id: str,
+        dataset_version_id: str,
+        version: str,
+        artifact_uri: str,
+        artifact_sha256: str,
+        metrics: dict | None,
+        baseline_metrics: dict | None,
+        uncertainty: dict | None,
+        abstention_policy: dict | None,
+        provenance: dict | None,
+    ) -> MLModelVersion:
+        if self.get_ml_model_registry(organization_id, registry_id) is None:
+            raise TenantBoundaryError("model version registry must belong to the same organization")
+        if self.get_ml_experiment_run(organization_id, experiment_run_id) is None:
+            raise TenantBoundaryError("model version experiment must belong to the same organization")
+        if self.get_ml_dataset_version(organization_id, dataset_version_id) is None:
+            raise TenantBoundaryError("model version dataset must belong to the same organization")
+        model_version = MLModelVersion(
+            organization_id=organization_id,
+            registry_id=registry_id,
+            experiment_run_id=experiment_run_id,
+            dataset_version_id=dataset_version_id,
+            version=version,
+            stage="candidate",
+            approval_status="not_required",
+            artifact_uri=artifact_uri,
+            artifact_sha256=artifact_sha256,
+            metrics=metrics,
+            baseline_metrics=baseline_metrics,
+            uncertainty=uncertainty,
+            abstention_policy=abstention_policy,
+            provenance=provenance,
+        )
+        self.session.add(model_version)
+        self.session.flush()
+        return model_version
+
+    def get_ml_model_version(self, organization_id: str, model_version_id: str) -> MLModelVersion | None:
+        return self.session.scalar(
+            select(MLModelVersion).where(
+                MLModelVersion.organization_id == organization_id,
+                MLModelVersion.id == model_version_id,
+            )
+        )
+
+    def list_ml_model_versions(self, organization_id: str, registry_id: str) -> list[MLModelVersion]:
+        statement = (
+            select(MLModelVersion)
+            .where(MLModelVersion.organization_id == organization_id, MLModelVersion.registry_id == registry_id)
+            .order_by(MLModelVersion.created_at, MLModelVersion.version)
+        )
+        return list(self.session.scalars(statement))
+
+    def get_production_model_version(self, organization_id: str, registry_id: str) -> MLModelVersion | None:
+        return self.session.scalar(
+            select(MLModelVersion).where(
+                MLModelVersion.organization_id == organization_id,
+                MLModelVersion.registry_id == registry_id,
+                MLModelVersion.stage == "production",
+            )
+        )
+
+    def model_version_has_reached_production(self, organization_id: str, model_version_id: str) -> bool:
+        count = self.session.scalar(
+            select(func.count())
+            .select_from(MLModelPromotionEvent)
+            .where(
+                MLModelPromotionEvent.organization_id == organization_id,
+                MLModelPromotionEvent.model_version_id == model_version_id,
+                MLModelPromotionEvent.to_stage == "production",
+            )
+        )
+        return bool(count)
+
+    def create_ml_promotion_event(
+        self,
+        organization_id: str,
+        *,
+        registry_id: str,
+        model_version_id: str,
+        from_stage: str,
+        to_stage: str,
+        action: str,
+        approved_by_user_id: str | None,
+        reason: str | None,
+        event_metadata: dict | None,
+    ) -> MLModelPromotionEvent:
+        if self.get_ml_model_registry(organization_id, registry_id) is None:
+            raise TenantBoundaryError("promotion registry must belong to the same organization")
+        if self.get_ml_model_version(organization_id, model_version_id) is None:
+            raise TenantBoundaryError("promotion model version must belong to the same organization")
+        event = MLModelPromotionEvent(
+            organization_id=organization_id,
+            registry_id=registry_id,
+            model_version_id=model_version_id,
+            from_stage=from_stage,
+            to_stage=to_stage,
+            action=action,
+            approved_by_user_id=approved_by_user_id,
+            reason=reason,
+            event_metadata=event_metadata,
+        )
+        self.session.add(event)
+        self.session.flush()
+        return event
 
     def ingestion_health(self, organization_id: str) -> dict:
         source_rows = self.session.execute(
