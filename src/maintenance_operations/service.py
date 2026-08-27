@@ -559,22 +559,21 @@ class MaintenanceOperationsService:
     ) -> CmmsSyncRecord:
         self._require_member(organization_id, request.initiated_by_user_id)
         work_order = self._work_order(organization_id, work_order_id)
-        provider_name = request.provider_name or request.adapter_name or "disabled"
+        requested_provider = request.provider_name or request.adapter_name
+        if work_order.cmms_external_id and work_order.cmms_provider:
+            if requested_provider and requested_provider != work_order.cmms_provider:
+                raise MaintenanceOperationsError("work order is already bound to a different CMMS provider")
+            provider_name = work_order.cmms_provider
+        else:
+            provider_name = requested_provider or "disabled"
         adapter = self.cmms_adapters.get(provider_name) or DisabledCmmsAdapter()
         operation = request.operation
-        if (
-            operation == "create"
-            and work_order.cmms_external_id
-            and work_order.cmms_provider
-            and work_order.cmms_provider != adapter.provider_name
-        ):
-            raise MaintenanceOperationsError("work order is already bound to a different CMMS provider")
-        idempotency_key = _cmms_idempotency_key(organization_id, work_order.id, adapter.provider_name, operation)
+        idempotency_key = _cmms_idempotency_key(organization_id, work_order.id, provider_name, operation)
         if operation == "create":
             existing_success = self.repo.get_successful_cmms_sync_record(
                 organization_id,
                 work_order_id=work_order.id,
-                provider_name=adapter.provider_name,
+                provider_name=provider_name,
                 operation=operation,
                 idempotency_key=idempotency_key,
             )
@@ -601,7 +600,7 @@ class MaintenanceOperationsService:
         sync = self.repo.create_cmms_sync_record(
             organization_id,
             work_order_id=work_order.id,
-            provider_name=adapter.provider_name,
+            provider_name=provider_name,
             initiator_type="user",
             initiated_by_user_id=request.initiated_by_user_id,
             operation=operation,
@@ -616,14 +615,14 @@ class MaintenanceOperationsService:
         if result.status == "succeeded":
             self.repo.update_maintenance_work_order(
                 work_order,
-                cmms_provider=adapter.provider_name,
+                cmms_provider=provider_name,
                 cmms_external_id=result.external_id,
                 cmms_state=result.external_status or result.status,
             )
         elif result.status == "not_configured":
             self.repo.update_maintenance_work_order(
                 work_order,
-                cmms_provider=adapter.provider_name,
+                cmms_provider=provider_name,
                 cmms_state="not_configured",
             )
         return sync

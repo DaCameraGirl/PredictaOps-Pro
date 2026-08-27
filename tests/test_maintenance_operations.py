@@ -922,7 +922,10 @@ def test_deterministic_cmms_adapter_and_create_idempotency(migrated_db, maintena
         assert session.scalar(select(func.count()).select_from(CmmsSyncRecord)) == 2
 
 
-def test_cmms_sync_requires_active_member_and_rejects_provider_switch(migrated_db, maintenance_fixture):
+def test_cmms_sync_requires_active_member_and_keeps_bound_provider_for_later_operations(
+    migrated_db,
+    maintenance_fixture,
+):
     _engine, session_factory = migrated_db
     with session_factory() as session:
         primary = DeterministicCmmsAdapter()
@@ -944,7 +947,7 @@ def test_cmms_sync_requires_active_member_and_rejects_provider_switch(migrated_d
                 ),
             )
 
-        service.sync_work_order_to_cmms(
+        create_sync = service.sync_work_order_to_cmms(
             maintenance_fixture["organization_id"],
             work_order.id,
             CmmsSyncRequest(
@@ -953,12 +956,97 @@ def test_cmms_sync_requires_active_member_and_rejects_provider_switch(migrated_d
                 initiated_by_user_id=maintenance_fixture["technician_id"],
             ),
         )
+        original_provider = work_order.cmms_provider
+        original_external_id = work_order.cmms_external_id
+
+        for operation in ["create", "update", "cancel", "close"]:
+            with pytest.raises(ValueError, match="already bound to a different CMMS provider"):
+                service.sync_work_order_to_cmms(
+                    maintenance_fixture["organization_id"],
+                    work_order.id,
+                    CmmsSyncRequest(
+                        operation=operation,
+                        provider_name=alternate.provider_name,
+                        initiated_by_user_id=maintenance_fixture["technician_id"],
+                    ),
+                )
+        update_sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="update",
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        session.commit()
+
+        assert create_sync.status == "succeeded"
+        assert update_sync.status == "succeeded"
+        assert update_sync.provider_name == primary.provider_name
+        assert update_sync.external_id == original_external_id
+        assert work_order.cmms_provider == original_provider
+        assert work_order.cmms_external_id == original_external_id
+        assert len(primary.calls) == 2
+        assert primary.calls[-1]["operation"] == "update"
+        assert len(alternate.calls) == 0
+        assert session.scalar(select(func.count()).select_from(CmmsSyncRecord)) == 2
+
+
+def test_cmms_update_without_bound_provider_uses_disabled_adapter_truthfully(migrated_db, maintenance_fixture):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        service = MaintenanceOperationsService(session)
+        work_order = _draft_work_order(service, maintenance_fixture)
+        sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="update",
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        session.commit()
+
+        assert sync.status == "not_configured"
+        assert sync.provider_name == "disabled"
+        assert sync.external_id is None
+        assert work_order.cmms_provider == "disabled"
+        assert work_order.cmms_external_id is None
+
+
+def test_cmms_bound_provider_is_used_when_no_provider_is_supplied(migrated_db, maintenance_fixture):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        primary = DeterministicCmmsAdapter()
+        alternate = AlternateDeterministicCmmsAdapter()
+        service = MaintenanceOperationsService(
+            session,
+            cmms_adapters={primary.provider_name: primary, alternate.provider_name: alternate},
+        )
+        work_order = _draft_work_order(service, maintenance_fixture)
+        create_sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="create",
+                provider_name=primary.provider_name,
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        update_sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="update",
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
         with pytest.raises(ValueError, match="already bound to a different CMMS provider"):
             service.sync_work_order_to_cmms(
                 maintenance_fixture["organization_id"],
                 work_order.id,
                 CmmsSyncRequest(
-                    operation="create",
+                    operation="close",
                     provider_name=alternate.provider_name,
                     initiated_by_user_id=maintenance_fixture["technician_id"],
                 ),
@@ -966,7 +1054,10 @@ def test_cmms_sync_requires_active_member_and_rejects_provider_switch(migrated_d
         session.commit()
 
         assert work_order.cmms_provider == primary.provider_name
-        assert len(primary.calls) == 1
+        assert work_order.cmms_external_id == create_sync.external_id
+        assert update_sync.provider_name == primary.provider_name
+        assert update_sync.external_id == create_sync.external_id
+        assert [call["operation"] for call in primary.calls] == ["create", "update"]
         assert len(alternate.calls) == 0
 
 

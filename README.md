@@ -217,7 +217,8 @@ adapter truthfully returns `not_configured` and never fabricates an external ID.
 A deterministic test adapter exercises successful sync and idempotent retry
 behavior without adding vendor credentials or claiming a vendor integration.
 Create idempotency is scoped by provider, and a work order bound to one
-successful external provider cannot silently switch providers.
+successful external provider cannot silently switch providers. Later CMMS
+operations without an explicit provider automatically use the bound provider.
 
 Useful maintenance endpoints:
 
