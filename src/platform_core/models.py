@@ -1111,12 +1111,15 @@ class CmmsSyncRecord(Base, TimestampMixin):
             "status in ('not_configured', 'succeeded', 'failed', 'timeout', 'skipped')",
             name="ck_cmms_sync_status",
         ),
+        CheckConstraint("initiator_type in ('user', 'system')", name="ck_cmms_sync_initiator_type"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
     work_order_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     provider_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    initiator_type: Mapped[str] = mapped_column(String(32), nullable=False, default="user")
+    initiated_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     operation: Mapped[str] = mapped_column(String(32), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)

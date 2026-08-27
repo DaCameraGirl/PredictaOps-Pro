@@ -48,7 +48,7 @@ class CaseCreate(BaseModel):
     asset_id: str | None = None
     component_id: str | None = None
     sensor_id: str | None = None
-    opened_by_user_id: str | None = None
+    opened_by_user_id: str
     owner_user_id: str | None = None
     assignee_user_id: str | None = None
     recommended_action: str | None = Field(default=None, max_length=1024)
@@ -132,6 +132,7 @@ class WorkOrderCancelRequest(BaseModel):
 
 class CmmsSyncRequest(BaseModel):
     operation: CmmsOperation = "create"
+    initiated_by_user_id: str
     provider_name: str | None = Field(default=None, max_length=120)
     adapter_name: str | None = Field(default=None, max_length=120)
     attempt_metadata: dict[str, Any] = Field(default_factory=dict)

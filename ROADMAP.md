@@ -80,7 +80,9 @@ GitHub pull request numbers may drift after branch renames or replacement PRs.
    Prediction/health evidence to alert evaluation, acknowledgement, cases, append-only technician notes, inspections,
    draft-to-completion work orders, explicit CMMS sync attempts, disabled/test CMMS adapters, operational history,
    tenant boundaries, idempotency protections, API endpoints, and PostgreSQL migration/CI coverage. Model evidence stays
-   separate from human findings, work performed, and CMMS state.
+   separate from human findings, work performed, and CMMS state. Case resolution is first-class, CMMS sync is
+   active-member attributed and provider-aware, and source-derived hierarchy cannot be contradicted without a future
+   explicit reassignment workflow.
 7. **Production Slice 12 - Enterprise Security**
    RBAC, SSO/OIDC, tenant isolation, audit logs, secrets, and security hardening.
 8. **Production Slice 13 - Full Studio UI**

@@ -1273,6 +1273,18 @@ class PlatformRepository:
         self.session.flush()
         return resolution
 
+    def get_production_model_resolution(
+        self,
+        organization_id: str,
+        resolution_id: str,
+    ) -> ProductionModelResolution | None:
+        return self.session.scalar(
+            select(ProductionModelResolution).where(
+                ProductionModelResolution.organization_id == organization_id,
+                ProductionModelResolution.id == resolution_id,
+            )
+        )
+
     def create_prediction_record(
         self,
         organization_id: str,
@@ -1822,6 +1834,8 @@ class PlatformRepository:
         *,
         work_order_id: str,
         provider_name: str,
+        initiator_type: str,
+        initiated_by_user_id: str | None,
         operation: str,
         idempotency_key: str,
         status: str,
@@ -1837,6 +1851,8 @@ class PlatformRepository:
             organization_id=organization_id,
             work_order_id=work_order_id,
             provider_name=provider_name,
+            initiator_type=initiator_type,
+            initiated_by_user_id=initiated_by_user_id,
             operation=operation,
             idempotency_key=idempotency_key,
             status=status,
@@ -1855,6 +1871,7 @@ class PlatformRepository:
         organization_id: str,
         *,
         work_order_id: str,
+        provider_name: str,
         operation: str,
         idempotency_key: str,
     ) -> CmmsSyncRecord | None:
@@ -1862,6 +1879,7 @@ class PlatformRepository:
             select(CmmsSyncRecord).where(
                 CmmsSyncRecord.organization_id == organization_id,
                 CmmsSyncRecord.work_order_id == work_order_id,
+                CmmsSyncRecord.provider_name == provider_name,
                 CmmsSyncRecord.operation == operation,
                 CmmsSyncRecord.idempotency_key == idempotency_key,
                 CmmsSyncRecord.status == "succeeded",

@@ -1,11 +1,12 @@
 import importlib
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import func, inspect, select, text
 from sqlalchemy.orm import sessionmaker
 
@@ -13,7 +14,9 @@ from alembic import command
 from maintenance_operations.contracts import (
     AlertAcknowledgeRequest,
     AlertResolveRequest,
+    CaseCreate,
     CaseCreateFromAlertRequest,
+    CaseTransitionRequest,
     CmmsSyncRequest,
     InspectionCancelRequest,
     InspectionCompleteRequest,
@@ -21,12 +24,22 @@ from maintenance_operations.contracts import (
     InspectionStartRequest,
     NoteCreate,
     PredictionAlertEvaluationRequest,
+    ResolutionCreate,
     WorkOrderApproveRequest,
     WorkOrderCompleteRequest,
     WorkOrderCreate,
     WorkOrderStartRequest,
 )
 from maintenance_operations.service import DeterministicCmmsAdapter, MaintenanceOperationsService
+from ml_platform.artifact_store import ModelArtifactStore
+from ml_platform.contracts import (
+    DatasetVersionCreate,
+    ExperimentCreate,
+    ModelVersionCreate,
+    PromoteModelVersion,
+    RegistryCreate,
+)
+from ml_platform.service import MLPlatformService
 from platform_core.contracts import (
     AssetCreate,
     ComponentCreate,
@@ -36,10 +49,23 @@ from platform_core.contracts import (
     UserCreate,
 )
 from platform_core.database import make_engine
-from platform_core.models import Base, CmmsSyncRecord, MaintenanceAlert, MaintenanceCase, PredictionRecord
+from platform_core.models import (
+    Base,
+    CmmsSyncRecord,
+    MaintenanceAlert,
+    MaintenanceCase,
+    MaintenanceResolution,
+    PredictionRecord,
+)
 from platform_core.repositories import PlatformRepository
+from production_serving.contracts import PredictionRequest, ServingBindingCreate
+from production_serving.service import ProductionServingService
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+class AlternateDeterministicCmmsAdapter(DeterministicCmmsAdapter):
+    provider_name = "alternate-test"
 
 
 @pytest.fixture
@@ -107,6 +133,24 @@ def _seed_operational_context(session):
             unit="g",
         ),
     )
+    other_asset = repo.create_asset(
+        org.id,
+        AssetCreate(site_id=site.id, slug="pump-p-105", name="Pump P-105", asset_type="pump"),
+    )
+    other_component = repo.create_component(
+        org.id,
+        ComponentCreate(asset_id=other_asset.id, slug="bearing", name="Drive-End Bearing", component_type="bearing"),
+    )
+    other_sensor = repo.create_sensor(
+        org.id,
+        SensorCreate(
+            component_id=other_component.id,
+            slug="vs-117",
+            name="VS-117",
+            sensor_type="accelerometer",
+            unit="g",
+        ),
+    )
     technician = repo.create_user(
         UserCreate(email="tech@example.com", full_name="Technician", external_subject="oidc:tech")
     )
@@ -132,6 +176,9 @@ def _seed_operational_context(session):
         "asset_id": asset.id,
         "component_id": component.id,
         "sensor_id": sensor.id,
+        "same_tenant_other_asset_id": other_asset.id,
+        "same_tenant_other_component_id": other_component.id,
+        "same_tenant_other_sensor_id": other_sensor.id,
         "technician_id": technician.id,
         "manager_id": manager.id,
         "outsider_id": outsider.id,
@@ -199,13 +246,12 @@ def _prediction(
         feature_record_ids=["feature-1", "feature-2"] if status == "supported" else [],
         abstention_reason=reason,
         provenance={
-            "model_resolution": {
-                "binding_id": "binding-1" if status == "supported" else None,
-                "artifact_sha256": resolution.artifact_sha256,
-                "feature_schema": resolution.feature_schema,
-                "source_model_version": "fixture-model-v1" if status == "supported" else None,
-                "source_dataset_version": "fixture-dataset-v1" if status == "supported" else None,
-            }
+            "serving_slice": "production-slice-10",
+            "binding_id": "binding-1" if status == "supported" else None,
+            "artifact_sha256": resolution.artifact_sha256,
+            "feature_record_ids": ["feature-1", "feature-2"] if status == "supported" else [],
+            "request_kind": "live",
+            "serving_reference_time": datetime.now(UTC).isoformat(),
         },
     )
     return prediction.id
@@ -248,6 +294,104 @@ def _draft_work_order(service, fixture):
     )
 
 
+def _seed_real_serving_features(session, fixture) -> None:
+    repo = PlatformRepository(session)
+    base_time = datetime.now(UTC) - timedelta(minutes=5)
+    run_a = repo.create_analytics_run(
+        fixture["organization_id"],
+        run_kind="sensor",
+        sensor_id=fixture["sensor_id"],
+        algorithm_version="analytics-v1",
+        provenance={"test": "maintenance-real-serving"},
+    )
+    run_b = repo.create_analytics_run(
+        fixture["organization_id"],
+        run_kind="sensor",
+        sensor_id=fixture["same_tenant_other_sensor_id"],
+        algorithm_version="analytics-v1",
+        provenance={"test": "maintenance-real-serving"},
+    )
+    for sensor_id, run_id, group, offset in [
+        (fixture["sensor_id"], run_a.id, "bearing-a", 0.0),
+        (fixture["same_tenant_other_sensor_id"], run_b.id, "bearing-b", 10.0),
+    ]:
+        for index in range(4):
+            repo.create_analytics_feature(
+                fixture["organization_id"],
+                run_id=run_id,
+                sensor_id=sensor_id,
+                batch_id=None,
+                source_kind="scalar",
+                source_record_id=f"{group}-{index}",
+                observed_at=base_time + timedelta(minutes=index),
+                feature_name="scalar.rms",
+                value=float(index + offset),
+                unit="g",
+                quality="good",
+                algorithm_version="analytics-v1",
+                provenance={
+                    "target_rul_hours": float(8 - index - offset / 10),
+                    "validation_group": group,
+                },
+            )
+
+
+def _real_serving_prediction(session, fixture, tmp_path) -> str:
+    _seed_real_serving_features(session, fixture)
+    ml_service = MLPlatformService(session, ModelArtifactStore(tmp_path / "models"))
+    dataset = ml_service.create_dataset_version(
+        fixture["organization_id"],
+        DatasetVersionCreate(name="maintenance-serving-features", version="v1", feature_names=["scalar.rms"]),
+    )
+    experiment = ml_service.run_experiment(
+        fixture["organization_id"],
+        ExperimentCreate(
+            dataset_version_id=dataset.id,
+            name="maintenance serving experiment",
+            training_config={"n_estimators": 5, "random_state": 17},
+        ),
+    )
+    registry = ml_service.create_registry(
+        fixture["organization_id"],
+        RegistryCreate(name="maintenance-bearing-rul", task="rul_regression"),
+    )
+    model_version = ml_service.register_model_version(
+        fixture["organization_id"],
+        ModelVersionCreate(registry_id=registry.id, experiment_run_id=experiment.id, version="1.0.0"),
+    )
+    ml_service.promote_model_version(
+        fixture["organization_id"],
+        model_version.id,
+        PromoteModelVersion(target_stage="validated"),
+    )
+    ml_service.promote_model_version(
+        fixture["organization_id"],
+        model_version.id,
+        PromoteModelVersion(
+            target_stage="production",
+            approved_by_user_id=fixture["manager_id"],
+            reason="approved for maintenance integration test",
+        ),
+    )
+    ProductionServingService(session).bind_model(
+        fixture["organization_id"],
+        ServingBindingCreate(
+            registry_id=registry.id,
+            model_version_id=model_version.id,
+            scope_type="sensor",
+            scope_id=fixture["sensor_id"],
+            approved_by_user_id=fixture["manager_id"],
+            reason="serve maintenance integration test",
+        ),
+    )
+    prediction = ProductionServingService(session, ModelArtifactStore(tmp_path / "models")).predict_rul(
+        fixture["organization_id"],
+        PredictionRequest(sensor_id=fixture["sensor_id"], registry_id=registry.id),
+    )
+    assert prediction.prediction_status == "supported"
+    return prediction.id
+
+
 def test_migration_creates_maintenance_operations_tables(migrated_db):
     engine, _session_factory = migrated_db
     tables = set(inspect(engine).get_table_names())
@@ -276,9 +420,10 @@ def test_supported_prediction_crossing_threshold_creates_evidence_backed_alert(
         assert result.alert["evidence_snapshot"]["prediction_status"] == "supported"
         assert result.alert["evidence_snapshot"]["predicted_rul_hours"] == 12.0
         assert result.alert["evidence_snapshot"]["feature_record_ids"] == ["feature-1", "feature-2"]
-        provenance = result.alert["evidence_snapshot"]["model_dataset_provenance"]
-        assert provenance["source_model_version"] == "fixture-model-v1"
-        assert provenance["source_dataset_version"] == "fixture-dataset-v1"
+        snapshot = result.alert["evidence_snapshot"]
+        assert snapshot["prediction_provenance"]["serving_slice"] == "production-slice-10"
+        assert snapshot["model_resolution"]["artifact_sha256"] == "abc123"
+        assert snapshot["model_resolution"]["feature_schema"] == ["scalar.rms", "scalar.kurtosis"]
         assert result.alert["evidence"]["rule"]["rul_threshold_hours"] == 24.0
         assert result.alert["evidence"]["maintenance_fact"] is False
 
@@ -431,6 +576,138 @@ def test_case_creation_from_alert_is_idempotent_while_active(migrated_db, mainte
         assert session.scalar(select(func.count()).select_from(MaintenanceCase)) == 1
         source_snapshot = first.evidence["source_evidence_snapshot"]
         assert source_snapshot["prediction_record_id"] == maintenance_fixture["supported_low_id"]
+
+
+def test_case_resolution_must_use_first_class_resolution_record(migrated_db, maintenance_fixture):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        service = MaintenanceOperationsService(session)
+        case = _active_case(service, maintenance_fixture)
+
+        with pytest.raises(ValueError, match="dedicated case resolution endpoint"):
+            service.transition_case(
+                maintenance_fixture["organization_id"],
+                case.id,
+                CaseTransitionRequest(actor_user_id=maintenance_fixture["manager_id"], target_status="resolved"),
+            )
+        assert session.scalar(select(func.count()).select_from(MaintenanceResolution)) == 0
+
+        service.resolve_case(
+            maintenance_fixture["organization_id"],
+            case.id,
+            ResolutionCreate(
+                resolved_by_user_id=maintenance_fixture["manager_id"],
+                outcome="monitor",
+                summary="Resolved after human review.",
+            ),
+        )
+        closed = service.transition_case(
+            maintenance_fixture["organization_id"],
+            case.id,
+            CaseTransitionRequest(actor_user_id=maintenance_fixture["manager_id"], target_status="closed"),
+        )
+        session.commit()
+
+        assert session.scalar(select(func.count()).select_from(MaintenanceResolution)) == 1
+        assert closed.status == "closed"
+
+
+def test_case_and_inspection_reject_same_tenant_wrong_hierarchy(migrated_db, maintenance_fixture):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        service = MaintenanceOperationsService(session)
+        alert = _service_alert(service, maintenance_fixture).alert
+
+        with pytest.raises(ValueError, match="hierarchy must match source evidence"):
+            service.open_case(
+                maintenance_fixture["organization_id"],
+                CaseCreate(
+                    alert_id=alert["id"],
+                    title="Bad hierarchy case",
+                    opened_by_user_id=maintenance_fixture["technician_id"],
+                    sensor_id=maintenance_fixture["same_tenant_other_sensor_id"],
+                ),
+            )
+
+        with pytest.raises(ValueError, match="hierarchy does not match"):
+            service.open_case(
+                maintenance_fixture["organization_id"],
+                CaseCreate(
+                    title="Manual bad hierarchy case",
+                    opened_by_user_id=maintenance_fixture["technician_id"],
+                    asset_id=maintenance_fixture["asset_id"],
+                    sensor_id=maintenance_fixture["same_tenant_other_sensor_id"],
+                ),
+            )
+
+        case = service.open_case_from_alert(
+            maintenance_fixture["organization_id"],
+            alert["id"],
+            CaseCreateFromAlertRequest(opened_by_user_id=maintenance_fixture["technician_id"]),
+        )
+        with pytest.raises(ValueError, match="hierarchy must match source evidence"):
+            service.request_inspection(
+                maintenance_fixture["organization_id"],
+                case.id,
+                InspectionRequestCreate(
+                    requested_by_user_id=maintenance_fixture["technician_id"],
+                    requested_reason="Should not point at a different bearing.",
+                    sensor_id=maintenance_fixture["same_tenant_other_sensor_id"],
+                ),
+            )
+
+
+def test_manual_case_requires_active_human_opener(migrated_db, maintenance_fixture):
+    _engine, session_factory = migrated_db
+    app_main = importlib.reload(importlib.import_module("app.main"))
+    client = TestClient(app_main.app)
+    response = client.post(
+        f"/api/maintenance/{maintenance_fixture['organization_id']}/cases",
+        json={"title": "Manual case", "priority": "medium"},
+    )
+    assert response.status_code == 422
+
+    with pytest.raises(ValidationError):
+        CaseCreate(title="Manual case")
+
+    with session_factory() as session:
+        service = MaintenanceOperationsService(session)
+        with pytest.raises(ValueError, match="active member"):
+            service.open_case(
+                maintenance_fixture["organization_id"],
+                CaseCreate(
+                    title="Manual case",
+                    opened_by_user_id=maintenance_fixture["outsider_id"],
+                ),
+            )
+
+
+def test_alert_snapshot_uses_real_slice_10_prediction_resolution(migrated_db, maintenance_fixture, tmp_path):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        prediction_id = _real_serving_prediction(session, maintenance_fixture, tmp_path)
+        service = MaintenanceOperationsService(session)
+        result = service.evaluate_prediction_alert(
+            maintenance_fixture["organization_id"],
+            PredictionAlertEvaluationRequest(
+                prediction_id=prediction_id,
+                rule_id="real-serving-rul-under-999h",
+                rul_threshold_hours=999.0,
+            ),
+        )
+        session.commit()
+
+        snapshot = result.alert["evidence_snapshot"]
+        prediction = session.get(PredictionRecord, prediction_id)
+        assert result.created is True
+        assert snapshot["prediction_record_id"] == prediction_id
+        assert snapshot["model_version_id"] == prediction.model_version_id
+        assert snapshot["dataset_version_id"] == prediction.dataset_version_id
+        assert snapshot["model_resolution_id"] == prediction.model_resolution_id
+        assert snapshot["feature_record_ids"]
+        assert snapshot["prediction_provenance"]["serving_slice"] == "production-slice-10"
+        assert snapshot["prediction_provenance"]["artifact_sha256"] == snapshot["model_resolution"]["artifact_sha256"]
+        assert snapshot["model_resolution"]["id"] == prediction.model_resolution_id
 
 
 def test_technician_notes_are_append_only_and_human_authored(migrated_db, maintenance_fixture):
@@ -605,11 +882,13 @@ def test_disabled_cmms_adapter_persists_truthful_not_configured_state(
         sync = service.sync_work_order_to_cmms(
             maintenance_fixture["organization_id"],
             work_order.id,
-            CmmsSyncRequest(operation="create"),
+            CmmsSyncRequest(operation="create", initiated_by_user_id=maintenance_fixture["technician_id"]),
         )
         session.commit()
 
         assert sync.status == "not_configured"
+        assert sync.initiator_type == "user"
+        assert sync.initiated_by_user_id == maintenance_fixture["technician_id"]
         assert sync.external_id is None
         assert sync.error_category == "not_configured"
         assert work_order.cmms_provider == "disabled"
@@ -623,7 +902,11 @@ def test_deterministic_cmms_adapter_and_create_idempotency(migrated_db, maintena
         adapter = DeterministicCmmsAdapter()
         service = MaintenanceOperationsService(session, cmms_adapters={adapter.provider_name: adapter})
         work_order = _draft_work_order(service, maintenance_fixture)
-        request = CmmsSyncRequest(operation="create", provider_name=adapter.provider_name)
+        request = CmmsSyncRequest(
+            operation="create",
+            provider_name=adapter.provider_name,
+            initiated_by_user_id=maintenance_fixture["technician_id"],
+        )
 
         first = service.sync_work_order_to_cmms(maintenance_fixture["organization_id"], work_order.id, request)
         second = service.sync_work_order_to_cmms(maintenance_fixture["organization_id"], work_order.id, request)
@@ -633,8 +916,58 @@ def test_deterministic_cmms_adapter_and_create_idempotency(migrated_db, maintena
         assert first.external_id is not None
         assert second.status == "skipped"
         assert second.external_id == first.external_id
+        assert first.initiated_by_user_id == maintenance_fixture["technician_id"]
+        assert second.initiated_by_user_id == maintenance_fixture["technician_id"]
         assert len(adapter.calls) == 1
         assert session.scalar(select(func.count()).select_from(CmmsSyncRecord)) == 2
+
+
+def test_cmms_sync_requires_active_member_and_rejects_provider_switch(migrated_db, maintenance_fixture):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        primary = DeterministicCmmsAdapter()
+        alternate = AlternateDeterministicCmmsAdapter()
+        service = MaintenanceOperationsService(
+            session,
+            cmms_adapters={primary.provider_name: primary, alternate.provider_name: alternate},
+        )
+        work_order = _draft_work_order(service, maintenance_fixture)
+
+        with pytest.raises(ValueError, match="active member"):
+            service.sync_work_order_to_cmms(
+                maintenance_fixture["organization_id"],
+                work_order.id,
+                CmmsSyncRequest(
+                    operation="create",
+                    provider_name=primary.provider_name,
+                    initiated_by_user_id=maintenance_fixture["outsider_id"],
+                ),
+            )
+
+        service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="create",
+                provider_name=primary.provider_name,
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        with pytest.raises(ValueError, match="already bound to a different CMMS provider"):
+            service.sync_work_order_to_cmms(
+                maintenance_fixture["organization_id"],
+                work_order.id,
+                CmmsSyncRequest(
+                    operation="create",
+                    provider_name=alternate.provider_name,
+                    initiated_by_user_id=maintenance_fixture["technician_id"],
+                ),
+            )
+        session.commit()
+
+        assert work_order.cmms_provider == primary.provider_name
+        assert len(primary.calls) == 1
+        assert len(alternate.calls) == 0
 
 
 def test_api_full_maintenance_workflow(migrated_db, maintenance_fixture):
@@ -710,7 +1043,7 @@ def test_api_full_maintenance_workflow(migrated_db, maintenance_fixture):
     )
     sync = client.post(
         f"/api/maintenance/{org_id}/work-orders/{work_order_id}/cmms-sync",
-        json={"operation": "create"},
+        json={"operation": "create", "initiated_by_user_id": technician},
     )
     work_start = client.post(
         f"/api/maintenance/{org_id}/work-orders/{work_order_id}/start",
@@ -747,6 +1080,7 @@ def test_api_full_maintenance_workflow(migrated_db, maintenance_fixture):
     assert approved.json()["status"] == "approved"
     assert sync.status_code == 200
     assert sync.json()["status"] == "not_configured"
+    assert sync.json()["initiated_by_user_id"] == technician
     assert sync.json()["external_id"] is None
     assert work_start.status_code == 200
     assert work_complete.status_code == 200

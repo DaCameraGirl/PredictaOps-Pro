@@ -201,16 +201,23 @@ keeps unsupported or insufficient-evidence predictions on a human-review path
 without inventing RUL claims.
 
 Alerts can be acknowledged, resolved, or dismissed by active organization
-members. Alerts can open first-class maintenance cases with explicit lifecycle
-transitions, append-only human-authored technician notes, requested inspections
-that require human findings before completion, and local work orders that begin
-as drafts. Work orders require explicit human approval before work starts and
-explicit completion details before completion.
+members. Alerts can open first-class maintenance cases with source hierarchy
+preserved from the alert; manual cases require an active human opener and valid
+asset/component/sensor ancestry. Case resolution must use the dedicated
+resolution endpoint so outcome, summary, and resolver evidence are persisted
+before a resolved case can be closed. Cases support append-only human-authored
+technician notes, requested inspections that cannot override the case hierarchy
+without an explicit future reassignment path and require human findings before
+completion, and local work orders that begin as drafts. Work orders require
+explicit human approval before work starts and explicit completion details before
+completion.
 
-CMMS synchronization is an explicit action. The default production adapter
-truthfully returns `not_configured` and never fabricates an external ID. A
-deterministic test adapter exercises successful sync and idempotent retry
+CMMS synchronization is an explicit active-member action. The default production
+adapter truthfully returns `not_configured` and never fabricates an external ID.
+A deterministic test adapter exercises successful sync and idempotent retry
 behavior without adding vendor credentials or claiming a vendor integration.
+Create idempotency is scoped by provider, and a work order bound to one
+successful external provider cannot silently switch providers.
 
 Useful maintenance endpoints:
 

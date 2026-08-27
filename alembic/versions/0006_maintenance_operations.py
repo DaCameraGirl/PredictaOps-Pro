@@ -292,6 +292,8 @@ def upgrade() -> None:
         sa.Column("organization_id", sa.String(length=36), nullable=False),
         sa.Column("work_order_id", sa.String(length=36), nullable=False),
         sa.Column("provider_name", sa.String(length=120), nullable=False),
+        sa.Column("initiator_type", sa.String(length=32), nullable=False),
+        sa.Column("initiated_by_user_id", sa.String(length=36), nullable=True),
         sa.Column("operation", sa.String(length=32), nullable=False),
         sa.Column("idempotency_key", sa.String(length=255), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False),
@@ -310,7 +312,9 @@ def upgrade() -> None:
             "status in ('not_configured', 'succeeded', 'failed', 'timeout', 'skipped')",
             name="ck_cmms_sync_status",
         ),
+        sa.CheckConstraint("initiator_type in ('user', 'system')", name="ck_cmms_sync_initiator_type"),
         sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"]),
+        sa.ForeignKeyConstraint(["initiated_by_user_id"], ["users.id"]),
         sa.ForeignKeyConstraint(
             ["organization_id", "work_order_id"],
             ["maintenance_work_orders.organization_id", "maintenance_work_orders.id"],
@@ -319,6 +323,7 @@ def upgrade() -> None:
         sa.UniqueConstraint("organization_id", "id", name="uq_cmms_sync_records_org_id"),
     )
     op.create_index("ix_cmms_sync_records_idempotency_key", "cmms_sync_records", ["idempotency_key"])
+    op.create_index("ix_cmms_sync_records_initiated_by_user_id", "cmms_sync_records", ["initiated_by_user_id"])
     op.create_index("ix_cmms_sync_records_organization_id", "cmms_sync_records", ["organization_id"])
     op.create_index("ix_cmms_sync_records_work_order_id", "cmms_sync_records", ["work_order_id"])
 

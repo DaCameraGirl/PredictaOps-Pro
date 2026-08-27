@@ -45,8 +45,8 @@ from platform_core.repositories import PlatformRepository
 ACTIVE_ALERT_STATUSES = {"open", "acknowledged"}
 ACTIVE_CASE_STATUSES = {"open", "in_progress"}
 CASE_TRANSITIONS = {
-    "open": {"in_progress", "resolved"},
-    "in_progress": {"resolved"},
+    "open": {"in_progress"},
+    "in_progress": set(),
     "resolved": {"closed"},
     "closed": set(),
 }
@@ -147,7 +147,8 @@ class MaintenanceOperationsService:
         if prediction is None:
             raise MaintenanceOperationsError("prediction does not exist inside this organization")
         rule = _rule_payload(request)
-        snapshot = _prediction_evidence_snapshot(prediction)
+        resolution = self.repo.get_production_model_resolution(organization_id, prediction.model_resolution_id)
+        snapshot = _prediction_evidence_snapshot(prediction, resolution)
         if prediction.prediction_status == "supported":
             if request.rul_threshold_hours is None:
                 raise MaintenanceOperationsError("supported RUL alert evaluation requires an explicit RUL threshold")
@@ -243,8 +244,7 @@ class MaintenanceOperationsService:
         )
 
     def open_case(self, organization_id: str, request: CaseCreate) -> MaintenanceCase:
-        if request.opened_by_user_id:
-            self._require_member(organization_id, request.opened_by_user_id)
+        self._require_member(organization_id, request.opened_by_user_id)
         for user_id in [request.owner_user_id, request.assignee_user_id]:
             if user_id:
                 self._require_member(organization_id, user_id)
@@ -252,14 +252,36 @@ class MaintenanceOperationsService:
         if request.alert_id:
             alert = self._alert(organization_id, request.alert_id)
             context = self._sensor_hierarchy(organization_id, alert.sensor_id)
-            data["sensor_id"] = data["sensor_id"] or alert.sensor_id
-            data["component_id"] = data["component_id"] or context["component_id"]
-            data["asset_id"] = data["asset_id"] or context["asset_id"]
+            _reject_hierarchy_override(
+                provided={
+                    "asset_id": data["asset_id"],
+                    "component_id": data["component_id"],
+                    "sensor_id": data["sensor_id"],
+                },
+                source={
+                    "asset_id": context["asset_id"],
+                    "component_id": context["component_id"],
+                    "sensor_id": alert.sensor_id,
+                },
+            )
+            data["sensor_id"] = alert.sensor_id
+            data["component_id"] = context["component_id"]
+            data["asset_id"] = context["asset_id"]
             data["evidence"] = {
                 **data["evidence"],
                 "source_alert_id": alert.id,
                 "source_evidence_snapshot": alert.evidence_snapshot,
             }
+        else:
+            hierarchy = self._validate_hierarchy(
+                organization_id,
+                asset_id=data["asset_id"],
+                component_id=data["component_id"],
+                sensor_id=data["sensor_id"],
+            )
+            data["asset_id"] = hierarchy["asset_id"]
+            data["component_id"] = hierarchy["component_id"]
+            data["sensor_id"] = hierarchy["sensor_id"]
         return self.repo.create_maintenance_case(
             organization_id,
             alert_id=data["alert_id"],
@@ -306,11 +328,11 @@ class MaintenanceOperationsService:
     ) -> MaintenanceCase:
         self._require_member(organization_id, request.actor_user_id)
         case = self._case(organization_id, case_id)
+        if request.target_status == "resolved":
+            raise MaintenanceOperationsError("resolve cases through the dedicated case resolution endpoint")
         if request.target_status not in CASE_TRANSITIONS[case.status]:
             raise MaintenanceOperationsError(f"invalid case transition {case.status} -> {request.target_status}")
         values: dict[str, Any] = {"status": request.target_status}
-        if request.target_status == "resolved":
-            values["resolved_at"] = datetime.now(UTC)
         if request.target_status == "closed":
             values["closed_at"] = datetime.now(UTC)
         values["history"] = [
@@ -342,12 +364,30 @@ class MaintenanceOperationsService:
         if request.assigned_to_user_id:
             self._require_member(organization_id, request.assigned_to_user_id)
         case = self._case(organization_id, case_id)
+        case_source = {"asset_id": case.asset_id, "component_id": case.component_id, "sensor_id": case.sensor_id}
+        if any(case_source.values()):
+            _reject_hierarchy_override(
+                provided={
+                    "asset_id": request.asset_id,
+                    "component_id": request.component_id,
+                    "sensor_id": request.sensor_id,
+                },
+                source=case_source,
+            )
+            hierarchy = case_source
+        else:
+            hierarchy = self._validate_hierarchy(
+                organization_id,
+                asset_id=request.asset_id,
+                component_id=request.component_id,
+                sensor_id=request.sensor_id,
+            )
         return self.repo.create_maintenance_inspection(
             organization_id,
             case_id=case_id,
-            asset_id=request.asset_id or case.asset_id,
-            component_id=request.component_id or case.component_id,
-            sensor_id=request.sensor_id or case.sensor_id,
+            asset_id=hierarchy["asset_id"],
+            component_id=hierarchy["component_id"],
+            sensor_id=hierarchy["sensor_id"],
             requested_reason=request.requested_reason,
             requested_by_user_id=request.requested_by_user_id,
             assigned_to_user_id=request.assigned_to_user_id,
@@ -517,15 +557,24 @@ class MaintenanceOperationsService:
         work_order_id: str,
         request: CmmsSyncRequest,
     ) -> CmmsSyncRecord:
+        self._require_member(organization_id, request.initiated_by_user_id)
         work_order = self._work_order(organization_id, work_order_id)
         provider_name = request.provider_name or request.adapter_name or "disabled"
         adapter = self.cmms_adapters.get(provider_name) or DisabledCmmsAdapter()
         operation = request.operation
-        idempotency_key = _cmms_idempotency_key(organization_id, work_order.id, operation)
+        if (
+            operation == "create"
+            and work_order.cmms_external_id
+            and work_order.cmms_provider
+            and work_order.cmms_provider != adapter.provider_name
+        ):
+            raise MaintenanceOperationsError("work order is already bound to a different CMMS provider")
+        idempotency_key = _cmms_idempotency_key(organization_id, work_order.id, adapter.provider_name, operation)
         if operation == "create":
             existing_success = self.repo.get_successful_cmms_sync_record(
                 organization_id,
                 work_order_id=work_order.id,
+                provider_name=adapter.provider_name,
                 operation=operation,
                 idempotency_key=idempotency_key,
             )
@@ -534,6 +583,8 @@ class MaintenanceOperationsService:
                     organization_id,
                     work_order_id=work_order.id,
                     provider_name=existing_success.provider_name,
+                    initiator_type="user",
+                    initiated_by_user_id=request.initiated_by_user_id,
                     operation=operation,
                     idempotency_key=idempotency_key,
                     status="skipped",
@@ -551,6 +602,8 @@ class MaintenanceOperationsService:
             organization_id,
             work_order_id=work_order.id,
             provider_name=adapter.provider_name,
+            initiator_type="user",
+            initiated_by_user_id=request.initiated_by_user_id,
             operation=operation,
             idempotency_key=idempotency_key,
             status=result.status,
@@ -684,6 +737,38 @@ class MaintenanceOperationsService:
             raise MaintenanceOperationsError("component asset does not exist inside this organization")
         return {"site_id": asset.site_id, "asset_id": asset.id, "component_id": component.id}
 
+    def _validate_hierarchy(
+        self,
+        organization_id: str,
+        *,
+        asset_id: str | None,
+        component_id: str | None,
+        sensor_id: str | None,
+    ) -> dict[str, str | None]:
+        if sensor_id:
+            context = self._sensor_hierarchy(organization_id, sensor_id)
+            if component_id and component_id != context["component_id"]:
+                raise MaintenanceOperationsError("sensor/component/asset hierarchy does not match")
+            if asset_id and asset_id != context["asset_id"]:
+                raise MaintenanceOperationsError("sensor/component/asset hierarchy does not match")
+            return {
+                "asset_id": context["asset_id"],
+                "component_id": context["component_id"],
+                "sensor_id": sensor_id,
+            }
+        if component_id:
+            component = self.repo.get_component_by_id(organization_id, component_id)
+            if component is None:
+                raise MaintenanceOperationsError("component does not exist inside this organization")
+            if asset_id and asset_id != component.asset_id:
+                raise MaintenanceOperationsError("sensor/component/asset hierarchy does not match")
+            return {"asset_id": component.asset_id, "component_id": component_id, "sensor_id": None}
+        if asset_id:
+            if self.repo.get_asset_by_id(organization_id, asset_id) is None:
+                raise MaintenanceOperationsError("asset does not exist inside this organization")
+            return {"asset_id": asset_id, "component_id": None, "sensor_id": None}
+        return {"asset_id": None, "component_id": None, "sensor_id": None}
+
     def _count_by_status(self, model, organization_id: str, statuses: list[str]) -> int:
         return int(
             self.session.scalar(
@@ -705,7 +790,7 @@ def _rule_payload(request: PredictionAlertEvaluationRequest) -> dict[str, Any]:
     }
 
 
-def _prediction_evidence_snapshot(prediction) -> dict[str, Any]:
+def _prediction_evidence_snapshot(prediction, resolution) -> dict[str, Any]:
     snapshot = {
         "prediction_record_id": prediction.id,
         "prediction_status": prediction.prediction_status,
@@ -717,7 +802,8 @@ def _prediction_evidence_snapshot(prediction) -> dict[str, Any]:
         "model_resolution_id": prediction.model_resolution_id,
         "feature_record_ids": prediction.feature_record_ids,
         "serving_reference_time": prediction.observed_at.isoformat(),
-        "model_dataset_provenance": (prediction.provenance or {}).get("model_resolution"),
+        "prediction_provenance": prediction.provenance or {},
+        "model_resolution": _model_resolution_snapshot(resolution),
     }
     if prediction.prediction_status == "supported":
         snapshot["predicted_rul_hours"] = prediction.predicted_rul_hours
@@ -742,8 +828,29 @@ def _alert_dedupe_key(prediction_id: str, rule_id: str, alert_kind: str, thresho
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def _cmms_idempotency_key(organization_id: str, work_order_id: str, operation: str) -> str:
-    return hashlib.sha256(f"{organization_id}:{work_order_id}:{operation}".encode()).hexdigest()
+def _model_resolution_snapshot(resolution) -> dict[str, Any] | None:
+    if resolution is None:
+        return None
+    return {
+        "id": resolution.id,
+        "status": resolution.status,
+        "reason_code": resolution.reason_code,
+        "reason": resolution.reason,
+        "artifact_sha256": resolution.artifact_sha256,
+        "feature_schema": resolution.feature_schema,
+        "abstention_policy": resolution.abstention_policy,
+        "evidence": resolution.evidence,
+    }
+
+
+def _reject_hierarchy_override(provided: dict[str, str | None], source: dict[str, str | None]) -> None:
+    for key, value in provided.items():
+        if value is not None and value != source.get(key):
+            raise MaintenanceOperationsError("maintenance hierarchy must match source evidence")
+
+
+def _cmms_idempotency_key(organization_id: str, work_order_id: str, provider_name: str, operation: str) -> str:
+    return hashlib.sha256(f"{organization_id}:{work_order_id}:{provider_name}:{operation}".encode()).hexdigest()
 
 
 def _history_event(kind: str, actor_user_id: str | None, note: str | None) -> dict[str, Any]:
@@ -878,6 +985,8 @@ def cmms_sync_payload(sync: CmmsSyncRecord) -> dict[str, Any]:
         "id": sync.id,
         "work_order_id": sync.work_order_id,
         "provider_name": sync.provider_name,
+        "initiator_type": sync.initiator_type,
+        "initiated_by_user_id": sync.initiated_by_user_id,
         "operation": sync.operation,
         "idempotency_key": sync.idempotency_key,
         "status": sync.status,
