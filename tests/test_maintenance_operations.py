@@ -30,7 +30,7 @@ from maintenance_operations.contracts import (
     WorkOrderCreate,
     WorkOrderStartRequest,
 )
-from maintenance_operations.service import DeterministicCmmsAdapter, MaintenanceOperationsService
+from maintenance_operations.service import CmmsAdapterResult, DeterministicCmmsAdapter, MaintenanceOperationsService
 from ml_platform.artifact_store import ModelArtifactStore
 from ml_platform.contracts import (
     DatasetVersionCreate,
@@ -66,6 +66,43 @@ ROOT = Path(__file__).resolve().parent.parent
 
 class AlternateDeterministicCmmsAdapter(DeterministicCmmsAdapter):
     provider_name = "alternate-test"
+
+
+class NoEchoUpdateCmmsAdapter:
+    provider_name = "no-echo-test"
+
+    def __init__(self):
+        self.calls: list[dict[str, str]] = []
+
+    def sync(self, operation, work_order, *, idempotency_key):
+        self.calls.append({"operation": operation, "idempotency_key": idempotency_key})
+        if operation == "create":
+            return CmmsAdapterResult(status="succeeded", external_id="A-123", external_status="created")
+        return CmmsAdapterResult(status="succeeded", external_id=None, external_status=operation)
+
+
+class MissingCreateExternalIdCmmsAdapter:
+    provider_name = "missing-create-id-test"
+
+    def __init__(self):
+        self.calls: list[dict[str, str]] = []
+
+    def sync(self, operation, work_order, *, idempotency_key):
+        self.calls.append({"operation": operation, "idempotency_key": idempotency_key})
+        return CmmsAdapterResult(status="succeeded", external_id=None, external_status=operation)
+
+
+class MismatchedExternalIdCmmsAdapter:
+    provider_name = "mismatched-id-test"
+
+    def __init__(self):
+        self.calls: list[dict[str, str]] = []
+
+    def sync(self, operation, work_order, *, idempotency_key):
+        self.calls.append({"operation": operation, "idempotency_key": idempotency_key})
+        if operation == "create":
+            return CmmsAdapterResult(status="succeeded", external_id="A-123", external_status="created")
+        return CmmsAdapterResult(status="succeeded", external_id="B-999", external_status=operation)
 
 
 @pytest.fixture
@@ -1059,6 +1096,118 @@ def test_cmms_bound_provider_is_used_when_no_provider_is_supplied(migrated_db, m
         assert update_sync.external_id == create_sync.external_id
         assert [call["operation"] for call in primary.calls] == ["create", "update"]
         assert len(alternate.calls) == 0
+
+
+def test_cmms_non_create_success_without_external_id_preserves_bound_identifier(
+    migrated_db,
+    maintenance_fixture,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        primary = NoEchoUpdateCmmsAdapter()
+        alternate = AlternateDeterministicCmmsAdapter()
+        service = MaintenanceOperationsService(
+            session,
+            cmms_adapters={primary.provider_name: primary, alternate.provider_name: alternate},
+        )
+        work_order = _draft_work_order(service, maintenance_fixture)
+        create_sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="create",
+                provider_name=primary.provider_name,
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        update_sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="update",
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        with pytest.raises(ValueError, match="already bound to a different CMMS provider"):
+            service.sync_work_order_to_cmms(
+                maintenance_fixture["organization_id"],
+                work_order.id,
+                CmmsSyncRequest(
+                    operation="update",
+                    provider_name=alternate.provider_name,
+                    initiated_by_user_id=maintenance_fixture["technician_id"],
+                ),
+            )
+        session.commit()
+
+        assert create_sync.status == "succeeded"
+        assert create_sync.external_id == "A-123"
+        assert update_sync.status == "succeeded"
+        assert update_sync.external_id == "A-123"
+        assert work_order.cmms_provider == primary.provider_name
+        assert work_order.cmms_external_id == "A-123"
+        assert [call["operation"] for call in primary.calls] == ["create", "update"]
+        assert len(alternate.calls) == 0
+
+
+def test_cmms_create_success_without_external_id_is_failed_adapter_result(migrated_db, maintenance_fixture):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        adapter = MissingCreateExternalIdCmmsAdapter()
+        service = MaintenanceOperationsService(session, cmms_adapters={adapter.provider_name: adapter})
+        work_order = _draft_work_order(service, maintenance_fixture)
+        sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="create",
+                provider_name=adapter.provider_name,
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        session.commit()
+
+        assert sync.status == "failed"
+        assert sync.error_category == "invalid_adapter_result"
+        assert sync.external_id is None
+        assert sync.attempt_metadata["adapter_reported_status"] == "succeeded"
+        assert work_order.cmms_provider is None
+        assert work_order.cmms_external_id is None
+        assert len(adapter.calls) == 1
+
+
+def test_cmms_non_create_success_with_different_external_id_fails_closed(migrated_db, maintenance_fixture):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        adapter = MismatchedExternalIdCmmsAdapter()
+        service = MaintenanceOperationsService(session, cmms_adapters={adapter.provider_name: adapter})
+        work_order = _draft_work_order(service, maintenance_fixture)
+        create_sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="create",
+                provider_name=adapter.provider_name,
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        update_sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="update",
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        session.commit()
+
+        assert create_sync.status == "succeeded"
+        assert update_sync.status == "failed"
+        assert update_sync.error_category == "invalid_adapter_result"
+        assert update_sync.external_id == "B-999"
+        assert work_order.cmms_provider == adapter.provider_name
+        assert work_order.cmms_external_id == "A-123"
+        assert [call["operation"] for call in adapter.calls] == ["create", "update"]
 
 
 def test_api_full_maintenance_workflow(migrated_db, maintenance_fixture):

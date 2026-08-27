@@ -597,6 +597,31 @@ class MaintenanceOperationsService:
                     },
                 )
         result = adapter.sync(operation, work_order, idempotency_key=idempotency_key)
+        external_id = _normalized_external_id(result.external_id)
+        if result.status == "succeeded":
+            invalid_adapter_message = _invalid_successful_cmms_result(operation, work_order, external_id)
+            if invalid_adapter_message:
+                return self.repo.create_cmms_sync_record(
+                    organization_id,
+                    work_order_id=work_order.id,
+                    provider_name=provider_name,
+                    initiator_type="user",
+                    initiated_by_user_id=request.initiated_by_user_id,
+                    operation=operation,
+                    idempotency_key=idempotency_key,
+                    status="failed",
+                    external_id=external_id,
+                    error_category="invalid_adapter_result",
+                    error_message=invalid_adapter_message,
+                    completed_at=datetime.now(UTC),
+                    attempt_metadata={
+                        **request.attempt_metadata,
+                        **(result.metadata or {}),
+                        "adapter_reported_status": result.status,
+                    },
+                )
+            if operation != "create":
+                external_id = work_order.cmms_external_id
         sync = self.repo.create_cmms_sync_record(
             organization_id,
             work_order_id=work_order.id,
@@ -606,7 +631,7 @@ class MaintenanceOperationsService:
             operation=operation,
             idempotency_key=idempotency_key,
             status=result.status,
-            external_id=result.external_id,
+            external_id=external_id,
             error_category=result.error_category,
             error_message=result.error_message,
             completed_at=datetime.now(UTC),
@@ -616,7 +641,7 @@ class MaintenanceOperationsService:
             self.repo.update_maintenance_work_order(
                 work_order,
                 cmms_provider=provider_name,
-                cmms_external_id=result.external_id,
+                cmms_external_id=external_id,
                 cmms_state=result.external_status or result.status,
             )
         elif result.status == "not_configured":
@@ -846,6 +871,29 @@ def _reject_hierarchy_override(provided: dict[str, str | None], source: dict[str
     for key, value in provided.items():
         if value is not None and value != source.get(key):
             raise MaintenanceOperationsError("maintenance hierarchy must match source evidence")
+
+
+def _normalized_external_id(external_id: str | None) -> str | None:
+    if external_id is None:
+        return None
+    normalized = external_id.strip()
+    return normalized or None
+
+
+def _invalid_successful_cmms_result(
+    operation: str,
+    work_order: MaintenanceWorkOrder,
+    external_id: str | None,
+) -> str | None:
+    if operation == "create":
+        if external_id is None:
+            return "CMMS create reported success without an external work-order identifier"
+        return None
+    if not work_order.cmms_external_id:
+        return "CMMS non-create operation reported success without an existing external work-order binding"
+    if external_id is not None and external_id != work_order.cmms_external_id:
+        return "CMMS non-create operation returned an external ID that differs from the bound work order"
+    return None
 
 
 def _cmms_idempotency_key(organization_id: str, work_order_id: str, provider_name: str, operation: str) -> str:

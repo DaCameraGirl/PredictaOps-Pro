@@ -219,6 +219,9 @@ behavior without adding vendor credentials or claiming a vendor integration.
 Create idempotency is scoped by provider, and a work order bound to one
 successful external provider cannot silently switch providers. Later CMMS
 operations without an explicit provider automatically use the bound provider.
+External create success requires a non-empty external ID; update, cancel, and
+close preserve the existing bound external ID when the adapter does not echo it
+and fail closed if the adapter returns a different ID.
 
 Useful maintenance endpoints:
 
