@@ -192,6 +192,56 @@ GET  /api/serving/{organization_id}/predictions
 GET  /api/serving/{organization_id}/health
 ```
 
+## Maintenance operations
+
+Production Slice 11 converts persisted machine evidence into a traceable human
+workflow. Prediction-driven alert evaluation stores the original serving
+evidence snapshot, applies an explicit caller-supplied maintenance rule, and
+keeps unsupported or insufficient-evidence predictions on a human-review path
+without inventing RUL claims.
+
+Alerts can be acknowledged, resolved, or dismissed by active organization
+members. Alerts can open first-class maintenance cases with explicit lifecycle
+transitions, append-only human-authored technician notes, requested inspections
+that require human findings before completion, and local work orders that begin
+as drafts. Work orders require explicit human approval before work starts and
+explicit completion details before completion.
+
+CMMS synchronization is an explicit action. The default production adapter
+truthfully returns `not_configured` and never fabricates an external ID. A
+deterministic test adapter exercises successful sync and idempotent retry
+behavior without adding vendor credentials or claiming a vendor integration.
+
+Useful maintenance endpoints:
+
+```text
+POST /api/maintenance/{organization_id}/alerts/evaluate-prediction
+GET  /api/maintenance/{organization_id}/alerts
+GET  /api/maintenance/{organization_id}/alerts/{alert_id}
+POST /api/maintenance/{organization_id}/alerts/{alert_id}/acknowledge
+POST /api/maintenance/{organization_id}/alerts/{alert_id}/resolve
+POST /api/maintenance/{organization_id}/alerts/{alert_id}/case
+POST /api/maintenance/{organization_id}/cases
+GET  /api/maintenance/{organization_id}/cases
+GET  /api/maintenance/{organization_id}/cases/{case_id}
+POST /api/maintenance/{organization_id}/cases/{case_id}/transition
+POST /api/maintenance/{organization_id}/cases/{case_id}/notes
+GET  /api/maintenance/{organization_id}/cases/{case_id}/notes
+POST /api/maintenance/{organization_id}/cases/{case_id}/inspections
+POST /api/maintenance/{organization_id}/inspections/{inspection_id}/start
+POST /api/maintenance/{organization_id}/inspections/{inspection_id}/complete
+POST /api/maintenance/{organization_id}/inspections/{inspection_id}/cancel
+POST /api/maintenance/{organization_id}/cases/{case_id}/work-orders
+POST /api/maintenance/{organization_id}/work-orders/{work_order_id}/approve
+POST /api/maintenance/{organization_id}/work-orders/{work_order_id}/start
+POST /api/maintenance/{organization_id}/work-orders/{work_order_id}/complete
+POST /api/maintenance/{organization_id}/work-orders/{work_order_id}/cancel
+POST /api/maintenance/{organization_id}/work-orders/{work_order_id}/cmms-sync
+GET  /api/maintenance/{organization_id}/work-orders/{work_order_id}/cmms-sync
+POST /api/maintenance/{organization_id}/cases/{case_id}/resolve
+GET  /api/maintenance/{organization_id}/health
+```
+
 ## Rebuild the current Test 2 model
 
 The existing downloader is intentionally Test-2-only:
@@ -249,7 +299,9 @@ uvicorn app.main:app --reload
 
 ## Validation
 
-Pull requests run Ruff, the full pytest suite including browser E2E coverage, and a Docker build in GitHub Actions.
+Pull requests run Ruff, the full pytest suite including browser E2E coverage, a
+PostgreSQL migration/platform-stack job through Maintenance Operations, and a
+Docker build in GitHub Actions.
 
 ```bash
 python -m ruff check src app tests scripts

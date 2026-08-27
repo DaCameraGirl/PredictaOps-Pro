@@ -77,7 +77,10 @@ GitHub pull request numbers may drift after branch renames or replacement PRs.
    provenance, persisted model-resolution decisions, drift and data-quality monitoring, retraining triggers without
    silent auto-promotion, REST endpoints, and PostgreSQL migration/CI coverage.
 6. **Production Slice 11 - Maintenance Operations**
-   Alerts, cases, inspections, acknowledgement, technician notes, work orders, and CMMS adapter contract.
+   Prediction/health evidence to alert evaluation, acknowledgement, cases, append-only technician notes, inspections,
+   draft-to-completion work orders, explicit CMMS sync attempts, disabled/test CMMS adapters, operational history,
+   tenant boundaries, idempotency protections, API endpoints, and PostgreSQL migration/CI coverage. Model evidence stays
+   separate from human findings, work performed, and CMMS state.
 7. **Production Slice 12 - Enterprise Security**
    RBAC, SSO/OIDC, tenant isolation, audit logs, secrets, and security hardening.
 8. **Production Slice 13 - Full Studio UI**

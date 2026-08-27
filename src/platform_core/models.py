@@ -845,3 +845,284 @@ class RetrainingTrigger(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
     triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     evidence: Mapped[dict | None] = mapped_column(JSON)
+
+
+class MaintenanceAlert(Base, TimestampMixin):
+    __tablename__ = "maintenance_alerts"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_maintenance_alerts_org_id"),
+        ForeignKeyConstraint(["organization_id", "site_id"], ["sites.organization_id", "sites.id"]),
+        ForeignKeyConstraint(["organization_id", "asset_id"], ["assets.organization_id", "assets.id"]),
+        ForeignKeyConstraint(["organization_id", "component_id"], ["components.organization_id", "components.id"]),
+        ForeignKeyConstraint(["organization_id", "sensor_id"], ["sensors.organization_id", "sensors.id"]),
+        ForeignKeyConstraint(
+            ["organization_id", "prediction_id"],
+            ["prediction_records.organization_id", "prediction_records.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "model_resolution_id"],
+            ["production_model_resolutions.organization_id", "production_model_resolutions.id"],
+        ),
+        CheckConstraint("severity in ('info', 'watch', 'warning', 'critical')", name="ck_maintenance_alert_severity"),
+        CheckConstraint("priority in ('low', 'medium', 'high', 'critical')", name="ck_maintenance_alert_priority"),
+        CheckConstraint(
+            "status in ('open', 'acknowledged', 'resolved', 'dismissed')",
+            name="ck_maintenance_alert_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    site_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    component_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    sensor_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    prediction_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    model_resolution_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    source_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    alert_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    summary: Mapped[str] = mapped_column(String(1024), nullable=False)
+    severity: Mapped[str] = mapped_column(String(32), nullable=False)
+    priority: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
+    source_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_reason_code: Mapped[str | None] = mapped_column(String(120))
+    recommended_action: Mapped[str | None] = mapped_column(String(1024))
+    dedupe_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    evidence_snapshot: Mapped[dict | None] = mapped_column(JSON)
+    evidence: Mapped[dict | None] = mapped_column(JSON)
+    acknowledged_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    acknowledgement_note: Mapped[str | None] = mapped_column(String(1024))
+    resolved_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    disposition: Mapped[str | None] = mapped_column(String(64))
+    disposition_reason: Mapped[str | None] = mapped_column(String(1024))
+
+
+class MaintenanceCase(Base, TimestampMixin):
+    __tablename__ = "maintenance_cases"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_maintenance_cases_org_id"),
+        UniqueConstraint("organization_id", "case_number", name="uq_maintenance_cases_org_case_number"),
+        ForeignKeyConstraint(
+            ["organization_id", "alert_id"],
+            ["maintenance_alerts.organization_id", "maintenance_alerts.id"],
+        ),
+        ForeignKeyConstraint(["organization_id", "asset_id"], ["assets.organization_id", "assets.id"]),
+        ForeignKeyConstraint(["organization_id", "component_id"], ["components.organization_id", "components.id"]),
+        ForeignKeyConstraint(["organization_id", "sensor_id"], ["sensors.organization_id", "sensors.id"]),
+        CheckConstraint("priority in ('low', 'medium', 'high', 'critical')", name="ck_maintenance_case_priority"),
+        CheckConstraint(
+            "status in ('open', 'in_progress', 'resolved', 'closed')",
+            name="ck_maintenance_case_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    alert_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    case_number: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    priority: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open")
+    asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    component_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    sensor_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    opened_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    assignee_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    summary: Mapped[str | None] = mapped_column(String(1024))
+    recommended_action: Mapped[str | None] = mapped_column(String(1024))
+    history: Mapped[list[dict] | None] = mapped_column(JSON)
+    evidence: Mapped[dict | None] = mapped_column(JSON)
+
+
+class MaintenanceAcknowledgement(Base, TimestampMixin):
+    __tablename__ = "maintenance_acknowledgements"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "case_id"],
+            ["maintenance_cases.organization_id", "maintenance_cases.id"],
+        ),
+        CheckConstraint("decision in ('accepted', 'deferred', 'dismissed')", name="ck_maintenance_ack_decision"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    acknowledged_by_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    decision: Mapped[str] = mapped_column(String(32), nullable=False)
+    comment: Mapped[str | None] = mapped_column(String(1024))
+    acknowledged_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class MaintenanceInspection(Base, TimestampMixin):
+    __tablename__ = "maintenance_inspections"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "case_id"],
+            ["maintenance_cases.organization_id", "maintenance_cases.id"],
+        ),
+        ForeignKeyConstraint(["organization_id", "asset_id"], ["assets.organization_id", "assets.id"]),
+        ForeignKeyConstraint(["organization_id", "component_id"], ["components.organization_id", "components.id"]),
+        ForeignKeyConstraint(["organization_id", "sensor_id"], ["sensors.organization_id", "sensors.id"]),
+        CheckConstraint(
+            "status in ('requested', 'in_progress', 'completed', 'cancelled')",
+            name="ck_inspection_status",
+        ),
+        CheckConstraint(
+            "condition in ('normal', 'watch', 'degraded', 'failed', 'unknown')",
+            name="ck_inspection_condition",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    component_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    sensor_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="requested")
+    requested_reason: Mapped[str] = mapped_column(String(1024), nullable=False)
+    requested_by_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    assigned_to_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    performed_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    condition: Mapped[str | None] = mapped_column(String(32))
+    findings: Mapped[str | None] = mapped_column(String(2048))
+    recommended_follow_up: Mapped[str | None] = mapped_column(String(1024))
+    evidence_metadata: Mapped[dict | None] = mapped_column(JSON)
+    inspected_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    inspected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    observation: Mapped[str | None] = mapped_column(String(2048))
+    measurements: Mapped[dict | None] = mapped_column(JSON)
+
+
+class MaintenanceNote(Base, TimestampMixin):
+    __tablename__ = "maintenance_notes"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "case_id"],
+            ["maintenance_cases.organization_id", "maintenance_cases.id"],
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    author_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    body: Mapped[str] = mapped_column(String(2048), nullable=False)
+    note_kind: Mapped[str] = mapped_column(String(64), nullable=False, default="technician_note")
+    metadata_json: Mapped[dict | None] = mapped_column(JSON)
+
+
+class MaintenanceWorkOrder(Base, TimestampMixin):
+    __tablename__ = "maintenance_work_orders"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_maintenance_work_orders_org_id"),
+        UniqueConstraint("organization_id", "work_order_number", name="uq_work_orders_org_number"),
+        ForeignKeyConstraint(
+            ["organization_id", "case_id"],
+            ["maintenance_cases.organization_id", "maintenance_cases.id"],
+        ),
+        ForeignKeyConstraint(["organization_id", "asset_id"], ["assets.organization_id", "assets.id"]),
+        ForeignKeyConstraint(["organization_id", "component_id"], ["components.organization_id", "components.id"]),
+        CheckConstraint(
+            "status in ('draft', 'approved', 'in_progress', 'completed', 'cancelled')",
+            name="ck_work_order_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    component_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    work_order_number: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(2048))
+    priority: Mapped[str] = mapped_column(String(32), nullable=False)
+    requested_work: Mapped[str] = mapped_column(String(2048), nullable=False)
+    summary: Mapped[str] = mapped_column(String(255), nullable=False)
+    requested_by_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    approved_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    assignee_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    planned_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completion_notes: Mapped[str | None] = mapped_column(String(2048))
+    cmms_provider: Mapped[str | None] = mapped_column(String(120))
+    cmms_external_id: Mapped[str | None] = mapped_column(String(255))
+    cmms_state: Mapped[str | None] = mapped_column(String(120))
+    work_performed: Mapped[str | None] = mapped_column(String(2048))
+    evidence: Mapped[dict | None] = mapped_column(JSON)
+
+
+class MaintenanceResolution(Base, TimestampMixin):
+    __tablename__ = "maintenance_resolutions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "case_id"],
+            ["maintenance_cases.organization_id", "maintenance_cases.id"],
+        ),
+        CheckConstraint(
+            "outcome in ('confirmed', 'not_found', 'monitor', 'repaired', 'replaced')",
+            name="ck_resolution_outcome",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    resolved_by_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    summary: Mapped[str] = mapped_column(String(2048), nullable=False)
+    resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    evidence: Mapped[dict | None] = mapped_column(JSON)
+
+
+class CmmsSyncRecord(Base, TimestampMixin):
+    __tablename__ = "cmms_sync_records"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_cmms_sync_records_org_id"),
+        ForeignKeyConstraint(
+            ["organization_id", "work_order_id"],
+            ["maintenance_work_orders.organization_id", "maintenance_work_orders.id"],
+        ),
+        CheckConstraint(
+            "operation in ('create', 'update', 'cancel', 'close')",
+            name="ck_cmms_sync_operation",
+        ),
+        CheckConstraint(
+            "status in ('not_configured', 'succeeded', 'failed', 'timeout', 'skipped')",
+            name="ck_cmms_sync_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    work_order_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    provider_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    operation: Mapped[str] = mapped_column(String(32), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    external_id: Mapped[str | None] = mapped_column(String(255))
+    error_category: Mapped[str | None] = mapped_column(String(120))
+    error_message: Mapped[str | None] = mapped_column(String(1024))
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_metadata: Mapped[dict | None] = mapped_column(JSON)

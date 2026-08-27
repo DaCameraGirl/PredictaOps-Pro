@@ -22,12 +22,20 @@ from platform_core.models import (
     AnalyticsHealthState,
     AnalyticsRun,
     Asset,
+    CmmsSyncRecord,
     Component,
     IngestedRecord,
     IngestionBatch,
     IngestionFailure,
     IngestionSource,
     MachineReading,
+    MaintenanceAcknowledgement,
+    MaintenanceAlert,
+    MaintenanceCase,
+    MaintenanceInspection,
+    MaintenanceNote,
+    MaintenanceResolution,
+    MaintenanceWorkOrder,
     MLDatasetVersion,
     MLExperimentRun,
     MLModelPromotionEvent,
@@ -93,6 +101,10 @@ class PlatformRepository:
             "prediction_records": self.count(PredictionRecord),
             "model_serving_monitors": self.count(ModelServingMonitor),
             "retraining_triggers": self.count(RetrainingTrigger),
+            "maintenance_alerts": self.count(MaintenanceAlert),
+            "maintenance_cases": self.count(MaintenanceCase),
+            "maintenance_work_orders": self.count(MaintenanceWorkOrder),
+            "cmms_sync_records": self.count(CmmsSyncRecord),
         }
 
     def get_organization_by_slug(self, slug: str) -> Organization | None:
@@ -1387,6 +1399,480 @@ class PlatformRepository:
             .order_by(RetrainingTrigger.created_at.desc(), RetrainingTrigger.id)
         )
         return list(self.session.scalars(statement))
+
+    def get_prediction_record(self, organization_id: str, prediction_id: str) -> PredictionRecord | None:
+        return self.session.scalar(
+            select(PredictionRecord).where(
+                PredictionRecord.organization_id == organization_id,
+                PredictionRecord.id == prediction_id,
+            )
+        )
+
+    def get_active_membership(self, organization_id: str, user_id: str) -> OrganizationMembership | None:
+        return self.session.scalar(
+            select(OrganizationMembership).where(
+                OrganizationMembership.organization_id == organization_id,
+                OrganizationMembership.user_id == user_id,
+                OrganizationMembership.lifecycle_state == "active",
+            )
+        )
+
+    def create_maintenance_alert(
+        self,
+        organization_id: str,
+        *,
+        site_id: str | None,
+        asset_id: str | None,
+        component_id: str | None,
+        sensor_id: str,
+        prediction_id: str | None,
+        model_resolution_id: str | None,
+        source_type: str,
+        source_id: str,
+        alert_kind: str,
+        title: str,
+        summary: str,
+        severity: str,
+        priority: str,
+        source_kind: str,
+        source_reason_code: str | None,
+        recommended_action: str | None,
+        dedupe_key: str,
+        evidence_snapshot: dict | None,
+        evidence: dict | None,
+    ) -> MaintenanceAlert:
+        existing = self.get_active_maintenance_alert_by_dedupe_key(organization_id, dedupe_key)
+        if existing:
+            return existing
+        if site_id and self.get_site_by_id(organization_id, site_id) is None:
+            raise TenantBoundaryError("maintenance alert site must belong to the same organization")
+        if asset_id and self.get_asset_by_id(organization_id, asset_id) is None:
+            raise TenantBoundaryError("maintenance alert asset must belong to the same organization")
+        if component_id and self.get_component_by_id(organization_id, component_id) is None:
+            raise TenantBoundaryError("maintenance alert component must belong to the same organization")
+        if self.get_sensor_by_id(organization_id, sensor_id) is None:
+            raise TenantBoundaryError("maintenance alert sensor must belong to the same organization")
+        if prediction_id and self.get_prediction_record(organization_id, prediction_id) is None:
+            raise TenantBoundaryError("maintenance alert prediction must belong to the same organization")
+        alert = MaintenanceAlert(
+            organization_id=organization_id,
+            site_id=site_id,
+            asset_id=asset_id,
+            component_id=component_id,
+            sensor_id=sensor_id,
+            prediction_id=prediction_id,
+            model_resolution_id=model_resolution_id,
+            source_type=source_type,
+            source_id=source_id,
+            alert_kind=alert_kind,
+            title=title,
+            summary=summary,
+            severity=severity,
+            priority=priority,
+            status="open",
+            source_kind=source_kind,
+            source_reason_code=source_reason_code,
+            recommended_action=recommended_action,
+            dedupe_key=dedupe_key,
+            evidence_snapshot=evidence_snapshot,
+            evidence=evidence,
+        )
+        self.session.add(alert)
+        self.session.flush()
+        return alert
+
+    def get_active_maintenance_alert_by_dedupe_key(
+        self,
+        organization_id: str,
+        dedupe_key: str,
+    ) -> MaintenanceAlert | None:
+        return self.session.scalar(
+            select(MaintenanceAlert).where(
+                MaintenanceAlert.organization_id == organization_id,
+                MaintenanceAlert.dedupe_key == dedupe_key,
+                MaintenanceAlert.status.in_(["open", "acknowledged"]),
+            )
+        )
+
+    def get_maintenance_alert(self, organization_id: str, alert_id: str) -> MaintenanceAlert | None:
+        return self.session.scalar(
+            select(MaintenanceAlert).where(
+                MaintenanceAlert.organization_id == organization_id,
+                MaintenanceAlert.id == alert_id,
+            )
+        )
+
+    def list_maintenance_alerts(self, organization_id: str, *, status: str | None = None) -> list[MaintenanceAlert]:
+        statement = select(MaintenanceAlert).where(MaintenanceAlert.organization_id == organization_id)
+        if status:
+            statement = statement.where(MaintenanceAlert.status == status)
+        return list(self.session.scalars(statement.order_by(MaintenanceAlert.created_at.desc(), MaintenanceAlert.id)))
+
+    def update_maintenance_alert(self, alert: MaintenanceAlert, **values) -> MaintenanceAlert:
+        for key, value in values.items():
+            setattr(alert, key, value)
+        self.session.flush()
+        return alert
+
+    def next_maintenance_case_number(self, organization_id: str) -> str:
+        total = self.count_for_organization(MaintenanceCase, organization_id) + 1
+        return f"CASE-{total:06d}"
+
+    def next_work_order_number(self, organization_id: str) -> str:
+        total = self.count_for_organization(MaintenanceWorkOrder, organization_id) + 1
+        return f"WO-{total:06d}"
+
+    def create_maintenance_case(
+        self,
+        organization_id: str,
+        *,
+        alert_id: str | None,
+        title: str,
+        summary: str | None,
+        priority: str,
+        asset_id: str | None,
+        component_id: str | None,
+        sensor_id: str | None,
+        opened_by_user_id: str | None,
+        owner_user_id: str | None,
+        assignee_user_id: str | None,
+        recommended_action: str | None,
+        history: list[dict] | None,
+        evidence: dict | None,
+    ) -> MaintenanceCase:
+        existing = self.get_active_maintenance_case_for_alert(organization_id, alert_id) if alert_id else None
+        if existing:
+            return existing
+        if alert_id and self.get_maintenance_alert(organization_id, alert_id) is None:
+            raise TenantBoundaryError("maintenance case alert must belong to the same organization")
+        if asset_id and self.get_asset_by_id(organization_id, asset_id) is None:
+            raise TenantBoundaryError("maintenance case asset must belong to the same organization")
+        if component_id and self.get_component_by_id(organization_id, component_id) is None:
+            raise TenantBoundaryError("maintenance case component must belong to the same organization")
+        if sensor_id and self.get_sensor_by_id(organization_id, sensor_id) is None:
+            raise TenantBoundaryError("maintenance case sensor must belong to the same organization")
+        case = MaintenanceCase(
+            organization_id=organization_id,
+            alert_id=alert_id,
+            case_number=self.next_maintenance_case_number(organization_id),
+            title=title,
+            summary=summary,
+            priority=priority,
+            status="open",
+            asset_id=asset_id,
+            component_id=component_id,
+            sensor_id=sensor_id,
+            opened_by_user_id=opened_by_user_id,
+            owner_user_id=owner_user_id,
+            assignee_user_id=assignee_user_id,
+            recommended_action=recommended_action,
+            history=history,
+            evidence=evidence,
+        )
+        self.session.add(case)
+        self.session.flush()
+        return case
+
+    def get_active_maintenance_case_for_alert(
+        self,
+        organization_id: str,
+        alert_id: str | None,
+    ) -> MaintenanceCase | None:
+        if not alert_id:
+            return None
+        return self.session.scalar(
+            select(MaintenanceCase).where(
+                MaintenanceCase.organization_id == organization_id,
+                MaintenanceCase.alert_id == alert_id,
+                MaintenanceCase.status.in_(["open", "in_progress"]),
+            )
+        )
+
+    def get_maintenance_case(self, organization_id: str, case_id: str) -> MaintenanceCase | None:
+        return self.session.scalar(
+            select(MaintenanceCase).where(
+                MaintenanceCase.organization_id == organization_id,
+                MaintenanceCase.id == case_id,
+            )
+        )
+
+    def list_maintenance_cases(self, organization_id: str, *, status: str | None = None) -> list[MaintenanceCase]:
+        statement = select(MaintenanceCase).where(MaintenanceCase.organization_id == organization_id)
+        if status:
+            statement = statement.where(MaintenanceCase.status == status)
+        return list(self.session.scalars(statement.order_by(MaintenanceCase.created_at.desc(), MaintenanceCase.id)))
+
+    def update_maintenance_case(self, case: MaintenanceCase, **values) -> MaintenanceCase:
+        for key, value in values.items():
+            setattr(case, key, value)
+        self.session.flush()
+        return case
+
+    def create_maintenance_acknowledgement(
+        self,
+        organization_id: str,
+        *,
+        case_id: str,
+        acknowledged_by_user_id: str,
+        decision: str,
+        comment: str | None,
+    ) -> MaintenanceAcknowledgement:
+        case = self.get_maintenance_case(organization_id, case_id)
+        if case is None:
+            raise TenantBoundaryError("maintenance acknowledgement case must belong to the same organization")
+        acknowledgement = MaintenanceAcknowledgement(
+            organization_id=organization_id,
+            case_id=case_id,
+            acknowledged_by_user_id=acknowledged_by_user_id,
+            decision=decision,
+            comment=comment,
+        )
+        self.session.add(acknowledgement)
+        self.session.flush()
+        return acknowledgement
+
+    def create_maintenance_inspection(
+        self,
+        organization_id: str,
+        *,
+        case_id: str,
+        asset_id: str | None,
+        component_id: str | None,
+        sensor_id: str | None,
+        requested_reason: str,
+        requested_by_user_id: str,
+        assigned_to_user_id: str | None,
+        evidence_metadata: dict | None,
+    ) -> MaintenanceInspection:
+        case = self.get_maintenance_case(organization_id, case_id)
+        if case is None:
+            raise TenantBoundaryError("maintenance inspection case must belong to the same organization")
+        if asset_id and self.get_asset_by_id(organization_id, asset_id) is None:
+            raise TenantBoundaryError("maintenance inspection asset must belong to the same organization")
+        if component_id and self.get_component_by_id(organization_id, component_id) is None:
+            raise TenantBoundaryError("maintenance inspection component must belong to the same organization")
+        if sensor_id and self.get_sensor_by_id(organization_id, sensor_id) is None:
+            raise TenantBoundaryError("maintenance inspection sensor must belong to the same organization")
+        inspection = MaintenanceInspection(
+            organization_id=organization_id,
+            case_id=case_id,
+            asset_id=asset_id,
+            component_id=component_id,
+            sensor_id=sensor_id,
+            status="requested",
+            requested_reason=requested_reason,
+            requested_by_user_id=requested_by_user_id,
+            assigned_to_user_id=assigned_to_user_id,
+            evidence_metadata=evidence_metadata,
+        )
+        self.session.add(inspection)
+        self.session.flush()
+        return inspection
+
+    def get_maintenance_inspection(self, organization_id: str, inspection_id: str) -> MaintenanceInspection | None:
+        return self.session.scalar(
+            select(MaintenanceInspection).where(
+                MaintenanceInspection.organization_id == organization_id,
+                MaintenanceInspection.id == inspection_id,
+            )
+        )
+
+    def list_maintenance_inspections(self, organization_id: str, *, case_id: str) -> list[MaintenanceInspection]:
+        statement = select(MaintenanceInspection).where(
+            MaintenanceInspection.organization_id == organization_id,
+            MaintenanceInspection.case_id == case_id,
+        )
+        return list(
+            self.session.scalars(statement.order_by(MaintenanceInspection.created_at, MaintenanceInspection.id))
+        )
+
+    def update_maintenance_inspection(
+        self,
+        inspection: MaintenanceInspection,
+        **values,
+    ) -> MaintenanceInspection:
+        for key, value in values.items():
+            setattr(inspection, key, value)
+        self.session.flush()
+        return inspection
+
+    def create_maintenance_note(
+        self,
+        organization_id: str,
+        *,
+        case_id: str,
+        author_user_id: str,
+        body: str,
+        note_kind: str,
+        metadata_json: dict | None,
+    ) -> MaintenanceNote:
+        if self.get_maintenance_case(organization_id, case_id) is None:
+            raise TenantBoundaryError("maintenance note case must belong to the same organization")
+        note = MaintenanceNote(
+            organization_id=organization_id,
+            case_id=case_id,
+            author_user_id=author_user_id,
+            body=body,
+            note_kind=note_kind,
+            metadata_json=metadata_json,
+        )
+        self.session.add(note)
+        self.session.flush()
+        return note
+
+    def list_maintenance_notes(self, organization_id: str, *, case_id: str) -> list[MaintenanceNote]:
+        statement = select(MaintenanceNote).where(
+            MaintenanceNote.organization_id == organization_id,
+            MaintenanceNote.case_id == case_id,
+        )
+        return list(self.session.scalars(statement.order_by(MaintenanceNote.created_at, MaintenanceNote.id)))
+
+    def create_maintenance_work_order(
+        self,
+        organization_id: str,
+        *,
+        case_id: str,
+        title: str,
+        description: str | None,
+        priority: str,
+        requested_work: str,
+        requested_by_user_id: str,
+        assignee_user_id: str | None,
+        planned_start_at,
+        evidence: dict | None,
+    ) -> MaintenanceWorkOrder:
+        case = self.get_maintenance_case(organization_id, case_id)
+        if case is None:
+            raise TenantBoundaryError("maintenance work order case must belong to the same organization")
+        work_order = MaintenanceWorkOrder(
+            organization_id=organization_id,
+            case_id=case_id,
+            asset_id=case.asset_id,
+            component_id=case.component_id,
+            work_order_number=self.next_work_order_number(organization_id),
+            status="draft",
+            title=title,
+            description=description,
+            priority=priority,
+            requested_work=requested_work,
+            summary=title,
+            requested_by_user_id=requested_by_user_id,
+            assignee_user_id=assignee_user_id,
+            planned_start_at=planned_start_at,
+            evidence=evidence,
+        )
+        self.session.add(work_order)
+        self.session.flush()
+        return work_order
+
+    def get_maintenance_work_order(self, organization_id: str, work_order_id: str) -> MaintenanceWorkOrder | None:
+        return self.session.scalar(
+            select(MaintenanceWorkOrder).where(
+                MaintenanceWorkOrder.organization_id == organization_id,
+                MaintenanceWorkOrder.id == work_order_id,
+            )
+        )
+
+    def list_maintenance_work_orders(
+        self,
+        organization_id: str,
+        *,
+        case_id: str | None = None,
+    ) -> list[MaintenanceWorkOrder]:
+        statement = select(MaintenanceWorkOrder).where(MaintenanceWorkOrder.organization_id == organization_id)
+        if case_id:
+            statement = statement.where(MaintenanceWorkOrder.case_id == case_id)
+        return list(self.session.scalars(statement.order_by(MaintenanceWorkOrder.created_at, MaintenanceWorkOrder.id)))
+
+    def update_maintenance_work_order(self, work_order: MaintenanceWorkOrder, **values) -> MaintenanceWorkOrder:
+        for key, value in values.items():
+            setattr(work_order, key, value)
+        self.session.flush()
+        return work_order
+
+    def resolve_maintenance_case(
+        self,
+        organization_id: str,
+        *,
+        case_id: str,
+        resolved_by_user_id: str,
+        outcome: str,
+        summary: str,
+        evidence: dict | None,
+    ) -> MaintenanceResolution:
+        case = self.get_maintenance_case(organization_id, case_id)
+        if case is None:
+            raise TenantBoundaryError("maintenance resolution case must belong to the same organization")
+        resolution = MaintenanceResolution(
+            organization_id=organization_id,
+            case_id=case_id,
+            resolved_by_user_id=resolved_by_user_id,
+            outcome=outcome,
+            summary=summary,
+            evidence=evidence,
+        )
+        self.session.add(resolution)
+        case.status = "resolved"
+        self.session.flush()
+        return resolution
+
+    def create_cmms_sync_record(
+        self,
+        organization_id: str,
+        *,
+        work_order_id: str,
+        provider_name: str,
+        operation: str,
+        idempotency_key: str,
+        status: str,
+        external_id: str | None,
+        error_category: str | None,
+        error_message: str | None,
+        completed_at,
+        attempt_metadata: dict | None,
+    ) -> CmmsSyncRecord:
+        if self.get_maintenance_work_order(organization_id, work_order_id) is None:
+            raise TenantBoundaryError("CMMS sync work order must belong to the same organization")
+        sync = CmmsSyncRecord(
+            organization_id=organization_id,
+            work_order_id=work_order_id,
+            provider_name=provider_name,
+            operation=operation,
+            idempotency_key=idempotency_key,
+            status=status,
+            external_id=external_id,
+            error_category=error_category,
+            error_message=error_message,
+            completed_at=completed_at,
+            attempt_metadata=attempt_metadata,
+        )
+        self.session.add(sync)
+        self.session.flush()
+        return sync
+
+    def get_successful_cmms_sync_record(
+        self,
+        organization_id: str,
+        *,
+        work_order_id: str,
+        operation: str,
+        idempotency_key: str,
+    ) -> CmmsSyncRecord | None:
+        return self.session.scalar(
+            select(CmmsSyncRecord).where(
+                CmmsSyncRecord.organization_id == organization_id,
+                CmmsSyncRecord.work_order_id == work_order_id,
+                CmmsSyncRecord.operation == operation,
+                CmmsSyncRecord.idempotency_key == idempotency_key,
+                CmmsSyncRecord.status == "succeeded",
+            )
+        )
+
+    def list_cmms_sync_records(self, organization_id: str, *, work_order_id: str | None = None) -> list[CmmsSyncRecord]:
+        statement = select(CmmsSyncRecord).where(CmmsSyncRecord.organization_id == organization_id)
+        if work_order_id:
+            statement = statement.where(CmmsSyncRecord.work_order_id == work_order_id)
+        return list(self.session.scalars(statement.order_by(CmmsSyncRecord.created_at, CmmsSyncRecord.id)))
 
     def ingestion_health(self, organization_id: str) -> dict:
         source_rows = self.session.execute(
