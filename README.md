@@ -166,6 +166,32 @@ POST /api/ml/{organization_id}/model-versions/{model_version_id}/promote
 POST /api/ml/{organization_id}/registries/{registry_id}/rollback
 ```
 
+## Production serving
+
+Production Slice 10 turns approved registry models into live inference contracts.
+Serving bindings attach approved production model versions to organization, site,
+asset, component, or sensor scopes. Prediction requests resolve the most specific
+active binding for a sensor, verify the model artifact SHA-256 before loading,
+construct feature vectors from canonical analytics records, enforce schema and
+training-domain compatibility, and persist both the model-resolution decision and
+prediction evidence.
+
+Supported RUL predictions are returned only when the platform can prove the
+approved model version, dataset snapshot, feature values, artifact checksum, and
+abstention policy that produced the result. Otherwise the API persists and
+returns `unsupported` or `insufficient_evidence` with the known evidence. Drift
+and data-quality monitors create retraining triggers, but replacement production
+models still require the Slice 9 human approval flow.
+
+Useful production-serving endpoints:
+
+```text
+POST /api/serving/{organization_id}/bindings
+POST /api/serving/{organization_id}/predict/rul
+GET  /api/serving/{organization_id}/predictions
+GET  /api/serving/{organization_id}/health
+```
+
 ## Rebuild the current Test 2 model
 
 The existing downloader is intentionally Test-2-only:

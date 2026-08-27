@@ -202,6 +202,7 @@ class MLPlatformService:
                 "dataset_version_id": dataset.id,
                 "dataset_fingerprint": dataset.fingerprint,
                 "feature_names": dataset.feature_names,
+                "model_domain": _model_domain_contract(dataset),
                 "code_version": experiment.code_version,
                 "experiment_run_id": experiment.id,
                 "created_at": datetime.now(UTC).isoformat(),
@@ -311,7 +312,7 @@ def _dataset_rows_from_features(
     validation_group_key: str,
 ) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, str], dict[str, Any]] = defaultdict(
-        lambda: {"features": {}, "source_feature_ids": [], "source_feature_provenance": []}
+        lambda: {"features": {}, "feature_units": {}, "source_feature_ids": [], "source_feature_provenance": []}
     )
     for feature in features:
         key = (feature.sensor_id, feature.observed_at.isoformat())
@@ -319,6 +320,7 @@ def _dataset_rows_from_features(
         row["sensor_id"] = feature.sensor_id
         row["observed_at"] = feature.observed_at.isoformat()
         row["features"][feature.feature_name] = feature.value
+        row["feature_units"][feature.feature_name] = feature.unit
         row["source_feature_ids"].append(feature.id)
         row["source_feature_provenance"].append(feature.provenance or {})
         provenance = feature.provenance or {}
@@ -337,6 +339,7 @@ def _dataset_rows_from_features(
             continue
         row.setdefault("validation_group", row["sensor_id"])
         row["features"] = {name: float(row["features"][name]) for name in feature_names}
+        row["feature_units"] = {name: row["feature_units"].get(name) for name in feature_names}
         row["source_feature_ids"] = sorted(row["source_feature_ids"])
         row.pop("source_feature_provenance", None)
         rows.append(row)
@@ -373,6 +376,48 @@ def _dataset_rows(dataset: MLDatasetVersion) -> list[dict[str, Any]]:
     if not rows:
         raise MLPlatformError("dataset version has no materialized row snapshot")
     return rows
+
+
+def _model_domain_contract(dataset: MLDatasetVersion) -> dict[str, Any]:
+    rows = _dataset_rows(dataset)
+    feature_stats = {}
+    feature_units = {}
+    for feature_name in dataset.feature_names:
+        values = [float(row["features"][feature_name]) for row in rows if feature_name in row.get("features", {})]
+        unit_values = []
+        for row in rows:
+            row_units = row.get("feature_units") or {}
+            if feature_name in row_units:
+                unit_values.append(row_units[feature_name])
+        non_null_units = sorted({unit for unit in unit_values if unit is not None})
+        if unit_values and all(unit is None for unit in unit_values):
+            feature_units[feature_name] = None
+        elif len(non_null_units) == 1 and all(unit is not None for unit in unit_values):
+            feature_units[feature_name] = non_null_units[0]
+        else:
+            feature_units[feature_name] = [None, *non_null_units]
+        feature_stats[feature_name] = {
+            "min": min(values),
+            "max": max(values),
+            "mean": float(np.mean(values)),
+            "std": float(np.std(values)),
+            "p05": float(np.percentile(values, 5)),
+            "p95": float(np.percentile(values, 95)),
+            "missing_count": dataset.row_count - len(values),
+            "training_rows": len(values),
+        }
+    return {
+        "schema_version": "model-domain-v1",
+        "ordered_feature_names": list(dataset.feature_names),
+        "feature_units": feature_units,
+        "analytics_algorithm_version": dataset.source_algorithm_version,
+        "preprocessing_version": dataset.source_algorithm_version,
+        "numeric_type": "float64",
+        "row_count": dataset.row_count,
+        "validation_group_count": dataset.validation_group_count,
+        "feature_stats": feature_stats,
+        "dataset_fingerprint": dataset.fingerprint,
+    }
 
 
 def _validate_supported_experiment_contract(request: ExperimentCreate) -> None:
@@ -465,12 +510,30 @@ def _matrix(rows: list[dict[str, Any]], feature_names: list[str]) -> tuple[np.nd
 
 
 def _abstention_policy(policy: dict[str, Any]) -> dict[str, Any]:
+    supported_fields = {
+        "contract",
+        "min_validation_groups",
+        "require_registered_dataset_version",
+        "require_model_stage_for_serving",
+        "live_serving_enforcement",
+        "max_feature_age_minutes",
+        "require_feature_quality",
+        "training_domain_behavior",
+        "allow_historical_predictions",
+    }
+    unknown = sorted(set(policy).difference(supported_fields))
+    if unknown:
+        raise MLPlatformError(f"unsupported abstention policy fields: {', '.join(unknown)}")
     merged = {
         "contract": "abstain when validation evidence is outside the model version domain",
         "min_validation_groups": 2,
         "require_registered_dataset_version": True,
         "require_model_stage_for_serving": "production",
-        "live_serving_enforcement": "out_of_scope_until_slice_10",
+        "live_serving_enforcement": "production-slice-10",
+        "max_feature_age_minutes": 1440,
+        "require_feature_quality": "good",
+        "training_domain_behavior": "abstain",
+        "allow_historical_predictions": True,
     }
     merged.update(policy)
     return merged

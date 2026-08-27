@@ -33,8 +33,13 @@ from platform_core.models import (
     MLModelPromotionEvent,
     MLModelRegistry,
     MLModelVersion,
+    ModelServingBinding,
+    ModelServingMonitor,
     Organization,
     OrganizationMembership,
+    PredictionRecord,
+    ProductionModelResolution,
+    RetrainingTrigger,
     Sensor,
     Site,
     User,
@@ -83,6 +88,11 @@ class PlatformRepository:
             "ml_model_registries": self.count(MLModelRegistry),
             "ml_model_versions": self.count(MLModelVersion),
             "ml_model_promotion_events": self.count(MLModelPromotionEvent),
+            "model_serving_bindings": self.count(ModelServingBinding),
+            "production_model_resolutions": self.count(ProductionModelResolution),
+            "prediction_records": self.count(PredictionRecord),
+            "model_serving_monitors": self.count(ModelServingMonitor),
+            "retraining_triggers": self.count(RetrainingTrigger),
         }
 
     def get_organization_by_slug(self, slug: str) -> Organization | None:
@@ -110,6 +120,17 @@ class PlatformRepository:
                 Component.slug == slug,
             )
         )
+
+    def get_component_by_id(self, organization_id: str, component_id: str) -> Component | None:
+        return self.session.scalar(
+            select(Component).where(Component.organization_id == organization_id, Component.id == component_id)
+        )
+
+    def get_asset_by_id(self, organization_id: str, asset_id: str) -> Asset | None:
+        return self.session.scalar(select(Asset).where(Asset.organization_id == organization_id, Asset.id == asset_id))
+
+    def get_site_by_id(self, organization_id: str, site_id: str) -> Site | None:
+        return self.session.scalar(select(Site).where(Site.organization_id == organization_id, Site.id == site_id))
 
     def get_sensor_by_slug(self, organization_id: str, component_id: str, slug: str) -> Sensor | None:
         return self.session.scalar(
@@ -917,6 +938,14 @@ class PlatformRepository:
         )
         return list(self.session.scalars(statement))
 
+    def get_ml_model_registry_by_name(self, organization_id: str, name: str) -> MLModelRegistry | None:
+        return self.session.scalar(
+            select(MLModelRegistry).where(
+                MLModelRegistry.organization_id == organization_id,
+                MLModelRegistry.name == name,
+            )
+        )
+
     def create_ml_model_version(
         self,
         organization_id: str,
@@ -1027,6 +1056,337 @@ class PlatformRepository:
         self.session.add(event)
         self.session.flush()
         return event
+
+    def create_model_serving_binding(
+        self,
+        organization_id: str,
+        *,
+        registry_id: str,
+        model_version_id: str,
+        scope_type: str,
+        scope_id: str | None,
+        approved_by_user_id: str,
+        reason: str | None,
+        provenance: dict | None,
+    ) -> ModelServingBinding:
+        if self.get_ml_model_registry(organization_id, registry_id) is None:
+            raise TenantBoundaryError("serving binding registry must belong to the same organization")
+        model_version = self.get_ml_model_version(organization_id, model_version_id)
+        if model_version is None or model_version.registry_id != registry_id:
+            raise TenantBoundaryError("serving binding model version must belong to the same registry")
+        user = self.session.get(User, approved_by_user_id)
+        if user is None:
+            raise TenantBoundaryError("serving binding approval user does not exist")
+        membership = self.session.scalar(
+            select(OrganizationMembership).where(
+                OrganizationMembership.organization_id == organization_id,
+                OrganizationMembership.user_id == approved_by_user_id,
+                OrganizationMembership.lifecycle_state == "active",
+            )
+        )
+        if membership is None:
+            raise TenantBoundaryError("serving binding approval user must belong to this organization")
+
+        self._assert_serving_scope(organization_id, scope_type, scope_id)
+        for existing in self.list_model_serving_bindings(
+            organization_id,
+            status="active",
+            registry_id=registry_id,
+            scope_type=scope_type,
+            scope_id=scope_id,
+        ):
+            existing.status = "disabled"
+        binding = ModelServingBinding(
+            organization_id=organization_id,
+            registry_id=registry_id,
+            model_version_id=model_version_id,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            status="active",
+            approved_by_user_id=approved_by_user_id,
+            reason=reason,
+            provenance=provenance,
+        )
+        self.session.add(binding)
+        self.session.flush()
+        return binding
+
+    def _assert_serving_scope(self, organization_id: str, scope_type: str, scope_id: str | None) -> None:
+        if scope_type == "organization":
+            if scope_id is not None:
+                raise TenantBoundaryError("organization serving scope must not provide scope_id")
+            if self.session.get(Organization, organization_id) is None:
+                raise TenantBoundaryError("serving binding organization does not exist")
+            return
+        if scope_id is None:
+            raise TenantBoundaryError("serving binding scope_id is required")
+        checks = {
+            "site": self.get_site_by_id,
+            "asset": self.get_asset_by_id,
+            "component": self.get_component_by_id,
+            "sensor": self.get_sensor_by_id,
+        }
+        if scope_type not in checks or checks[scope_type](organization_id, scope_id) is None:
+            raise TenantBoundaryError("serving binding scope must belong to the same organization")
+
+    def list_model_serving_bindings(
+        self,
+        organization_id: str,
+        *,
+        status: str | None = None,
+        registry_id: str | None = None,
+        scope_type: str | None = None,
+        scope_id: str | None = None,
+    ) -> list[ModelServingBinding]:
+        statement = select(ModelServingBinding).where(ModelServingBinding.organization_id == organization_id)
+        if status:
+            statement = statement.where(ModelServingBinding.status == status)
+        if registry_id:
+            statement = statement.where(ModelServingBinding.registry_id == registry_id)
+        if scope_type:
+            statement = statement.where(ModelServingBinding.scope_type == scope_type)
+        if scope_id is not None:
+            statement = statement.where(ModelServingBinding.scope_id == scope_id)
+        return list(
+            self.session.scalars(statement.order_by(ModelServingBinding.created_at.desc(), ModelServingBinding.id))
+        )
+
+    def list_active_model_serving_bindings_for_sensor(
+        self,
+        organization_id: str,
+        *,
+        registry_id: str | None,
+        sensor_id: str,
+        component_id: str,
+        asset_id: str,
+        site_id: str,
+    ) -> list[ModelServingBinding]:
+        scope_filters = [
+            (ModelServingBinding.scope_type == "organization") & (ModelServingBinding.scope_id.is_(None)),
+            (ModelServingBinding.scope_type == "site") & (ModelServingBinding.scope_id == site_id),
+            (ModelServingBinding.scope_type == "asset") & (ModelServingBinding.scope_id == asset_id),
+            (ModelServingBinding.scope_type == "component") & (ModelServingBinding.scope_id == component_id),
+            (ModelServingBinding.scope_type == "sensor") & (ModelServingBinding.scope_id == sensor_id),
+        ]
+        statement = select(ModelServingBinding).where(
+            ModelServingBinding.organization_id == organization_id,
+            ModelServingBinding.status == "active",
+            scope_filters[0] | scope_filters[1] | scope_filters[2] | scope_filters[3] | scope_filters[4],
+        )
+        if registry_id:
+            statement = statement.where(ModelServingBinding.registry_id == registry_id)
+        return list(
+            self.session.scalars(statement.order_by(ModelServingBinding.created_at.desc(), ModelServingBinding.id))
+        )
+
+    def list_latest_analytics_features_for_sensor(
+        self,
+        organization_id: str,
+        *,
+        sensor_id: str,
+        algorithm_version: str,
+        feature_names: list[str],
+        observed_at,
+    ) -> dict[str, AnalyticsFeatureRecord]:
+        statement = (
+            select(AnalyticsFeatureRecord)
+            .where(
+                AnalyticsFeatureRecord.organization_id == organization_id,
+                AnalyticsFeatureRecord.sensor_id == sensor_id,
+                AnalyticsFeatureRecord.algorithm_version == algorithm_version,
+                AnalyticsFeatureRecord.feature_name.in_(feature_names),
+                AnalyticsFeatureRecord.observed_at <= observed_at,
+            )
+            .order_by(
+                AnalyticsFeatureRecord.feature_name,
+                AnalyticsFeatureRecord.observed_at.desc(),
+                AnalyticsFeatureRecord.id.desc(),
+            )
+        )
+        latest: dict[str, AnalyticsFeatureRecord] = {}
+        for row in self.session.scalars(statement):
+            latest.setdefault(row.feature_name, row)
+        return latest
+
+    def latest_feature_observed_at(
+        self,
+        organization_id: str,
+        *,
+        sensor_id: str,
+        algorithm_version: str,
+    ):
+        return self.session.scalar(
+            select(func.max(AnalyticsFeatureRecord.observed_at)).where(
+                AnalyticsFeatureRecord.organization_id == organization_id,
+                AnalyticsFeatureRecord.sensor_id == sensor_id,
+                AnalyticsFeatureRecord.algorithm_version == algorithm_version,
+            )
+        )
+
+    def create_production_model_resolution(
+        self,
+        organization_id: str,
+        *,
+        binding_id: str | None,
+        registry_id: str | None,
+        model_version_id: str | None,
+        dataset_version_id: str | None,
+        sensor_id: str,
+        status: str,
+        reason_code: str,
+        reason: str,
+        artifact_sha256: str | None,
+        feature_schema: list[str] | None,
+        abstention_policy: dict | None,
+        evidence: dict | None,
+    ) -> ProductionModelResolution:
+        if self.get_sensor_by_id(organization_id, sensor_id) is None:
+            raise TenantBoundaryError("production resolution sensor must belong to the same organization")
+        resolution = ProductionModelResolution(
+            organization_id=organization_id,
+            binding_id=binding_id,
+            registry_id=registry_id,
+            model_version_id=model_version_id,
+            dataset_version_id=dataset_version_id,
+            sensor_id=sensor_id,
+            status=status,
+            reason_code=reason_code,
+            reason=reason,
+            artifact_sha256=artifact_sha256,
+            feature_schema=feature_schema,
+            abstention_policy=abstention_policy,
+            evidence=evidence,
+        )
+        self.session.add(resolution)
+        self.session.flush()
+        return resolution
+
+    def create_prediction_record(
+        self,
+        organization_id: str,
+        *,
+        model_resolution_id: str,
+        registry_id: str | None,
+        model_version_id: str | None,
+        dataset_version_id: str | None,
+        sensor_id: str,
+        observed_at,
+        prediction_status: str,
+        predicted_rul_hours: float | None,
+        abstention_code: str | None,
+        uncertainty: dict | None,
+        feature_vector: dict | None,
+        feature_record_ids: list[str] | None,
+        abstention_reason: str | None,
+        provenance: dict | None,
+    ) -> PredictionRecord:
+        prediction = PredictionRecord(
+            organization_id=organization_id,
+            model_resolution_id=model_resolution_id,
+            registry_id=registry_id,
+            model_version_id=model_version_id,
+            dataset_version_id=dataset_version_id,
+            sensor_id=sensor_id,
+            observed_at=observed_at,
+            prediction_status=prediction_status,
+            predicted_rul_hours=predicted_rul_hours,
+            abstention_code=abstention_code,
+            uncertainty=uncertainty,
+            feature_vector=feature_vector,
+            feature_record_ids=feature_record_ids,
+            abstention_reason=abstention_reason,
+            provenance=provenance,
+        )
+        self.session.add(prediction)
+        self.session.flush()
+        return prediction
+
+    def list_prediction_records(self, organization_id: str, *, sensor_id: str | None = None) -> list[PredictionRecord]:
+        statement = select(PredictionRecord).where(PredictionRecord.organization_id == organization_id)
+        if sensor_id:
+            statement = statement.where(PredictionRecord.sensor_id == sensor_id)
+        return list(self.session.scalars(statement.order_by(PredictionRecord.created_at.desc(), PredictionRecord.id)))
+
+    def create_model_serving_monitor(
+        self,
+        organization_id: str,
+        *,
+        model_version_id: str | None,
+        sensor_id: str,
+        observed_at,
+        metric_name: str,
+        status: str,
+        drift_score: float | None,
+        threshold: float | None,
+        evidence: dict | None,
+    ) -> ModelServingMonitor:
+        monitor = ModelServingMonitor(
+            organization_id=organization_id,
+            model_version_id=model_version_id,
+            sensor_id=sensor_id,
+            observed_at=observed_at,
+            metric_name=metric_name,
+            status=status,
+            drift_score=drift_score,
+            threshold=threshold,
+            evidence=evidence,
+        )
+        self.session.add(monitor)
+        self.session.flush()
+        return monitor
+
+    def create_retraining_trigger(
+        self,
+        organization_id: str,
+        *,
+        model_version_id: str | None,
+        sensor_id: str | None,
+        trigger_kind: str,
+        reason: str,
+        evidence: dict | None,
+    ) -> RetrainingTrigger:
+        existing = self.session.scalar(
+            select(RetrainingTrigger).where(
+                RetrainingTrigger.organization_id == organization_id,
+                RetrainingTrigger.model_version_id == model_version_id,
+                RetrainingTrigger.sensor_id == sensor_id,
+                RetrainingTrigger.trigger_kind == trigger_kind,
+                RetrainingTrigger.status == "open",
+            )
+        )
+        if existing:
+            existing.reason = reason
+            existing.evidence = evidence
+            self.session.flush()
+            return existing
+        trigger = RetrainingTrigger(
+            organization_id=organization_id,
+            model_version_id=model_version_id,
+            sensor_id=sensor_id,
+            trigger_kind=trigger_kind,
+            reason=reason,
+            status="open",
+            evidence=evidence,
+        )
+        self.session.add(trigger)
+        self.session.flush()
+        return trigger
+
+    def list_model_serving_monitors(self, organization_id: str) -> list[ModelServingMonitor]:
+        statement = (
+            select(ModelServingMonitor)
+            .where(ModelServingMonitor.organization_id == organization_id)
+            .order_by(ModelServingMonitor.created_at.desc(), ModelServingMonitor.id)
+        )
+        return list(self.session.scalars(statement))
+
+    def list_retraining_triggers(self, organization_id: str) -> list[RetrainingTrigger]:
+        statement = (
+            select(RetrainingTrigger)
+            .where(RetrainingTrigger.organization_id == organization_id)
+            .order_by(RetrainingTrigger.created_at.desc(), RetrainingTrigger.id)
+        )
+        return list(self.session.scalars(statement))
 
     def ingestion_health(self, organization_id: str) -> dict:
         source_rows = self.session.execute(
