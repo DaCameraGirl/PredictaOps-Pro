@@ -17,6 +17,10 @@ from platform_core.contracts import (
     UserCreate,
 )
 from platform_core.models import (
+    AnalyticsFailure,
+    AnalyticsFeatureRecord,
+    AnalyticsHealthState,
+    AnalyticsRun,
     Asset,
     Component,
     IngestedRecord,
@@ -65,6 +69,10 @@ class PlatformRepository:
             "ingestion_batches": self.count(IngestionBatch),
             "ingestion_failures": self.count(IngestionFailure),
             "waveform_records": self.count(WaveformRecord),
+            "analytics_runs": self.count(AnalyticsRun),
+            "analytics_feature_records": self.count(AnalyticsFeatureRecord),
+            "analytics_health_states": self.count(AnalyticsHealthState),
+            "analytics_failures": self.count(AnalyticsFailure),
         }
 
     def get_organization_by_slug(self, slug: str) -> Organization | None:
@@ -465,6 +473,14 @@ class PlatformRepository:
         )
         return list(self.session.scalars(statement))
 
+    def get_ingestion_batch(self, organization_id: str, batch_id: str) -> IngestionBatch | None:
+        return self.session.scalar(
+            select(IngestionBatch).where(
+                IngestionBatch.organization_id == organization_id,
+                IngestionBatch.id == batch_id,
+            )
+        )
+
     def get_machine_reading(self, organization_id: str, reading_id: str) -> MachineReading | None:
         return self.session.scalar(
             select(MachineReading).where(
@@ -480,6 +496,245 @@ class PlatformRepository:
                 WaveformRecord.id == waveform_id,
             )
         )
+
+    def list_machine_readings_for_sensor(self, organization_id: str, sensor_id: str) -> list[MachineReading]:
+        statement = (
+            select(MachineReading)
+            .where(MachineReading.organization_id == organization_id, MachineReading.sensor_id == sensor_id)
+            .order_by(MachineReading.observed_at, MachineReading.id)
+        )
+        return list(self.session.scalars(statement))
+
+    def list_waveform_records_for_sensor(self, organization_id: str, sensor_id: str) -> list[WaveformRecord]:
+        statement = (
+            select(WaveformRecord)
+            .where(WaveformRecord.organization_id == organization_id, WaveformRecord.sensor_id == sensor_id)
+            .order_by(WaveformRecord.observed_at, WaveformRecord.id)
+        )
+        return list(self.session.scalars(statement))
+
+    def create_analytics_run(
+        self,
+        organization_id: str,
+        *,
+        run_kind: str,
+        algorithm_version: str,
+        input_batch_id: str | None = None,
+        sensor_id: str | None = None,
+        provenance: dict | None = None,
+    ) -> AnalyticsRun:
+        if self.session.get(Organization, organization_id) is None:
+            raise TenantBoundaryError("analytics run organization does not exist")
+        if input_batch_id is not None:
+            batch = self.get_ingestion_batch(organization_id, input_batch_id)
+            if batch is None:
+                raise TenantBoundaryError("analytics batch must belong to the same organization")
+        if sensor_id is not None and self.get_sensor_by_id(organization_id, sensor_id) is None:
+            raise TenantBoundaryError("analytics sensor must belong to the same organization")
+        run = AnalyticsRun(
+            organization_id=organization_id,
+            input_batch_id=input_batch_id,
+            sensor_id=sensor_id,
+            run_kind=run_kind,
+            status="running",
+            algorithm_version=algorithm_version,
+            provenance=provenance,
+        )
+        self.session.add(run)
+        self.session.flush()
+        return run
+
+    def get_analytics_feature(
+        self,
+        organization_id: str,
+        *,
+        algorithm_version: str,
+        source_kind: str,
+        source_record_id: str,
+        feature_name: str,
+    ) -> AnalyticsFeatureRecord | None:
+        return self.session.scalar(
+            select(AnalyticsFeatureRecord).where(
+                AnalyticsFeatureRecord.organization_id == organization_id,
+                AnalyticsFeatureRecord.algorithm_version == algorithm_version,
+                AnalyticsFeatureRecord.source_kind == source_kind,
+                AnalyticsFeatureRecord.source_record_id == source_record_id,
+                AnalyticsFeatureRecord.feature_name == feature_name,
+            )
+        )
+
+    def create_analytics_feature(
+        self,
+        organization_id: str,
+        *,
+        run_id: str,
+        sensor_id: str,
+        batch_id: str | None,
+        source_kind: str,
+        source_record_id: str,
+        observed_at,
+        feature_name: str,
+        value: float,
+        unit: str | None,
+        quality: str,
+        algorithm_version: str,
+        provenance: dict | None,
+    ) -> AnalyticsFeatureRecord:
+        run = self.session.scalar(
+            select(AnalyticsRun).where(AnalyticsRun.organization_id == organization_id, AnalyticsRun.id == run_id)
+        )
+        if run is None:
+            raise TenantBoundaryError("analytics feature run must exist")
+        sensor = self.get_sensor_by_id(organization_id, sensor_id)
+        if sensor is None:
+            raise TenantBoundaryError("analytics feature sensor must belong to the same organization")
+        feature = AnalyticsFeatureRecord(
+            organization_id=organization_id,
+            run_id=run_id,
+            sensor_id=sensor_id,
+            batch_id=batch_id,
+            source_kind=source_kind,
+            source_record_id=source_record_id,
+            observed_at=observed_at,
+            feature_name=feature_name,
+            value=value,
+            unit=unit,
+            quality=quality,
+            algorithm_version=algorithm_version,
+            provenance=provenance,
+        )
+        self.session.add(feature)
+        self.session.flush()
+        return feature
+
+    def list_analytics_features_for_sensor(
+        self,
+        organization_id: str,
+        sensor_id: str,
+        *,
+        algorithm_version: str,
+        feature_name: str | None = None,
+    ) -> list[AnalyticsFeatureRecord]:
+        statement = select(AnalyticsFeatureRecord).where(
+            AnalyticsFeatureRecord.organization_id == organization_id,
+            AnalyticsFeatureRecord.sensor_id == sensor_id,
+            AnalyticsFeatureRecord.algorithm_version == algorithm_version,
+        )
+        if feature_name:
+            statement = statement.where(AnalyticsFeatureRecord.feature_name == feature_name)
+        return list(
+            self.session.scalars(statement.order_by(AnalyticsFeatureRecord.observed_at, AnalyticsFeatureRecord.id))
+        )
+
+    def create_analytics_health_state(
+        self,
+        organization_id: str,
+        *,
+        run_id: str,
+        sensor_id: str,
+        observed_at,
+        health_state: str,
+        anomaly_score: float | None,
+        trend_slope: float | None,
+        confidence: float | None,
+        algorithm_version: str,
+        evidence: dict | None,
+    ) -> AnalyticsHealthState:
+        run = self.session.scalar(
+            select(AnalyticsRun).where(AnalyticsRun.organization_id == organization_id, AnalyticsRun.id == run_id)
+        )
+        if run is None:
+            raise TenantBoundaryError("analytics health-state run must exist")
+        if self.get_sensor_by_id(organization_id, sensor_id) is None:
+            raise TenantBoundaryError("analytics health-state sensor must belong to the same organization")
+        existing = self.session.scalar(
+            select(AnalyticsHealthState).where(
+                AnalyticsHealthState.organization_id == organization_id,
+                AnalyticsHealthState.algorithm_version == algorithm_version,
+                AnalyticsHealthState.sensor_id == sensor_id,
+                AnalyticsHealthState.observed_at == observed_at,
+            )
+        )
+        if existing:
+            existing.run_id = run_id
+            existing.health_state = health_state
+            existing.anomaly_score = anomaly_score
+            existing.trend_slope = trend_slope
+            existing.confidence = confidence
+            existing.evidence = evidence
+            self.session.flush()
+            return existing
+        health_state_row = AnalyticsHealthState(
+            organization_id=organization_id,
+            run_id=run_id,
+            sensor_id=sensor_id,
+            observed_at=observed_at,
+            health_state=health_state,
+            anomaly_score=anomaly_score,
+            trend_slope=trend_slope,
+            confidence=confidence,
+            algorithm_version=algorithm_version,
+            evidence=evidence,
+        )
+        self.session.add(health_state_row)
+        self.session.flush()
+        return health_state_row
+
+    def create_analytics_failure(
+        self,
+        organization_id: str,
+        *,
+        run_id: str,
+        sensor_id: str | None,
+        batch_id: str | None,
+        source_kind: str,
+        source_record_id: str | None,
+        reason: str,
+        detail: dict | None,
+    ) -> AnalyticsFailure:
+        run = self.session.scalar(
+            select(AnalyticsRun).where(AnalyticsRun.organization_id == organization_id, AnalyticsRun.id == run_id)
+        )
+        if run is None:
+            raise TenantBoundaryError("analytics failure run must exist")
+        if sensor_id is not None and self.get_sensor_by_id(organization_id, sensor_id) is None:
+            raise TenantBoundaryError("analytics failure sensor must belong to the same organization")
+        failure = AnalyticsFailure(
+            organization_id=organization_id,
+            run_id=run_id,
+            sensor_id=sensor_id,
+            batch_id=batch_id,
+            source_kind=source_kind,
+            source_record_id=source_record_id,
+            reason=reason,
+            detail=detail,
+            dead_letter=True,
+        )
+        self.session.add(failure)
+        self.session.flush()
+        return failure
+
+    def latest_analytics_health(self, organization_id: str) -> list[AnalyticsHealthState]:
+        row_numbers = (
+            select(
+                AnalyticsHealthState.id,
+                func.row_number()
+                .over(
+                    partition_by=AnalyticsHealthState.sensor_id,
+                    order_by=(AnalyticsHealthState.observed_at.desc(), AnalyticsHealthState.id.desc()),
+                )
+                .label("row_number"),
+            )
+            .where(AnalyticsHealthState.organization_id == organization_id)
+            .subquery()
+        )
+        statement = (
+            select(AnalyticsHealthState)
+            .join(row_numbers, AnalyticsHealthState.id == row_numbers.c.id)
+            .where(row_numbers.c.row_number == 1)
+            .order_by(AnalyticsHealthState.observed_at.desc(), AnalyticsHealthState.sensor_id)
+        )
+        return list(self.session.scalars(statement))
 
     def ingestion_health(self, organization_id: str) -> dict:
         source_rows = self.session.execute(

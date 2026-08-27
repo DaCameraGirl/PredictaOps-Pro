@@ -62,7 +62,10 @@ GitHub pull request numbers may drift after branch renames or replacement PRs.
    sensor resolution, ingestion provenance, idempotency, quality states, dead-letter failures, tenant-boundary tests,
    source health, and first-class waveform ingestion metadata.
 3. **Production Slice 8 - Analytics Pipeline**
-   Streaming feature extraction, waveform processing/storage hardening, FFT, anomaly/degradation engine, and health state.
+   Canonical scalar and waveform analytics, deterministic feature extraction, waveform integrity checks, FFT and
+   frequency-domain features, persisted feature records with provenance, baseline anomaly scoring, degradation/trend
+   evidence, health state, deterministic replay/recomputation, tenant isolation, corrupted/missing waveform behavior,
+   and PostgreSQL migration/CI coverage.
 4. **Production Slice 9 - ML Platform**
    Dataset versions, experiments, model registry, cross-run validation, uncertainty, abstention, promotion, and rollback.
 5. **Production Slice 10 - Production Serving**

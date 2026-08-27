@@ -122,6 +122,23 @@ POST /api/ingestion/{organization_id}/replay/{batch_id}
 GET  /api/ingestion/{organization_id}/health
 ```
 
+## Analytics pipeline
+
+Production Slice 8 computes deterministic analytics from canonical
+`machine_readings` and `waveform_records`. It persists feature records with
+source provenance, validates waveform integrity before reading samples, computes
+time-domain and FFT features, scores baseline anomalies and degradation trends,
+and stores evidence-backed sensor health states. This layer does not train,
+register, promote, or serve ML models; that remains Production Slice 9.
+
+Useful analytics endpoints:
+
+```text
+POST /api/analytics/{organization_id}/batches/{batch_id}/compute
+POST /api/analytics/{organization_id}/sensors/{sensor_id}/recompute
+GET  /api/analytics/{organization_id}/health
+```
+
 ## Rebuild the current Test 2 model
 
 The existing downloader is intentionally Test-2-only:
