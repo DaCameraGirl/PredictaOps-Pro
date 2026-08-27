@@ -83,6 +83,10 @@ class Organization(Base, TimestampMixin, LifecycleMixin):
         back_populates="organization",
         cascade="all, delete-orphan",
     )
+    ml_dataset_versions: Mapped[list["MLDatasetVersion"]] = relationship(
+        back_populates="organization",
+        cascade="all, delete-orphan",
+    )
 
 
 class User(Base, TimestampMixin, LifecycleMixin):
@@ -530,3 +534,148 @@ class AnalyticsFailure(Base, TimestampMixin):
     reason: Mapped[str] = mapped_column(String(255), nullable=False)
     detail: Mapped[dict | None] = mapped_column(JSON)
     dead_letter: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class MLDatasetVersion(Base, TimestampMixin):
+    __tablename__ = "ml_dataset_versions"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_ml_dataset_versions_org_id"),
+        UniqueConstraint("organization_id", "name", "version", name="uq_ml_dataset_name_version"),
+        CheckConstraint("status in ('created', 'archived')", name="ck_ml_dataset_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="created")
+    source_algorithm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    target_unit: Mapped[str | None] = mapped_column(String(64))
+    feature_names: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    validation_group_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    filters: Mapped[dict | None] = mapped_column(JSON)
+    provenance: Mapped[dict | None] = mapped_column(JSON)
+
+    organization: Mapped[Organization] = relationship(back_populates="ml_dataset_versions")
+
+
+class MLExperimentRun(Base, TimestampMixin):
+    __tablename__ = "ml_experiment_runs"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_ml_experiments_org_id"),
+        ForeignKeyConstraint(
+            ["organization_id", "dataset_version_id"],
+            ["ml_dataset_versions.organization_id", "ml_dataset_versions.id"],
+        ),
+        CheckConstraint("status in ('running', 'completed', 'failed')", name="ck_ml_experiment_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    dataset_version_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    algorithm: Mapped[str] = mapped_column(String(120), nullable=False)
+    validation_method: Mapped[str] = mapped_column(String(120), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    code_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_config: Mapped[dict | None] = mapped_column(JSON)
+    metrics: Mapped[dict | None] = mapped_column(JSON)
+    baseline_metrics: Mapped[dict | None] = mapped_column(JSON)
+    uncertainty: Mapped[dict | None] = mapped_column(JSON)
+    abstention_policy: Mapped[dict | None] = mapped_column(JSON)
+    artifact_uri: Mapped[str | None] = mapped_column(String(1024))
+    artifact_sha256: Mapped[str | None] = mapped_column(String(64))
+    provenance: Mapped[dict | None] = mapped_column(JSON)
+
+
+class MLModelRegistry(Base, TimestampMixin):
+    __tablename__ = "ml_model_registries"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_ml_model_registries_org_id"),
+        UniqueConstraint("organization_id", "name", name="uq_ml_model_registry_name"),
+        CheckConstraint("status in ('active', 'archived')", name="ck_ml_model_registry_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    task: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    description: Mapped[str | None] = mapped_column(String(1024))
+
+
+class MLModelVersion(Base, TimestampMixin):
+    __tablename__ = "ml_model_versions"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_ml_model_versions_org_id"),
+        UniqueConstraint("organization_id", "registry_id", "version", name="uq_ml_model_registry_version"),
+        ForeignKeyConstraint(
+            ["organization_id", "registry_id"],
+            ["ml_model_registries.organization_id", "ml_model_registries.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "experiment_run_id"],
+            ["ml_experiment_runs.organization_id", "ml_experiment_runs.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "dataset_version_id"],
+            ["ml_dataset_versions.organization_id", "ml_dataset_versions.id"],
+        ),
+        CheckConstraint(
+            "stage in ('candidate', 'validated', 'production', 'archived', 'rejected')",
+            name="ck_ml_model_version_stage",
+        ),
+        CheckConstraint(
+            "approval_status in ('not_required', 'pending', 'approved', 'rejected')",
+            name="ck_ml_model_version_approval",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    registry_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    experiment_run_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    dataset_version_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False, default="candidate")
+    approval_status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_required")
+    artifact_uri: Mapped[str] = mapped_column(String(1024), nullable=False)
+    artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    metrics: Mapped[dict | None] = mapped_column(JSON)
+    baseline_metrics: Mapped[dict | None] = mapped_column(JSON)
+    uncertainty: Mapped[dict | None] = mapped_column(JSON)
+    abstention_policy: Mapped[dict | None] = mapped_column(JSON)
+    provenance: Mapped[dict | None] = mapped_column(JSON)
+    approved_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class MLModelPromotionEvent(Base, TimestampMixin):
+    __tablename__ = "ml_model_promotion_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "model_version_id"],
+            ["ml_model_versions.organization_id", "ml_model_versions.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "registry_id"],
+            ["ml_model_registries.organization_id", "ml_model_registries.id"],
+        ),
+        CheckConstraint("action in ('promote', 'rollback')", name="ck_ml_promotion_action"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    registry_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    model_version_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    from_stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    to_stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    approved_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    reason: Mapped[str | None] = mapped_column(String(1024))
+    event_metadata: Mapped[dict | None] = mapped_column(JSON)

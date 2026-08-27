@@ -139,6 +139,33 @@ POST /api/analytics/{organization_id}/sensors/{sensor_id}/recompute
 GET  /api/analytics/{organization_id}/health
 ```
 
+## ML platform
+
+Production Slice 9 adds the model-development control plane. Dataset versions
+are immutable snapshots built from canonical analytics feature records; experiment
+runs capture reproducible training config, code version, validation method,
+metrics, baseline comparison, uncertainty evidence, and abstention policy. Model
+registries track immutable model versions, promotion stages, explicit human
+approval before production promotion, and rollback events.
+
+This slice does **not** perform live per-asset model resolution, drift monitoring,
+or retraining triggers. Those are Production Slice 10 responsibilities.
+
+Useful ML platform endpoints:
+
+```text
+POST /api/ml/{organization_id}/dataset-versions
+GET  /api/ml/{organization_id}/dataset-versions
+POST /api/ml/{organization_id}/experiments
+GET  /api/ml/{organization_id}/experiments
+GET  /api/ml/{organization_id}/experiments/{experiment_run_id}
+POST /api/ml/{organization_id}/registries
+GET  /api/ml/{organization_id}/registries
+POST /api/ml/{organization_id}/model-versions
+POST /api/ml/{organization_id}/model-versions/{model_version_id}/promote
+POST /api/ml/{organization_id}/registries/{registry_id}/rollback
+```
+
 ## Rebuild the current Test 2 model
 
 The existing downloader is intentionally Test-2-only:

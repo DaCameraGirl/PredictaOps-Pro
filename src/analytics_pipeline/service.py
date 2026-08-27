@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -151,7 +152,7 @@ class AnalyticsService:
                 source=reading,
                 batch_id=record.batch_id,
                 features=features,
-                provenance={"ingested_record_id": record.id, "quality": record.quality},
+                provenance=self._feature_provenance(record, {"quality": record.quality}),
             )
         elif record.target_type == "waveform":
             waveform = self.repo.get_waveform_record(organization_id, record.target_id)
@@ -166,12 +167,14 @@ class AnalyticsService:
                 source=waveform,
                 batch_id=record.batch_id,
                 features=features,
-                provenance={
-                    "ingested_record_id": record.id,
-                    "quality": record.quality,
-                    "content_sha256": loaded.content_sha256,
-                    "checksum_verified": loaded.checksum_verified,
-                },
+                provenance=self._feature_provenance(
+                    record,
+                    {
+                        "quality": record.quality,
+                        "content_sha256": loaded.content_sha256,
+                        "checksum_verified": loaded.checksum_verified,
+                    },
+                ),
             )
         else:
             raise AnalyticsError(f"unsupported ingested target type {record.target_type!r}")
@@ -182,6 +185,17 @@ class AnalyticsService:
             "features": sum(1 for _feature, created in created_features if created),
             "duplicates": sum(1 for _feature, created in created_features if not created),
             "health_states": health_states,
+        }
+
+    def _feature_provenance(self, record: IngestedRecord, extra: dict[str, Any]) -> dict[str, Any]:
+        ingestion_provenance = record.provenance or {}
+        source_metadata = ingestion_provenance.get("metadata") or {}
+        return {
+            "ingested_record_id": record.id,
+            "source_record_id": ingestion_provenance.get("source_record_id"),
+            "ingestion_provenance": ingestion_provenance,
+            "source_metadata": source_metadata,
+            **extra,
         }
 
     def _persist_features(

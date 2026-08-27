@@ -67,7 +67,10 @@ GitHub pull request numbers may drift after branch renames or replacement PRs.
    evidence, health state, deterministic replay/recomputation, tenant isolation, corrupted/missing waveform behavior,
    and PostgreSQL migration/CI coverage.
 4. **Production Slice 9 - ML Platform**
-   Dataset versions, experiments, model registry, cross-run validation, uncertainty, abstention, promotion, and rollback.
+   Dataset versions tied to canonical analytics inputs, experiment runs with reproducible training metadata, cross-run
+   or cross-bearing validation, immutable model versions, evaluation metrics and baseline comparison, uncertainty,
+   abstention contracts, candidate to validated to production promotion with explicit human approval, rollback, per-model
+   provenance, tenant isolation, API endpoints, and PostgreSQL migration/CI coverage.
 5. **Production Slice 10 - Production Serving**
    Per-asset model resolution, live predictions, drift, monitoring, and retraining triggers.
 6. **Production Slice 11 - Maintenance Operations**
