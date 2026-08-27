@@ -58,9 +58,11 @@ GitHub pull request numbers may drift after branch renames or replacement PRs.
 1. **Production Slice 6 - Platform Core**
    Database, organizations, users, sites, assets, components, sensors, canonical schemas, migrations, and persistence.
 2. **Production Slice 7 - Industrial Ingestion**
-   File ingestion, REST, MQTT, OPC-UA, adapter architecture, replay, validation, and units.
+   CSV, Parquet, REST, MQTT, OPC-UA, ABB/vendor adapters, replay, validation, unit and timezone normalization,
+   sensor resolution, ingestion provenance, idempotency, quality states, dead-letter failures, tenant-boundary tests,
+   source health, and first-class waveform ingestion metadata.
 3. **Production Slice 8 - Analytics Pipeline**
-   Streaming feature extraction, waveform storage, FFT, anomaly/degradation engine, and health state.
+   Streaming feature extraction, waveform processing/storage hardening, FFT, anomaly/degradation engine, and health state.
 4. **Production Slice 9 - ML Platform**
    Dataset versions, experiments, model registry, cross-run validation, uncertainty, abstention, promotion, and rollback.
 5. **Production Slice 10 - Production Serving**

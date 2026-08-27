@@ -19,12 +19,17 @@ from platform_core.contracts import (
 from platform_core.models import (
     Asset,
     Component,
+    IngestedRecord,
+    IngestionBatch,
+    IngestionFailure,
+    IngestionSource,
     MachineReading,
     Organization,
     OrganizationMembership,
     Sensor,
     Site,
     User,
+    WaveformRecord,
 )
 
 
@@ -56,6 +61,10 @@ class PlatformRepository:
             "components": self.count(Component),
             "sensors": self.count(Sensor),
             "machine_readings": self.count(MachineReading),
+            "ingestion_sources": self.count(IngestionSource),
+            "ingestion_batches": self.count(IngestionBatch),
+            "ingestion_failures": self.count(IngestionFailure),
+            "waveform_records": self.count(WaveformRecord),
         }
 
     def get_organization_by_slug(self, slug: str) -> Organization | None:
@@ -90,6 +99,42 @@ class PlatformRepository:
                 Sensor.organization_id == organization_id,
                 Sensor.component_id == component_id,
                 Sensor.slug == slug,
+            )
+        )
+
+    def get_sensor_by_id(self, organization_id: str, sensor_id: str) -> Sensor | None:
+        return self.session.scalar(
+            select(Sensor).where(Sensor.organization_id == organization_id, Sensor.id == sensor_id)
+        )
+
+    def get_sensor_by_external_ref(self, organization_id: str, external_ref: str) -> Sensor | None:
+        return self.session.scalar(
+            select(Sensor).where(Sensor.organization_id == organization_id, Sensor.external_ref == external_ref)
+        )
+
+    def get_sensor_by_path(
+        self,
+        organization_id: str,
+        *,
+        site_slug: str,
+        asset_slug: str,
+        component_slug: str,
+        sensor_slug: str,
+    ) -> Sensor | None:
+        return self.session.scalar(
+            select(Sensor)
+            .join(Component, Sensor.component_id == Component.id)
+            .join(Asset, Component.asset_id == Asset.id)
+            .join(Site, Asset.site_id == Site.id)
+            .where(
+                Sensor.organization_id == organization_id,
+                Component.organization_id == organization_id,
+                Asset.organization_id == organization_id,
+                Site.organization_id == organization_id,
+                Site.slug == site_slug,
+                Asset.slug == asset_slug,
+                Component.slug == component_slug,
+                Sensor.slug == sensor_slug,
             )
         )
 
@@ -229,6 +274,246 @@ class PlatformRepository:
         self.session.add(reading)
         self.session.flush()
         return reading
+
+    def get_or_create_ingestion_source(
+        self,
+        organization_id: str,
+        *,
+        name: str,
+        source_type: str,
+        external_ref: str | None = None,
+        config: dict | None = None,
+    ) -> IngestionSource:
+        if self.session.get(Organization, organization_id) is None:
+            raise TenantBoundaryError("ingestion source organization does not exist")
+        existing = self.session.scalar(
+            select(IngestionSource).where(
+                IngestionSource.organization_id == organization_id,
+                IngestionSource.name == name,
+            )
+        )
+        if existing:
+            if existing.source_type != source_type:
+                raise TenantBoundaryError("ingestion source name is already registered with a different source type")
+            return existing
+        source = IngestionSource(
+            organization_id=organization_id,
+            name=name,
+            source_type=source_type,
+            external_ref=external_ref,
+            status="active",
+            config=config,
+        )
+        self.session.add(source)
+        self.session.flush()
+        return source
+
+    def create_ingestion_batch(
+        self,
+        organization_id: str,
+        *,
+        source_id: str,
+        source_type: str,
+        idempotency_key: str | None,
+        source_uri: str | None,
+        provenance: dict | None,
+        replay_of_batch_id: str | None = None,
+    ) -> IngestionBatch:
+        source = self.session.get(IngestionSource, source_id)
+        if source is None or source.organization_id != organization_id:
+            raise TenantBoundaryError("ingestion source must belong to the same organization")
+        if replay_of_batch_id is not None:
+            replay_batch = self.session.get(IngestionBatch, replay_of_batch_id)
+            if replay_batch is None or replay_batch.organization_id != organization_id:
+                raise TenantBoundaryError("replay batch must belong to the same organization")
+        batch = IngestionBatch(
+            organization_id=organization_id,
+            source_id=source_id,
+            source_type=source_type,
+            idempotency_key=idempotency_key,
+            source_uri=source_uri,
+            replay_of_batch_id=replay_of_batch_id,
+            provenance=provenance,
+            status="accepted",
+            accepted_count=0,
+            duplicate_count=0,
+            failed_count=0,
+            scalar_count=0,
+            waveform_count=0,
+        )
+        self.session.add(batch)
+        self.session.flush()
+        return batch
+
+    def get_ingested_record_by_key(
+        self,
+        organization_id: str,
+        *,
+        source_id: str,
+        idempotency_key: str,
+    ) -> IngestedRecord | None:
+        return self.session.scalar(
+            select(IngestedRecord).where(
+                IngestedRecord.organization_id == organization_id,
+                IngestedRecord.source_id == source_id,
+                IngestedRecord.idempotency_key == idempotency_key,
+            )
+        )
+
+    def create_ingested_record(
+        self,
+        organization_id: str,
+        *,
+        source_id: str,
+        batch_id: str,
+        idempotency_key: str,
+        target_type: str,
+        target_id: str,
+        observed_at,
+        metric: str | None,
+        quality: str,
+        provenance: dict | None,
+    ) -> IngestedRecord:
+        record = IngestedRecord(
+            organization_id=organization_id,
+            source_id=source_id,
+            batch_id=batch_id,
+            idempotency_key=idempotency_key,
+            target_type=target_type,
+            target_id=target_id,
+            observed_at=observed_at,
+            metric=metric,
+            quality=quality,
+            provenance=provenance,
+        )
+        self.session.add(record)
+        self.session.flush()
+        return record
+
+    def create_ingestion_failure(
+        self,
+        organization_id: str,
+        *,
+        source_id: str,
+        batch_id: str,
+        source_record_id: str | None,
+        quality: str,
+        reason: str,
+        detail: dict | None,
+        payload: dict | None,
+    ) -> IngestionFailure:
+        failure = IngestionFailure(
+            organization_id=organization_id,
+            source_id=source_id,
+            batch_id=batch_id,
+            source_record_id=source_record_id,
+            quality=quality,
+            reason=reason,
+            detail=detail,
+            payload=payload,
+            dead_letter=True,
+        )
+        self.session.add(failure)
+        self.session.flush()
+        return failure
+
+    def create_waveform_record(
+        self,
+        organization_id: str,
+        *,
+        sensor_id: str,
+        batch_id: str,
+        observed_at,
+        unit: str,
+        sampling_rate_hz: float,
+        sample_count: int,
+        source: str,
+        quality: str,
+        storage_uri: str,
+        sha256: str | None,
+        metadata_json: dict | None,
+    ) -> WaveformRecord:
+        sensor = self.session.get(Sensor, sensor_id)
+        if sensor is None or sensor.organization_id != organization_id:
+            raise TenantBoundaryError("waveform sensor must belong to the same organization")
+        batch = self.session.get(IngestionBatch, batch_id)
+        if batch is None or batch.organization_id != organization_id:
+            raise TenantBoundaryError("waveform batch must belong to the same organization")
+        waveform = WaveformRecord(
+            organization_id=organization_id,
+            sensor_id=sensor_id,
+            batch_id=batch_id,
+            observed_at=observed_at,
+            unit=unit,
+            sampling_rate_hz=sampling_rate_hz,
+            sample_count=sample_count,
+            source=source,
+            quality=quality,
+            storage_uri=storage_uri,
+            sha256=sha256,
+            metadata_json=metadata_json,
+        )
+        self.session.add(waveform)
+        self.session.flush()
+        return waveform
+
+    def list_ingested_records_for_batch(self, organization_id: str, batch_id: str) -> list[IngestedRecord]:
+        statement = (
+            select(IngestedRecord)
+            .where(IngestedRecord.organization_id == organization_id, IngestedRecord.batch_id == batch_id)
+            .order_by(IngestedRecord.observed_at, IngestedRecord.id)
+        )
+        return list(self.session.scalars(statement))
+
+    def get_machine_reading(self, organization_id: str, reading_id: str) -> MachineReading | None:
+        return self.session.scalar(
+            select(MachineReading).where(
+                MachineReading.organization_id == organization_id,
+                MachineReading.id == reading_id,
+            )
+        )
+
+    def get_waveform_record(self, organization_id: str, waveform_id: str) -> WaveformRecord | None:
+        return self.session.scalar(
+            select(WaveformRecord).where(
+                WaveformRecord.organization_id == organization_id,
+                WaveformRecord.id == waveform_id,
+            )
+        )
+
+    def ingestion_health(self, organization_id: str) -> dict:
+        source_rows = self.session.execute(
+            select(
+                IngestionSource.id,
+                IngestionSource.name,
+                IngestionSource.source_type,
+                IngestionSource.status,
+                func.count(IngestionBatch.id),
+            )
+            .outerjoin(
+                IngestionBatch,
+                (IngestionBatch.organization_id == IngestionSource.organization_id)
+                & (IngestionBatch.source_id == IngestionSource.id),
+            )
+            .where(IngestionSource.organization_id == organization_id)
+            .group_by(IngestionSource.id)
+            .order_by(IngestionSource.name)
+        )
+        return {
+            "sources": [
+                {
+                    "id": row.id,
+                    "name": row.name,
+                    "source_type": row.source_type,
+                    "status": row.status,
+                    "batch_count": int(row[4]),
+                }
+                for row in source_rows
+            ],
+            "batches": self.count_for_organization(IngestionBatch, organization_id),
+            "failures": self.count_for_organization(IngestionFailure, organization_id),
+            "waveforms": self.count_for_organization(WaveformRecord, organization_id),
+        }
 
     def list_assets(self, organization_id: str) -> list[Asset]:
         statement: Select[tuple[Asset]] = select(Asset).where(Asset.organization_id == organization_id)
