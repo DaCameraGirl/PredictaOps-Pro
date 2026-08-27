@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect
 from sqlalchemy.exc import SQLAlchemyError
 
+from analytics_pipeline.service import AnalyticsService
 from bearing_data import (
     BEARING_COLS,
     DEFAULT_RUN,
@@ -370,6 +371,45 @@ def ingestion_health(organization_id: str):
     with SessionLocal() as session:
         try:
             return IngestionService(session).health(organization_id)
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/analytics/{organization_id}/batches/{batch_id}/compute")
+def compute_analytics_batch(organization_id: str, batch_id: str):
+    with SessionLocal() as session:
+        try:
+            receipt = AnalyticsService(session).compute_batch(organization_id, batch_id)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return receipt.model_dump()
+
+
+@app.post("/api/analytics/{organization_id}/sensors/{sensor_id}/recompute")
+def recompute_analytics_sensor(organization_id: str, sensor_id: str):
+    with SessionLocal() as session:
+        try:
+            receipt = AnalyticsService(session).recompute_sensor(organization_id, sensor_id)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return receipt.model_dump()
+
+
+@app.get("/api/analytics/{organization_id}/health")
+def analytics_health(organization_id: str):
+    with SessionLocal() as session:
+        try:
+            return AnalyticsService(session).health(organization_id)
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 

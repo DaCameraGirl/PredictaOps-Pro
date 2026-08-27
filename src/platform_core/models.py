@@ -79,6 +79,10 @@ class Organization(Base, TimestampMixin, LifecycleMixin):
         back_populates="organization",
         cascade="all, delete-orphan",
     )
+    analytics_runs: Mapped[list["AnalyticsRun"]] = relationship(
+        back_populates="organization",
+        cascade="all, delete-orphan",
+    )
 
 
 class User(Base, TimestampMixin, LifecycleMixin):
@@ -402,3 +406,127 @@ class WaveformRecord(Base, TimestampMixin):
     metadata_json: Mapped[dict | None] = mapped_column(JSON)
 
     sensor: Mapped[Sensor] = relationship(back_populates="waveforms")
+
+
+class AnalyticsRun(Base, TimestampMixin):
+    __tablename__ = "analytics_runs"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_analytics_runs_org_id"),
+        ForeignKeyConstraint(
+            ["organization_id", "input_batch_id"],
+            ["ingestion_batches.organization_id", "ingestion_batches.id"],
+        ),
+        ForeignKeyConstraint(["organization_id", "sensor_id"], ["sensors.organization_id", "sensors.id"]),
+        CheckConstraint("run_kind in ('batch', 'sensor')", name="ck_analytics_run_kind"),
+        CheckConstraint("status in ('running', 'completed', 'partial', 'failed')", name="ck_analytics_run_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    input_batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    sensor_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    run_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    algorithm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    feature_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    health_state_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    provenance: Mapped[dict | None] = mapped_column(JSON)
+
+    organization: Mapped[Organization] = relationship(back_populates="analytics_runs")
+
+
+class AnalyticsFeatureRecord(Base, TimestampMixin):
+    __tablename__ = "analytics_feature_records"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_analytics_features_org_id"),
+        UniqueConstraint(
+            "organization_id",
+            "algorithm_version",
+            "source_kind",
+            "source_record_id",
+            "feature_name",
+            name="uq_analytics_feature_source",
+        ),
+        ForeignKeyConstraint(["organization_id", "run_id"], ["analytics_runs.organization_id", "analytics_runs.id"]),
+        ForeignKeyConstraint(["organization_id", "sensor_id"], ["sensors.organization_id", "sensors.id"]),
+        ForeignKeyConstraint(
+            ["organization_id", "batch_id"],
+            ["ingestion_batches.organization_id", "ingestion_batches.id"],
+        ),
+        CheckConstraint("source_kind in ('scalar', 'waveform')", name="ck_analytics_feature_source_kind"),
+        CheckConstraint("quality in ('good', 'suspect', 'bad', 'missing')", name="ck_analytics_feature_quality"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    run_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    sensor_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_record_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    feature_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    value: Mapped[float] = mapped_column(Float, nullable=False)
+    unit: Mapped[str | None] = mapped_column(String(64))
+    quality: Mapped[str] = mapped_column(String(32), nullable=False, default="good")
+    algorithm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    provenance: Mapped[dict | None] = mapped_column(JSON)
+
+
+class AnalyticsHealthState(Base, TimestampMixin):
+    __tablename__ = "analytics_health_states"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_analytics_health_states_org_id"),
+        UniqueConstraint(
+            "organization_id",
+            "algorithm_version",
+            "sensor_id",
+            "observed_at",
+            name="uq_analytics_health_state_sensor_time",
+        ),
+        ForeignKeyConstraint(["organization_id", "run_id"], ["analytics_runs.organization_id", "analytics_runs.id"]),
+        ForeignKeyConstraint(["organization_id", "sensor_id"], ["sensors.organization_id", "sensors.id"]),
+        CheckConstraint(
+            "health_state in ('insufficient_evidence', 'healthy', 'watch', 'warning', 'critical', 'unknown')",
+            name="ck_analytics_health_state",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    run_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    sensor_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    health_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    anomaly_score: Mapped[float | None] = mapped_column(Float)
+    trend_slope: Mapped[float | None] = mapped_column(Float)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    algorithm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence: Mapped[dict | None] = mapped_column(JSON)
+
+
+class AnalyticsFailure(Base, TimestampMixin):
+    __tablename__ = "analytics_failures"
+    __table_args__ = (
+        ForeignKeyConstraint(["organization_id", "run_id"], ["analytics_runs.organization_id", "analytics_runs.id"]),
+        ForeignKeyConstraint(["organization_id", "sensor_id"], ["sensors.organization_id", "sensors.id"]),
+        ForeignKeyConstraint(
+            ["organization_id", "batch_id"],
+            ["ingestion_batches.organization_id", "ingestion_batches.id"],
+        ),
+        CheckConstraint("source_kind in ('scalar', 'waveform')", name="ck_analytics_failure_source_kind"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    run_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    sensor_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_record_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    reason: Mapped[str] = mapped_column(String(255), nullable=False)
+    detail: Mapped[dict | None] = mapped_column(JSON)
+    dead_letter: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
