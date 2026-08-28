@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import os
+import socket
+import ssl
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -53,6 +57,8 @@ from platform_core.repositories import PlatformRepository
 SAFE_AUTH_ERROR = "invalid or missing authentication"
 SAFE_FORBIDDEN_ERROR = "not authorized for this organization"
 SUPPORTED_SECURITY_MODES = {"disabled", "enterprise", "test"}
+DEFAULT_HTTPS_PORT = 443
+MAX_AUDIT_HTTP_PATH_LENGTH = 1024
 
 
 class AuthenticationError(PermissionError):
@@ -127,6 +133,8 @@ def validate_oidc_endpoint(url: str, *, allow_development_targets: bool = False)
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
+        if not allow_development_targets:
+            _validated_oidc_addresses(host, parsed.port or DEFAULT_HTTPS_PORT)
         return
     if not allow_development_targets and (
         address.is_loopback
@@ -136,6 +144,35 @@ def validate_oidc_endpoint(url: str, *, allow_development_targets: bool = False)
         or address.is_multicast
     ):
         raise SecurityConfigurationError("OIDC endpoint must not target private or unsafe addresses")
+
+
+def _validated_oidc_addresses(host: str, port: int) -> tuple[str, ...]:
+    try:
+        resolved = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise SecurityConfigurationError("OIDC endpoint host could not be resolved") from exc
+    addresses = sorted({item[4][0] for item in resolved})
+    if not addresses:
+        raise SecurityConfigurationError("OIDC endpoint host did not resolve to an address")
+    for raw_address in addresses:
+        try:
+            address = ipaddress.ip_address(raw_address)
+        except ValueError as exc:
+            raise SecurityConfigurationError("OIDC endpoint resolved to an invalid address") from exc
+        if _unsafe_oidc_address(address):
+            raise SecurityConfigurationError("OIDC endpoint resolved to a private or unsafe address")
+    return tuple(addresses)
+
+
+def _unsafe_oidc_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        address.is_loopback
+        or address.is_link_local
+        or address.is_private
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+    )
 
 
 class OidcTokenVerifier:
@@ -199,18 +236,113 @@ class OidcTokenVerifier:
     def _load_jwks(self, jwks_uri: str, *, refresh: bool) -> dict[str, Any]:
         if not refresh and jwks_uri in self._jwks_cache:
             return self._jwks_cache[jwks_uri]
-        validate_oidc_endpoint(jwks_uri, allow_development_targets=os.environ.get("PMS_ENVIRONMENT") != "production")
+        allow_development_targets = os.environ.get("PMS_ENVIRONMENT") != "production"
+        validate_oidc_endpoint(jwks_uri, allow_development_targets=allow_development_targets)
         try:
-            with httpx.Client(timeout=self.http_timeout_seconds, follow_redirects=False) as client:
-                response = client.get(jwks_uri)
-                response.raise_for_status()
-                jwks = response.json()
+            if allow_development_targets:
+                with httpx.Client(timeout=self.http_timeout_seconds, follow_redirects=False) as client:
+                    response = client.get(jwks_uri)
+                    response.raise_for_status()
+                    jwks = response.json()
+            else:
+                jwks = _fetch_jwks_with_pinned_address(jwks_uri, timeout_seconds=self.http_timeout_seconds)
         except Exception as exc:
             raise AuthenticationError(SAFE_AUTH_ERROR) from exc
         if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
             raise AuthenticationError(SAFE_AUTH_ERROR)
+        _validated_jwk_entries(jwks["keys"])
         self._jwks_cache[jwks_uri] = jwks
         return jwks
+
+
+def _fetch_jwks_with_pinned_address(jwks_uri: str, *, timeout_seconds: float) -> dict[str, Any]:
+    parsed = urlparse(jwks_uri)
+    host = parsed.hostname
+    if not host:
+        raise AuthenticationError(SAFE_AUTH_ERROR)
+    port = parsed.port or DEFAULT_HTTPS_PORT
+    addresses = _validated_oidc_addresses(host, port)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    host_header = host if port == DEFAULT_HTTPS_PORT else f"{host}:{port}"
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host_header}\r\n"
+        "Accept: application/json\r\n"
+        "Connection: close\r\n"
+        "User-Agent: abb-predictive-maintenance-studio/enterprise-security\r\n"
+        "\r\n"
+    ).encode("ascii")
+    last_error: Exception | None = None
+    for address in addresses:
+        try:
+            with socket.create_connection((address, port), timeout=timeout_seconds) as raw_socket:
+                context = ssl.create_default_context()
+                with context.wrap_socket(raw_socket, server_hostname=host) as tls_socket:
+                    tls_socket.settimeout(timeout_seconds)
+                    tls_socket.sendall(request)
+                    chunks = []
+                    while True:
+                        chunk = tls_socket.recv(65536)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+            return _parse_jwks_http_response(b"".join(chunks))
+        except Exception as exc:
+            last_error = exc
+    raise AuthenticationError(SAFE_AUTH_ERROR) from last_error
+
+
+def _parse_jwks_http_response(raw_response: bytes) -> dict[str, Any]:
+    header_blob, separator, body = raw_response.partition(b"\r\n\r\n")
+    if not separator:
+        raise AuthenticationError(SAFE_AUTH_ERROR)
+    header_lines = header_blob.decode("iso-8859-1").split("\r\n")
+    try:
+        _protocol, status_code, _reason = header_lines[0].split(" ", 2)
+    except ValueError as exc:
+        raise AuthenticationError(SAFE_AUTH_ERROR) from exc
+    try:
+        status = int(status_code)
+    except ValueError as exc:
+        raise AuthenticationError(SAFE_AUTH_ERROR) from exc
+    if status < 200 or status >= 300:
+        raise AuthenticationError(SAFE_AUTH_ERROR)
+    headers = {}
+    for line in header_lines[1:]:
+        name, _, value = line.partition(":")
+        if name:
+            headers[name.lower()] = value.strip().lower()
+    if headers.get("transfer-encoding") == "chunked":
+        body = _decode_chunked_body(body)
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise AuthenticationError(SAFE_AUTH_ERROR) from exc
+    if not isinstance(payload, dict):
+        raise AuthenticationError(SAFE_AUTH_ERROR)
+    return payload
+
+
+def _decode_chunked_body(body: bytes) -> bytes:
+    decoded = bytearray()
+    remaining = body
+    while True:
+        size_blob, separator, rest = remaining.partition(b"\r\n")
+        if not separator:
+            raise AuthenticationError(SAFE_AUTH_ERROR)
+        try:
+            size = int(size_blob.split(b";", 1)[0], 16)
+        except ValueError as exc:
+            raise AuthenticationError(SAFE_AUTH_ERROR) from exc
+        if size == 0:
+            return bytes(decoded)
+        chunk = rest[:size]
+        if len(chunk) != size or rest[size : size + 2] != b"\r\n":
+            raise AuthenticationError(SAFE_AUTH_ERROR)
+        decoded.extend(chunk)
+        remaining = rest[size + 2 :]
 
 
 class DeterministicTokenVerifier:
@@ -233,9 +365,15 @@ class DeterministicTokenVerifier:
 
 def _select_jwk(jwks: dict[str, Any], key_id: str | None) -> dict[str, Any] | None:
     keys = jwks.get("keys") or []
+    _validated_jwk_entries(keys)
     if key_id:
         return next((key for key in keys if key.get("kid") == key_id), None)
     return keys[0] if len(keys) == 1 else None
+
+
+def _validated_jwk_entries(keys: list[Any]) -> None:
+    if any(not isinstance(key, Mapping) for key in keys):
+        raise AuthenticationError(SAFE_AUTH_ERROR)
 
 
 class SecretResolver:
@@ -245,6 +383,7 @@ class SecretResolver:
 
 class EnvironmentSecretResolver(SecretResolver):
     def resolve(self, reference: SecretReference) -> str:
+        _require_resolvable_secret(reference)
         if reference.provider != "env":
             raise SecretResolutionError("secret provider is not configured")
         value = os.environ.get(reference.locator)
@@ -258,10 +397,19 @@ class InMemorySecretResolver(SecretResolver):
         self.values = values
 
     def resolve(self, reference: SecretReference) -> str:
+        _require_resolvable_secret(reference)
         value = self.values.get(reference.locator)
         if value is None:
             raise SecretResolutionError("secret is not available")
         return value
+
+
+def _require_resolvable_secret(reference: SecretReference) -> None:
+    if reference.status in {"active", "rotating"}:
+        return
+    if reference.status in {"inactive", "archived"}:
+        raise SecretResolutionError("secret reference is not active")
+    raise SecretResolutionError("secret reference has an unsupported lifecycle status")
 
 
 class SecurityService:
@@ -343,7 +491,13 @@ class SecurityService:
         self.session.flush()
         return identity
 
-    def onboard_user_identity(self, organization_id: str, request: UserIdentityOnboard) -> dict[str, Any]:
+    def onboard_user_identity(
+        self,
+        organization_id: str,
+        request: UserIdentityOnboard,
+        *,
+        actor: SecurityContext,
+    ) -> dict[str, Any]:
         self._require_org(organization_id)
         idp = self.get_identity_provider(organization_id, request.identity_provider_id)
         if idp is None or idp.status != "active":
@@ -366,17 +520,11 @@ class SecurityService:
         if user.lifecycle_state != "active":
             raise AuthorizationError("user is not active")
 
-        membership = self.session.scalar(
-            select(OrganizationMembership).where(
-                OrganizationMembership.organization_id == organization_id,
-                OrganizationMembership.user_id == user.id,
-            )
+        membership = self.change_membership_role(
+            organization_id,
+            MembershipChange(user_id=user.id, role=request.role),
+            actor=actor,
         )
-        if membership is None:
-            membership = self.repo.add_membership(organization_id, user.id, request.role)
-        else:
-            membership.role = request.role
-            membership.lifecycle_state = "active"
 
         identity = self.session.scalar(
             select(UserIdentity).where(
@@ -665,6 +813,7 @@ class SecurityService:
         *,
         actor: SecurityContext,
     ) -> OrganizationMembership:
+        self._lock_organization_for_owner_transition(organization_id)
         self.require_permission(
             actor,
             OWNERS_MANAGE if request.role == "owner" else "members.manage",
@@ -700,6 +849,14 @@ class SecurityService:
         )
         return int(count or 0)
 
+    def _lock_organization_for_owner_transition(self, organization_id: str) -> Organization:
+        organization = self.session.scalar(
+            select(Organization).where(Organization.id == organization_id).with_for_update()
+        )
+        if organization is None:
+            raise AuthorizationError("organization does not exist")
+        return organization
+
     def _require_active_issuer(self, organization_id: str, issuer: str) -> OrganizationIdentityProvider:
         idp = self.session.scalar(
             select(OrganizationIdentityProvider).where(
@@ -720,6 +877,7 @@ class SecurityService:
         *,
         actor: SecurityContext,
     ) -> OrganizationMembership:
+        self._lock_organization_for_owner_transition(organization_id)
         membership = self.session.scalar(
             select(OrganizationMembership).where(
                 OrganizationMembership.organization_id == organization_id,
@@ -731,14 +889,7 @@ class SecurityService:
         permission = OWNERS_MANAGE if membership.role == "owner" else "members.manage"
         self.require_permission(actor, permission, action="members.status")
         if membership.role == "owner" and request.lifecycle_state != "active":
-            active_owner_count = self.session.scalar(
-                select(func.count()).select_from(OrganizationMembership).where(
-                    OrganizationMembership.organization_id == organization_id,
-                    OrganizationMembership.role == "owner",
-                    OrganizationMembership.lifecycle_state == "active",
-                )
-            )
-            if int(active_owner_count or 0) <= 1:
+            if self._active_owner_count(organization_id) <= 1:
                 raise AuthorizationError("cannot deactivate the final active owner")
         membership.lifecycle_state = request.lifecycle_state
         self.session.flush()

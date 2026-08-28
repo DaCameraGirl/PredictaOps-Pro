@@ -3,6 +3,10 @@ from __future__ import annotations
 import base64
 import importlib
 import os
+import socket
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -25,6 +29,7 @@ from enterprise_security.contracts import (
     ServicePrincipalCreate,
     TokenClaims,
     UserIdentityCreate,
+    UserIdentityOnboard,
 )
 from enterprise_security.permissions import (
     INGESTION_WRITE,
@@ -36,12 +41,17 @@ from enterprise_security.permissions import (
 )
 from enterprise_security.redaction import assert_no_plaintext_secrets
 from enterprise_security.service import (
+    MAX_AUDIT_HTTP_PATH_LENGTH,
     AuthenticationError,
     DeterministicTokenVerifier,
+    EnvironmentSecretResolver,
     InMemorySecretResolver,
     OidcTokenVerifier,
+    SecretResolutionError,
     SecurityConfigurationError,
     SecurityService,
+    _fetch_jwks_with_pinned_address,
+    _validated_oidc_addresses,
     audit_event_payload,
     secret_reference_payload,
     security_settings,
@@ -51,6 +61,14 @@ from industrial_ingestion.contracts import SourceRegistration
 from industrial_ingestion.service import IngestionService
 from maintenance_operations.contracts import CaseCreate
 from maintenance_operations.service import MaintenanceOperationsService
+from ml_platform.artifact_store import ModelArtifactStore
+from ml_platform.contracts import (
+    DatasetVersionCreate,
+    ExperimentCreate,
+    ModelVersionCreate,
+    RegistryCreate,
+)
+from ml_platform.service import MLPlatformService
 from platform_core.contracts import (
     AssetCreate,
     ComponentCreate,
@@ -65,6 +83,7 @@ from platform_core.models import (
     IngestionSource,
     MaintenanceCase,
     MaintenanceNote,
+    MLModelPromotionEvent,
     OrganizationIdentityProvider,
     OrganizationMembership,
     SecretReference,
@@ -285,6 +304,52 @@ def _enterprise_app(monkeypatch, session_factory, jwks=None):
     return app_main, TestClient(app_main.app)
 
 
+def _seed_ml_training_features(session, fixture) -> None:
+    repo = PlatformRepository(session)
+    run = repo.create_analytics_run(
+        fixture["organization_id"],
+        run_kind="sensor",
+        sensor_id=fixture["sensor_id"],
+        algorithm_version="analytics-v1",
+        provenance={"test": "enterprise-security-promotion"},
+    )
+    base_time = datetime(2026, 1, 1, tzinfo=UTC)
+    for group, offset in [("bearing-a", 0), ("bearing-b", 10)]:
+        for index in range(4):
+            repo.create_analytics_feature(
+                fixture["organization_id"],
+                run_id=run.id,
+                sensor_id=fixture["sensor_id"],
+                batch_id=None,
+                source_kind="scalar",
+                source_record_id=f"{group}-{index}",
+                observed_at=base_time + timedelta(minutes=offset + index),
+                feature_name="scalar.rms",
+                value=float(index + offset),
+                unit="g",
+                quality="good",
+                algorithm_version="analytics-v1",
+                provenance={
+                    "target_rul_hours": float(8 - index - offset / 10),
+                    "validation_group": group,
+                },
+            )
+    session.commit()
+
+
+def _register_candidate_model(
+    service: MLPlatformService,
+    organization_id: str,
+    experiment_id: str,
+    registry_id: str,
+    version: str,
+):
+    return service.register_model_version(
+        organization_id,
+        ModelVersionCreate(registry_id=registry_id, experiment_run_id=experiment_id, version=version),
+    )
+
+
 def test_migration_creates_enterprise_security_tables(migrated_db):
     engine, _session_factory = migrated_db
     tables = set(inspect(engine).get_table_names())
@@ -345,6 +410,27 @@ def test_unknown_kid_refreshes_jwks_once_then_fails_closed(migrated_db, rsa_keys
             verifier.verify(_token(rsa_keys["primary"], subject="owner-sub", kid="rotated"), idp)
 
         assert calls == [False, True]
+
+
+def test_malformed_jwks_entries_fail_closed_as_authentication_errors(migrated_db, rsa_keys, jwks):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        idp = SecurityService(session).get_identity_provider(fixture["organization_id"], fixture["idp_id"])
+        verifier = OidcTokenVerifier()
+        valid_token = _token(rsa_keys["primary"], subject="owner-sub")
+
+        verifier._jwks_cache[idp.jwks_uri] = jwks
+        assert verifier.verify(valid_token, idp).subject == "owner-sub"
+
+        for malformed_keys in [["not-a-jwk"], [None], [[]]]:
+            verifier._jwks_cache[idp.jwks_uri] = {"keys": malformed_keys}
+            with pytest.raises(AuthenticationError):
+                verifier.verify(valid_token, idp)
+
+        verifier._jwks_cache[idp.jwks_uri] = {"keys": [{"kid": "primary", "kty": "RSA"}]}
+        with pytest.raises(AuthenticationError):
+            verifier.verify(valid_token, idp)
 
 
 def test_identity_resolution_uses_issuer_and_subject_not_subject_alone(migrated_db):
@@ -480,8 +566,162 @@ def test_role_policy_and_owner_protection_rules(migrated_db):
                 fixture["users"]["owner"],
                 MembershipStatusChange(lifecycle_state="inactive"),
                 actor=owner,
-            )
+        )
         assert original_owner.lifecycle_state == "active"
+
+
+def test_onboarding_uses_centralized_owner_role_policy(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        admin = security.context_from_claims(
+            fixture["organization_id"],
+            _claims(fixture["subjects"]["admin"]),
+            request_id="req-admin",
+        )
+        owner = security.context_from_claims(
+            fixture["organization_id"],
+            _claims(fixture["subjects"]["owner"]),
+            request_id="req-owner",
+        )
+
+        for role in ["viewer", "technician", "engineer", "admin"]:
+            result = security.onboard_user_identity(
+                fixture["organization_id"],
+                UserIdentityOnboard(
+                    email=f"new-{role}@example.com",
+                    full_name=f"New {role.title()}",
+                    identity_provider_id=fixture["idp_id"],
+                    issuer=ISSUER_A,
+                    subject=f"new-{role}-sub",
+                    role=role,
+                ),
+                actor=admin,
+            )
+            assert result["membership"].role == role
+
+        with pytest.raises(PermissionError):
+            security.onboard_user_identity(
+                fixture["organization_id"],
+                UserIdentityOnboard(
+                    email="new-owner-denied@example.com",
+                    identity_provider_id=fixture["idp_id"],
+                    issuer=ISSUER_A,
+                    subject="new-owner-denied-sub",
+                    role="owner",
+                ),
+                actor=admin,
+            )
+
+        result = security.onboard_user_identity(
+            fixture["organization_id"],
+            UserIdentityOnboard(
+                email="new-owner@example.com",
+                identity_provider_id=fixture["idp_id"],
+                issuer=ISSUER_A,
+                subject="new-owner-sub",
+                role="owner",
+            ),
+            actor=owner,
+        )
+        assert result["membership"].role == "owner"
+
+
+def test_onboarding_existing_identity_cannot_bypass_final_owner_protection(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        owner = security.context_from_claims(
+            fixture["organization_id"],
+            _claims(fixture["subjects"]["owner"]),
+            request_id="req-owner",
+        )
+        for role in ["admin", "engineer", "technician", "viewer"]:
+            membership = session.query(OrganizationMembership).filter_by(user_id=fixture["users"][role]).one()
+            membership.lifecycle_state = "inactive"
+        session.flush()
+
+        with pytest.raises(PermissionError):
+            security.onboard_user_identity(
+                fixture["organization_id"],
+                UserIdentityOnboard(
+                    email="owner@example.com",
+                    identity_provider_id=fixture["idp_id"],
+                    issuer=ISSUER_A,
+                    subject=fixture["subjects"]["owner"],
+                    role="admin",
+                ),
+                actor=owner,
+            )
+
+        owner_membership = session.query(OrganizationMembership).filter_by(user_id=fixture["users"]["owner"]).one()
+        assert owner_membership.role == "owner"
+        assert owner_membership.lifecycle_state == "active"
+
+
+def test_postgres_serializes_concurrent_final_owner_demotions(migrated_db):
+    engine, session_factory = migrated_db
+    if engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL row-lock regression requires PostgreSQL")
+
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        owner = security.context_from_claims(
+            fixture["organization_id"],
+            _claims(fixture["subjects"]["owner"]),
+            request_id="req-owner",
+        )
+        security.change_membership_role(
+            fixture["organization_id"],
+            MembershipChange(user_id=fixture["users"]["admin"], role="owner"),
+            actor=owner,
+        )
+        session.commit()
+
+    barrier = threading.Barrier(2)
+
+    def demote_self(subject: str) -> str:
+        with session_factory() as session:
+            security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+            actor = security.context_from_claims(fixture["organization_id"], _claims(subject), request_id=subject)
+            barrier.wait(timeout=10)
+            try:
+                security.change_membership_role(
+                    fixture["organization_id"],
+                    MembershipChange(user_id=actor.user_id, role="admin"),
+                    actor=actor,
+                )
+                time.sleep(0.2)
+                session.commit()
+                return "demoted"
+            except PermissionError:
+                session.rollback()
+                return "blocked"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = sorted(
+            [
+                executor.submit(demote_self, fixture["subjects"]["owner"]),
+                executor.submit(demote_self, fixture["subjects"]["admin"]),
+            ],
+            key=lambda future: future.result(),
+        )
+        outcomes = [future.result() for future in results]
+
+    with session_factory() as session:
+        active_owner_count = session.scalar(
+            text(
+                "select count(*) from organization_memberships "
+                "where organization_id = :organization_id and role = 'owner' and lifecycle_state = 'active'"
+            ),
+            {"organization_id": fixture["organization_id"]},
+        )
+
+    assert outcomes == ["blocked", "demoted"]
+    assert active_owner_count == 1
 
 
 def test_service_principal_scopes_are_machine_only(migrated_db):
@@ -552,9 +792,21 @@ def test_secret_references_do_not_expose_values_and_plaintext_source_config_is_r
             created_by_user_id=fixture["users"]["owner"],
         )
         monkeypatch.setenv("ABB_TOKEN", "super-secret-value")
-        resolved = InMemorySecretResolver({"ABB_TOKEN": "super-secret-value"}).resolve(secret)
+        memory_resolver = InMemorySecretResolver({"ABB_TOKEN": "super-secret-value"})
+        environment_resolver = EnvironmentSecretResolver()
+        resolved = memory_resolver.resolve(secret)
 
         assert resolved == "super-secret-value"
+        assert environment_resolver.resolve(secret) == "super-secret-value"
+        secret.status = "rotating"
+        assert memory_resolver.resolve(secret) == "super-secret-value"
+        assert environment_resolver.resolve(secret) == "super-secret-value"
+        for status in ["inactive", "archived"]:
+            secret.status = status
+            with pytest.raises(SecretResolutionError):
+                memory_resolver.resolve(secret)
+            with pytest.raises(SecretResolutionError):
+                environment_resolver.resolve(secret)
         payload = secret_reference_payload(secret)
         assert "locator" not in payload
         assert "super-secret-value" not in str(payload)
@@ -601,6 +853,99 @@ def test_security_configuration_rejects_dangerous_production_settings(monkeypatc
         security_settings()
     with pytest.raises(SecurityConfigurationError):
         validate_oidc_endpoint("http://127.0.0.1/jwks")
+
+
+def test_oidc_resolved_address_validation_rejects_unsafe_dns_answers(monkeypatch):
+    def resolver_for(addresses: list[str]):
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            assert host == "issuer.example"
+            assert port == 443
+            return [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))
+                for address in addresses
+            ]
+
+        return fake_getaddrinfo
+
+    monkeypatch.setattr("enterprise_security.service.socket.getaddrinfo", resolver_for(["93.184.216.34"]))
+    assert _validated_oidc_addresses("issuer.example", 443) == ("93.184.216.34",)
+
+    for address in ["127.0.0.1", "10.0.0.5", "169.254.169.254"]:
+        monkeypatch.setattr("enterprise_security.service.socket.getaddrinfo", resolver_for([address]))
+        with pytest.raises(SecurityConfigurationError):
+            _validated_oidc_addresses("issuer.example", 443)
+
+    monkeypatch.setattr(
+        "enterprise_security.service.socket.getaddrinfo",
+        resolver_for(["93.184.216.34", "127.0.0.1"]),
+    )
+    with pytest.raises(SecurityConfigurationError):
+        _validated_oidc_addresses("issuer.example", 443)
+
+
+def test_oidc_jwks_fetch_pins_validated_connection_destination(monkeypatch):
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: 11\r\n"
+        b"\r\n"
+        b'{"keys":[]}'
+    )
+    resolver_calls = []
+    connected_addresses = []
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        resolver_calls.append((host, port))
+        if len(resolver_calls) == 1:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    class FakeRawSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeTlsSocket:
+        def __init__(self):
+            self._chunks = [response, b""]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def settimeout(self, timeout):
+            assert timeout == 2.0
+
+        def sendall(self, request):
+            assert b"Host: issuer.example\r\n" in request
+
+        def recv(self, _size):
+            return self._chunks.pop(0)
+
+    class FakeSslContext:
+        def wrap_socket(self, raw_socket, *, server_hostname):
+            assert isinstance(raw_socket, FakeRawSocket)
+            assert server_hostname == "issuer.example"
+            return FakeTlsSocket()
+
+    def fake_create_connection(address, *, timeout):
+        connected_addresses.append(address)
+        assert timeout == 2.0
+        return FakeRawSocket()
+
+    monkeypatch.setattr("enterprise_security.service.socket.getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr("enterprise_security.service.socket.create_connection", fake_create_connection)
+    monkeypatch.setattr("enterprise_security.service.ssl.create_default_context", lambda: FakeSslContext())
+
+    assert _fetch_jwks_with_pinned_address("https://issuer.example/.well-known/jwks.json", timeout_seconds=2.0) == {
+        "keys": []
+    }
+    assert resolver_calls == [("issuer.example", 443)]
+    assert connected_addresses == [("93.184.216.34", 443)]
 
 
 def test_bootstrap_security_provisioning_is_idempotent_and_org_scoped(migrated_db):
@@ -746,6 +1091,120 @@ def test_authenticated_api_enforces_tenant_permissions_and_blocks_actor_spoofing
     assert any(event.required_permission == "ingestion.manage" for event in denied_events)
 
 
+def test_enterprise_model_promotions_derive_approver_from_auth_context(
+    migrated_db,
+    monkeypatch,
+    tmp_path,
+    rsa_keys,
+    jwks,
+):
+    _engine, session_factory = migrated_db
+    monkeypatch.setenv("PMS_MODEL_REGISTRY_ROOT", str(tmp_path / "models"))
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        _seed_ml_training_features(session, fixture)
+        service = MLPlatformService(session, ModelArtifactStore(tmp_path / "models"))
+        dataset = service.create_dataset_version(
+            fixture["organization_id"],
+            DatasetVersionCreate(
+                name="bearing-rul-features",
+                version="security-v1",
+                feature_names=["scalar.rms"],
+                target_provenance_key="target_rul_hours",
+                validation_group_provenance_key="validation_group",
+            ),
+        )
+        experiment = service.run_experiment(
+            fixture["organization_id"],
+            ExperimentCreate(
+                dataset_version_id=dataset.id,
+                name="security promotion provenance",
+                training_config={"n_estimators": 5, "random_state": 17},
+            ),
+        )
+        registry = service.create_registry(
+            fixture["organization_id"],
+            RegistryCreate(name="security-bearing-rul", task="rul_regression"),
+        )
+        validated_model = _register_candidate_model(
+            service,
+            fixture["organization_id"],
+            experiment.id,
+            registry.id,
+            "validated-spoof",
+        )
+        rejected_model = _register_candidate_model(
+            service,
+            fixture["organization_id"],
+            experiment.id,
+            registry.id,
+            "rejected-spoof",
+        )
+        production_model = _register_candidate_model(
+            service,
+            fixture["organization_id"],
+            experiment.id,
+            registry.id,
+            "production-spoof",
+        )
+        session.commit()
+
+    _app_main, client = _enterprise_app(monkeypatch, session_factory, jwks=jwks)
+
+    def auth(subject: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {_token(rsa_keys['primary'], subject=subject)}"}
+
+    org_id = fixture["organization_id"]
+    outsider_user_id = fixture["users"]["outsider"]
+    engineer_headers = auth(fixture["subjects"]["engineer"])
+    owner_headers = auth(fixture["subjects"]["owner"])
+
+    validated = client.post(
+        f"/api/ml/{org_id}/model-versions/{validated_model.id}/promote",
+        headers=engineer_headers,
+        json={"target_stage": "validated", "approved_by_user_id": outsider_user_id},
+    )
+    rejected = client.post(
+        f"/api/ml/{org_id}/model-versions/{rejected_model.id}/promote",
+        headers=engineer_headers,
+        json={"target_stage": "rejected", "approved_by_user_id": outsider_user_id},
+    )
+    production_ready = client.post(
+        f"/api/ml/{org_id}/model-versions/{production_model.id}/promote",
+        headers=engineer_headers,
+        json={"target_stage": "validated", "approved_by_user_id": outsider_user_id},
+    )
+    forbidden_production = client.post(
+        f"/api/ml/{org_id}/model-versions/{production_model.id}/promote",
+        headers=engineer_headers,
+        json={"target_stage": "production", "approved_by_user_id": outsider_user_id},
+    )
+    production = client.post(
+        f"/api/ml/{org_id}/model-versions/{production_model.id}/promote",
+        headers=owner_headers,
+        json={"target_stage": "production", "approved_by_user_id": outsider_user_id},
+    )
+
+    assert validated.status_code == 200
+    assert rejected.status_code == 200
+    assert production_ready.status_code == 200
+    assert forbidden_production.status_code == 403
+    assert production.status_code == 200
+
+    with session_factory() as session:
+        events = session.query(MLModelPromotionEvent).filter_by(organization_id=org_id).all()
+        approver_by_target = {
+            (event.model_version_id, event.to_stage): event.approved_by_user_id
+            for event in events
+        }
+
+    assert approver_by_target[(validated_model.id, "validated")] == fixture["users"]["engineer"]
+    assert approver_by_target[(rejected_model.id, "rejected")] == fixture["users"]["engineer"]
+    assert approver_by_target[(production_model.id, "validated")] == fixture["users"]["engineer"]
+    assert approver_by_target[(production_model.id, "production")] == fixture["users"]["owner"]
+    assert outsider_user_id not in approver_by_target.values()
+
+
 def test_enterprise_app_reuses_oidc_verifier_jwks_cache(migrated_db, monkeypatch, rsa_keys, jwks):
     _engine, session_factory = migrated_db
     with session_factory() as session:
@@ -807,6 +1266,32 @@ def test_cors_allows_patch_and_request_ids_are_bounded(migrated_db, monkeypatch)
     assert "PATCH" in preflight.headers["access-control-allow-methods"]
     assert too_long_request_id.status_code == 400
     assert malformed_request_id.status_code == 400
+
+
+def test_audited_http_paths_are_bounded(migrated_db, monkeypatch, rsa_keys, jwks):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        session.commit()
+
+    _app_main, client = _enterprise_app(monkeypatch, session_factory, jwks=jwks)
+    headers = {"Authorization": f"Bearer {_token(rsa_keys['primary'], subject='owner-sub')}"}
+    valid_path = f"/api/security/{fixture['organization_id']}/me"
+    oversized_path = f"{valid_path}/{'x' * (MAX_AUDIT_HTTP_PATH_LENGTH + 1)}"
+
+    valid = client.get(valid_path, headers=headers)
+    oversized = client.get(oversized_path, headers=headers)
+
+    assert len(valid_path) <= MAX_AUDIT_HTTP_PATH_LENGTH
+    assert valid.status_code == 200
+    assert oversized.status_code == 414
+    assert oversized.status_code not in {500, 503}
+
+    with session_factory() as session:
+        paths = [event.http_path for event in session.query(SecurityAuditEvent).all() if event.http_path]
+
+    assert valid_path in paths
+    assert all(len(path) <= MAX_AUDIT_HTTP_PATH_LENGTH for path in paths)
 
 
 def test_health_endpoints_commit_successful_authorization_audits(migrated_db, monkeypatch, rsa_keys, jwks):
@@ -925,6 +1410,40 @@ def test_security_admin_api_onboards_users_updates_idps_and_rotates_secrets(
     assert idp.status == "inactive"
     assert secret.status == "rotating"
     assert secret.rotation_metadata["new_token"] == "[REDACTED]"
+
+
+def test_service_principal_patch_unknown_and_cross_tenant_are_generic_403(
+    migrated_db,
+    monkeypatch,
+    rsa_keys,
+    jwks,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        other_principal = SecurityService(session).create_service_principal(
+            fixture["other_organization_id"],
+            ServicePrincipalCreate(
+                name="other-robot",
+                external_subject="other-robot-sub",
+                issuer=ISSUER_A,
+                permissions=[INGESTION_WRITE],
+            ),
+        )
+        session.commit()
+
+    _app_main, client = _enterprise_app(monkeypatch, session_factory, jwks=jwks)
+    headers = {"Authorization": f"Bearer {_token(rsa_keys['primary'], subject='owner-sub')}"}
+    org_id = fixture["organization_id"]
+
+    for principal_id in ["00000000-0000-4000-8000-000000000000", other_principal.id]:
+        response = client.patch(
+            f"/api/security/{org_id}/service-principals/{principal_id}",
+            headers=headers,
+            json={"status": "inactive"},
+        )
+        assert response.status_code == 403
+        assert response.json() == {"detail": "not authorized for this organization"}
 
 
 def test_service_principal_cannot_create_human_note_via_api(migrated_db, monkeypatch, rsa_keys, jwks):

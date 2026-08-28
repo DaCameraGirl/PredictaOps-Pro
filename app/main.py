@@ -65,6 +65,7 @@ from enterprise_security.permissions import (
     SERVING_PREDICT,
 )
 from enterprise_security.service import (
+    MAX_AUDIT_HTTP_PATH_LENGTH,
     AuthenticationError,
     AuthorizationError,
     OidcTokenVerifier,
@@ -154,6 +155,8 @@ app.add_middleware(
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
+    if len(request.url.path) > MAX_AUDIT_HTTP_PATH_LENGTH:
+        return JSONResponse(status_code=414, content={"detail": "URI path is too long"})
     supplied_request_id = request.headers.get("X-Request-ID")
     if supplied_request_id is not None and not REQUEST_ID_PATTERN.fullmatch(supplied_request_id):
         return JSONResponse(
@@ -627,14 +630,14 @@ def update_identity_provider(
 def onboard_user_identity(organization_id: str, request: UserIdentityOnboard, http_request: Request):
     with SessionLocal() as session:
         try:
-            _authorize(
+            context = _authorize(
                 session,
                 http_request,
                 organization_id,
                 SECURITY_MANAGE,
                 action="security.user_identity.onboard",
             )
-            result = _security_service(session).onboard_user_identity(organization_id, request)
+            result = _security_service(session).onboard_user_identity(organization_id, request, actor=context)
             session.commit()
             user = result["user"]
             return {
@@ -780,6 +783,9 @@ def update_service_principal(
             principal = _security_service(session).update_service_principal(organization_id, principal_id, request)
             session.commit()
             return service_principal_payload(principal)
+        except AuthorizationError as exc:
+            session.commit()
+            raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
         except ValueError as exc:
             session.rollback()
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1213,7 +1219,7 @@ def promote_ml_model_version(
                 else ML_MODEL_PROMOTE_VALIDATED
             )
             context = _authorize(session, http_request, organization_id, permission, action="ml.model.promote")
-            if _enterprise_security_enabled() and request.target_stage == "production":
+            if _enterprise_security_enabled():
                 request = request.model_copy(update={"approved_by_user_id": _authenticated_user_id(context, None)})
             model_version = MLPlatformService(session).promote_model_version(
                 organization_id,
