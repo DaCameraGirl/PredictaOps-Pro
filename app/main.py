@@ -32,6 +32,36 @@ from degradation_signal import DegradationSignal
 from explain_bearing import BearingRulExplainer
 from industrial_ingestion.contracts import SourceRegistration
 from industrial_ingestion.service import IngestionService
+from maintenance_operations.contracts import (
+    AlertAcknowledgeRequest,
+    AlertResolveRequest,
+    CaseCreate,
+    CaseCreateFromAlertRequest,
+    CaseTransitionRequest,
+    CmmsSyncRequest,
+    InspectionCancelRequest,
+    InspectionCompleteRequest,
+    InspectionRequestCreate,
+    InspectionStartRequest,
+    NoteCreate,
+    PredictionAlertEvaluationRequest,
+    ResolutionCreate,
+    WorkOrderApproveRequest,
+    WorkOrderCancelRequest,
+    WorkOrderCompleteRequest,
+    WorkOrderCreate,
+    WorkOrderStartRequest,
+)
+from maintenance_operations.service import (
+    MaintenanceOperationsService,
+    alert_payload,
+    case_payload,
+    cmms_sync_payload,
+    inspection_payload,
+    note_payload,
+    resolution_payload,
+    work_order_payload,
+)
 from ml_platform.contracts import (
     DatasetVersionCreate,
     ExperimentCreate,
@@ -605,6 +635,372 @@ def production_serving_health(organization_id: str):
     with SessionLocal() as session:
         try:
             return ProductionServingService(session).health(organization_id)
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/maintenance/{organization_id}/alerts/evaluate-prediction")
+def evaluate_maintenance_alert_from_prediction(organization_id: str, request: PredictionAlertEvaluationRequest):
+    with SessionLocal() as session:
+        try:
+            result = MaintenanceOperationsService(session).evaluate_prediction_alert(organization_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return result.model_dump()
+
+
+@app.get("/api/maintenance/{organization_id}/alerts")
+def list_maintenance_alerts(organization_id: str, status: str | None = None):
+    with SessionLocal() as session:
+        try:
+            return {"alerts": MaintenanceOperationsService(session).list_alerts(organization_id, status=status)}
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.get("/api/maintenance/{organization_id}/alerts/{alert_id}")
+def get_maintenance_alert(organization_id: str, alert_id: str):
+    with SessionLocal() as session:
+        try:
+            return MaintenanceOperationsService(session).get_alert(organization_id, alert_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/maintenance/{organization_id}/alerts/{alert_id}/acknowledge")
+def acknowledge_maintenance_alert(organization_id: str, alert_id: str, request: AlertAcknowledgeRequest):
+    with SessionLocal() as session:
+        try:
+            alert = MaintenanceOperationsService(session).acknowledge_alert(organization_id, alert_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return alert_payload(alert)
+
+
+@app.post("/api/maintenance/{organization_id}/alerts/{alert_id}/resolve")
+def resolve_maintenance_alert(organization_id: str, alert_id: str, request: AlertResolveRequest):
+    with SessionLocal() as session:
+        try:
+            alert = MaintenanceOperationsService(session).resolve_alert(organization_id, alert_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return alert_payload(alert)
+
+
+@app.post("/api/maintenance/{organization_id}/cases")
+def open_maintenance_case(organization_id: str, request: CaseCreate):
+    with SessionLocal() as session:
+        try:
+            case = MaintenanceOperationsService(session).open_case(organization_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return case_payload(case)
+
+
+@app.post("/api/maintenance/{organization_id}/alerts/{alert_id}/case")
+def open_maintenance_case_from_alert(organization_id: str, alert_id: str, request: CaseCreateFromAlertRequest):
+    with SessionLocal() as session:
+        try:
+            case = MaintenanceOperationsService(session).open_case_from_alert(organization_id, alert_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return case_payload(case)
+
+
+@app.get("/api/maintenance/{organization_id}/cases")
+def list_maintenance_cases(organization_id: str, status: str | None = None):
+    with SessionLocal() as session:
+        try:
+            return {"cases": MaintenanceOperationsService(session).list_cases(organization_id, status=status)}
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.get("/api/maintenance/{organization_id}/cases/{case_id}")
+def get_maintenance_case(organization_id: str, case_id: str):
+    with SessionLocal() as session:
+        try:
+            return MaintenanceOperationsService(session).get_case(organization_id, case_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/maintenance/{organization_id}/cases/{case_id}/transition")
+def transition_maintenance_case(organization_id: str, case_id: str, request: CaseTransitionRequest):
+    with SessionLocal() as session:
+        try:
+            case = MaintenanceOperationsService(session).transition_case(organization_id, case_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return case_payload(case)
+
+
+@app.post("/api/maintenance/{organization_id}/cases/{case_id}/inspections")
+def request_maintenance_inspection(organization_id: str, case_id: str, request: InspectionRequestCreate):
+    with SessionLocal() as session:
+        try:
+            inspection = MaintenanceOperationsService(session).request_inspection(organization_id, case_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return inspection_payload(inspection)
+
+
+@app.post("/api/maintenance/{organization_id}/inspections/{inspection_id}/start")
+def start_maintenance_inspection(organization_id: str, inspection_id: str, request: InspectionStartRequest):
+    with SessionLocal() as session:
+        try:
+            inspection = MaintenanceOperationsService(session).start_inspection(organization_id, inspection_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return inspection_payload(inspection)
+
+
+@app.post("/api/maintenance/{organization_id}/inspections/{inspection_id}/complete")
+def complete_maintenance_inspection(organization_id: str, inspection_id: str, request: InspectionCompleteRequest):
+    with SessionLocal() as session:
+        try:
+            inspection = MaintenanceOperationsService(session).complete_inspection(
+                organization_id,
+                inspection_id,
+                request,
+            )
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return inspection_payload(inspection)
+
+
+@app.post("/api/maintenance/{organization_id}/inspections/{inspection_id}/cancel")
+def cancel_maintenance_inspection(organization_id: str, inspection_id: str, request: InspectionCancelRequest):
+    with SessionLocal() as session:
+        try:
+            inspection = MaintenanceOperationsService(session).cancel_inspection(
+                organization_id,
+                inspection_id,
+                request,
+            )
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return inspection_payload(inspection)
+
+
+@app.post("/api/maintenance/{organization_id}/cases/{case_id}/notes")
+def add_maintenance_note(organization_id: str, case_id: str, request: NoteCreate):
+    with SessionLocal() as session:
+        try:
+            note = MaintenanceOperationsService(session).add_note(organization_id, case_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return note_payload(note)
+
+
+@app.get("/api/maintenance/{organization_id}/cases/{case_id}/notes")
+def list_maintenance_notes(organization_id: str, case_id: str):
+    with SessionLocal() as session:
+        try:
+            return {"notes": MaintenanceOperationsService(session).list_notes(organization_id, case_id)}
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/maintenance/{organization_id}/cases/{case_id}/work-orders")
+def create_maintenance_work_order(organization_id: str, case_id: str, request: WorkOrderCreate):
+    with SessionLocal() as session:
+        try:
+            work_order = MaintenanceOperationsService(session).create_work_order(organization_id, case_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return work_order_payload(work_order)
+
+
+@app.post("/api/maintenance/{organization_id}/work-orders/{work_order_id}/approve")
+def approve_maintenance_work_order(organization_id: str, work_order_id: str, request: WorkOrderApproveRequest):
+    with SessionLocal() as session:
+        try:
+            work_order = MaintenanceOperationsService(session).approve_work_order(
+                organization_id,
+                work_order_id,
+                request,
+            )
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return work_order_payload(work_order)
+
+
+@app.post("/api/maintenance/{organization_id}/work-orders/{work_order_id}/start")
+def start_maintenance_work_order(organization_id: str, work_order_id: str, request: WorkOrderStartRequest):
+    with SessionLocal() as session:
+        try:
+            work_order = MaintenanceOperationsService(session).start_work_order(organization_id, work_order_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return work_order_payload(work_order)
+
+
+@app.post("/api/maintenance/{organization_id}/work-orders/{work_order_id}/complete")
+def complete_maintenance_work_order(organization_id: str, work_order_id: str, request: WorkOrderCompleteRequest):
+    with SessionLocal() as session:
+        try:
+            work_order = MaintenanceOperationsService(session).complete_work_order(
+                organization_id,
+                work_order_id,
+                request,
+            )
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return work_order_payload(work_order)
+
+
+@app.post("/api/maintenance/{organization_id}/work-orders/{work_order_id}/cancel")
+def cancel_maintenance_work_order(organization_id: str, work_order_id: str, request: WorkOrderCancelRequest):
+    with SessionLocal() as session:
+        try:
+            work_order = MaintenanceOperationsService(session).cancel_work_order(
+                organization_id,
+                work_order_id,
+                request,
+            )
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return work_order_payload(work_order)
+
+
+@app.post("/api/maintenance/{organization_id}/work-orders/{work_order_id}/cmms-sync")
+def sync_maintenance_work_order_to_cmms(organization_id: str, work_order_id: str, request: CmmsSyncRequest):
+    with SessionLocal() as session:
+        try:
+            sync = MaintenanceOperationsService(session).sync_work_order_to_cmms(
+                organization_id,
+                work_order_id,
+                request,
+            )
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return cmms_sync_payload(sync)
+
+
+@app.get("/api/maintenance/{organization_id}/work-orders/{work_order_id}/cmms-sync")
+def list_maintenance_work_order_cmms_syncs(organization_id: str, work_order_id: str):
+    with SessionLocal() as session:
+        try:
+            syncs = MaintenanceOperationsService(session).list_cmms_sync_records(organization_id, work_order_id)
+            return {"sync_records": syncs}
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/maintenance/{organization_id}/cases/{case_id}/resolve")
+def resolve_maintenance_case(organization_id: str, case_id: str, request: ResolutionCreate):
+    with SessionLocal() as session:
+        try:
+            resolution = MaintenanceOperationsService(session).resolve_case(organization_id, case_id, request)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return resolution_payload(resolution)
+
+
+@app.get("/api/maintenance/{organization_id}/health")
+def maintenance_operations_health(organization_id: str):
+    with SessionLocal() as session:
+        try:
+            return MaintenanceOperationsService(session).health(organization_id)
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
