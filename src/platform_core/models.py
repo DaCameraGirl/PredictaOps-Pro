@@ -11,10 +11,12 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -794,6 +796,24 @@ class ModelServingBinding(Base, TimestampMixin):
     __tablename__ = "model_serving_bindings"
     __table_args__ = (
         UniqueConstraint("organization_id", "id", name="uq_model_serving_bindings_org_id"),
+        Index(
+            "uq_active_model_serving_binding_scope_id",
+            "organization_id",
+            "registry_id",
+            "scope_type",
+            "scope_id",
+            unique=True,
+            sqlite_where=text("status = 'active' AND scope_id IS NOT NULL"),
+            postgresql_where=text("status = 'active' AND scope_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_active_model_serving_binding_org_scope",
+            "organization_id",
+            "registry_id",
+            unique=True,
+            sqlite_where=text("status = 'active' AND scope_type = 'organization' AND scope_id IS NULL"),
+            postgresql_where=text("status = 'active' AND scope_type = 'organization' AND scope_id IS NULL"),
+        ),
         ForeignKeyConstraint(
             ["organization_id", "registry_id"],
             ["ml_model_registries.organization_id", "ml_model_registries.id"],
