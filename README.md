@@ -221,7 +221,10 @@ successful external provider cannot silently switch providers. Later CMMS
 operations without an explicit provider automatically use the bound provider.
 External create success requires a non-empty external ID; update, cancel, and
 close preserve the existing bound external ID when the adapter does not echo it
-and fail closed if the adapter returns a different ID.
+and fail closed if the adapter returns a different ID. Adapter timeouts and
+runtime failures are persisted as `timeout` or `failed` sync records with
+client-safe error details and without mutating any existing CMMS provider or
+external ID binding.
 
 Useful maintenance endpoints:
 

@@ -63,6 +63,7 @@ WORK_ORDER_TRANSITIONS = {
     "completed": set(),
     "cancelled": set(),
 }
+VALID_CMMS_SYNC_STATUSES = {"not_configured", "succeeded", "failed", "timeout", "skipped"}
 
 
 class MaintenanceOperationsError(ValueError):
@@ -596,7 +597,61 @@ class MaintenanceOperationsService:
                         "source_sync_record_id": existing_success.id,
                     },
                 )
-        result = adapter.sync(operation, work_order, idempotency_key=idempotency_key)
+        try:
+            result = adapter.sync(operation, work_order, idempotency_key=idempotency_key)
+        except TimeoutError:
+            return self.repo.create_cmms_sync_record(
+                organization_id,
+                work_order_id=work_order.id,
+                provider_name=provider_name,
+                initiator_type="user",
+                initiated_by_user_id=request.initiated_by_user_id,
+                operation=operation,
+                idempotency_key=idempotency_key,
+                status="timeout",
+                external_id=work_order.cmms_external_id,
+                error_category="timeout",
+                error_message="CMMS adapter timed out during sync",
+                completed_at=datetime.now(UTC),
+                attempt_metadata=request.attempt_metadata,
+            )
+        except Exception:
+            return self.repo.create_cmms_sync_record(
+                organization_id,
+                work_order_id=work_order.id,
+                provider_name=provider_name,
+                initiator_type="user",
+                initiated_by_user_id=request.initiated_by_user_id,
+                operation=operation,
+                idempotency_key=idempotency_key,
+                status="failed",
+                external_id=work_order.cmms_external_id,
+                error_category="adapter_error",
+                error_message="CMMS adapter failed during sync",
+                completed_at=datetime.now(UTC),
+                attempt_metadata=request.attempt_metadata,
+            )
+
+        if result.status not in VALID_CMMS_SYNC_STATUSES:
+            return self.repo.create_cmms_sync_record(
+                organization_id,
+                work_order_id=work_order.id,
+                provider_name=provider_name,
+                initiator_type="user",
+                initiated_by_user_id=request.initiated_by_user_id,
+                operation=operation,
+                idempotency_key=idempotency_key,
+                status="failed",
+                external_id=work_order.cmms_external_id,
+                error_category="invalid_adapter_result",
+                error_message="CMMS adapter returned an unsupported sync status",
+                completed_at=datetime.now(UTC),
+                attempt_metadata={
+                    **request.attempt_metadata,
+                    **(result.metadata or {}),
+                    "adapter_reported_status": result.status,
+                },
+            )
         external_id = _normalized_external_id(result.external_id)
         if result.status == "succeeded":
             invalid_adapter_message = _invalid_successful_cmms_result(operation, work_order, external_id)

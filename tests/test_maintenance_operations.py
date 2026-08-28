@@ -105,6 +105,56 @@ class MismatchedExternalIdCmmsAdapter:
         return CmmsAdapterResult(status="succeeded", external_id="B-999", external_status=operation)
 
 
+class TimeoutCmmsAdapter:
+    provider_name = "timeout-test"
+
+    def __init__(self):
+        self.calls: list[dict[str, str]] = []
+
+    def sync(self, operation, work_order, *, idempotency_key):
+        self.calls.append({"operation": operation, "idempotency_key": idempotency_key})
+        raise TimeoutError("timeout while using credential secret-token")
+
+
+class CreateThenTimeoutCmmsAdapter:
+    provider_name = "create-then-timeout-test"
+
+    def __init__(self):
+        self.calls: list[dict[str, str]] = []
+
+    def sync(self, operation, work_order, *, idempotency_key):
+        self.calls.append({"operation": operation, "idempotency_key": idempotency_key})
+        if operation == "create":
+            return CmmsAdapterResult(status="succeeded", external_id="A-123", external_status="created")
+        raise TimeoutError("timeout while updating secret-token")
+
+
+class FailingCmmsAdapter:
+    provider_name = "failing-test"
+
+    def __init__(self):
+        self.calls: list[dict[str, str]] = []
+
+    def sync(self, operation, work_order, *, idempotency_key):
+        self.calls.append({"operation": operation, "idempotency_key": idempotency_key})
+        raise RuntimeError("adapter failed with password=secret-token")
+
+
+class UnsupportedStatusCmmsAdapter:
+    provider_name = "unsupported-status-test"
+
+    def __init__(self):
+        self.calls: list[dict[str, str]] = []
+
+    def sync(self, operation, work_order, *, idempotency_key):
+        self.calls.append({"operation": operation, "idempotency_key": idempotency_key})
+        return CmmsAdapterResult(
+            status="made_up_status",
+            external_id="SHOULD-NOT-BIND",
+            metadata={"idempotency_key": idempotency_key},
+        )
+
+
 @pytest.fixture
 def migrated_db(tmp_path, monkeypatch):
     external_url = os.environ.get("PMS_PLATFORM_CORE_TEST_DATABASE_URL")
@@ -1208,6 +1258,173 @@ def test_cmms_non_create_success_with_different_external_id_fails_closed(migrate
         assert work_order.cmms_provider == adapter.provider_name
         assert work_order.cmms_external_id == "A-123"
         assert [call["operation"] for call in adapter.calls] == ["create", "update"]
+
+
+def test_cmms_create_timeout_persists_timeout_record_without_external_id(migrated_db, maintenance_fixture):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        adapter = TimeoutCmmsAdapter()
+        service = MaintenanceOperationsService(session, cmms_adapters={adapter.provider_name: adapter})
+        work_order = _draft_work_order(service, maintenance_fixture)
+        sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="create",
+                provider_name=adapter.provider_name,
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        session.commit()
+
+        assert sync.status == "timeout"
+        assert sync.provider_name == adapter.provider_name
+        assert sync.external_id is None
+        assert sync.error_category == "timeout"
+        assert "secret" not in sync.error_message.lower()
+        assert work_order.cmms_provider is None
+        assert work_order.cmms_external_id is None
+        assert len(adapter.calls) == 1
+
+
+def test_cmms_bound_provider_update_timeout_preserves_existing_external_id(
+    migrated_db,
+    maintenance_fixture,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        adapter = CreateThenTimeoutCmmsAdapter()
+        alternate = AlternateDeterministicCmmsAdapter()
+        service = MaintenanceOperationsService(
+            session,
+            cmms_adapters={adapter.provider_name: adapter, alternate.provider_name: alternate},
+        )
+        work_order = _draft_work_order(service, maintenance_fixture)
+        create_sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="create",
+                provider_name=adapter.provider_name,
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        update_sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="update",
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        with pytest.raises(ValueError, match="already bound to a different CMMS provider"):
+            service.sync_work_order_to_cmms(
+                maintenance_fixture["organization_id"],
+                work_order.id,
+                CmmsSyncRequest(
+                    operation="update",
+                    provider_name=alternate.provider_name,
+                    initiated_by_user_id=maintenance_fixture["technician_id"],
+                ),
+            )
+        session.commit()
+
+        assert create_sync.status == "succeeded"
+        assert create_sync.external_id == "A-123"
+        assert update_sync.status == "timeout"
+        assert update_sync.provider_name == adapter.provider_name
+        assert update_sync.external_id == "A-123"
+        assert update_sync.error_category == "timeout"
+        assert work_order.cmms_provider == adapter.provider_name
+        assert work_order.cmms_external_id == "A-123"
+        assert [call["operation"] for call in adapter.calls] == ["create", "update"]
+        assert len(alternate.calls) == 0
+
+
+def test_cmms_generic_adapter_exception_persists_failed_record_without_leaking_details(
+    migrated_db,
+    maintenance_fixture,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        adapter = FailingCmmsAdapter()
+        service = MaintenanceOperationsService(session, cmms_adapters={adapter.provider_name: adapter})
+        work_order = _draft_work_order(service, maintenance_fixture)
+        sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="create",
+                provider_name=adapter.provider_name,
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        session.commit()
+
+        assert sync.status == "failed"
+        assert sync.error_category == "adapter_error"
+        assert "secret" not in sync.error_message.lower()
+        assert "password" not in sync.error_message.lower()
+        assert sync.external_id is None
+        assert work_order.cmms_provider is None
+        assert work_order.cmms_external_id is None
+        assert len(adapter.calls) == 1
+
+
+def test_cmms_unsupported_adapter_status_becomes_failed_invalid_adapter_result(
+    migrated_db,
+    maintenance_fixture,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        adapter = UnsupportedStatusCmmsAdapter()
+        service = MaintenanceOperationsService(session, cmms_adapters={adapter.provider_name: adapter})
+        work_order = _draft_work_order(service, maintenance_fixture)
+        sync = service.sync_work_order_to_cmms(
+            maintenance_fixture["organization_id"],
+            work_order.id,
+            CmmsSyncRequest(
+                operation="create",
+                provider_name=adapter.provider_name,
+                initiated_by_user_id=maintenance_fixture["technician_id"],
+            ),
+        )
+        session.commit()
+
+        assert sync.status == "failed"
+        assert sync.error_category == "invalid_adapter_result"
+        assert sync.error_message == "CMMS adapter returned an unsupported sync status"
+        assert sync.external_id is None
+        assert sync.attempt_metadata["adapter_reported_status"] == "made_up_status"
+        assert work_order.cmms_provider is None
+        assert work_order.cmms_external_id is None
+        assert len(adapter.calls) == 1
+
+
+def test_cmms_timeout_retry_reuses_provider_aware_idempotency_key(migrated_db, maintenance_fixture):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        adapter = TimeoutCmmsAdapter()
+        service = MaintenanceOperationsService(session, cmms_adapters={adapter.provider_name: adapter})
+        work_order = _draft_work_order(service, maintenance_fixture)
+        request = CmmsSyncRequest(
+            operation="create",
+            provider_name=adapter.provider_name,
+            initiated_by_user_id=maintenance_fixture["technician_id"],
+        )
+
+        first = service.sync_work_order_to_cmms(maintenance_fixture["organization_id"], work_order.id, request)
+        second = service.sync_work_order_to_cmms(maintenance_fixture["organization_id"], work_order.id, request)
+        session.commit()
+
+        assert first.status == "timeout"
+        assert second.status == "timeout"
+        assert first.idempotency_key == second.idempotency_key
+        assert adapter.calls[0]["idempotency_key"] == adapter.calls[1]["idempotency_key"]
+        assert first.provider_name == adapter.provider_name
+        assert second.provider_name == adapter.provider_name
+        assert work_order.cmms_provider is None
+        assert work_order.cmms_external_id is None
 
 
 def test_api_full_maintenance_workflow(migrated_db, maintenance_fixture):
