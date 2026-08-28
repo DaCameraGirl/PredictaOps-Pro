@@ -69,6 +69,7 @@ def upgrade() -> None:
             ["organization_identity_providers.organization_id", "organization_identity_providers.id"],
         ),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("issuer", "subject", name="uq_user_identity_global_issuer_subject"),
         sa.UniqueConstraint("identity_provider_id", "subject", name="uq_user_identity_provider_subject"),
         sa.UniqueConstraint("organization_id", "issuer", "subject", name="uq_user_identity_org_issuer_subject"),
     )

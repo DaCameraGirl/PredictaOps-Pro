@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from alembic import command
@@ -355,6 +356,9 @@ def test_migration_creates_enterprise_security_tables(migrated_db):
     engine, _session_factory = migrated_db
     tables = set(inspect(engine).get_table_names())
     columns = {column["name"]: column for column in inspect(engine).get_columns("service_principals")}
+    identity_constraints = {
+        constraint["name"] for constraint in inspect(engine).get_unique_constraints("user_identities")
+    }
 
     assert {
         "organization_identity_providers",
@@ -364,6 +368,7 @@ def test_migration_creates_enterprise_security_tables(migrated_db):
         "security_audit_events",
     }.issubset(tables)
     assert columns["issuer"]["nullable"] is False
+    assert "uq_user_identity_global_issuer_subject" in identity_constraints
 
 
 def test_oidc_verifier_accepts_valid_signed_token_and_rejects_bad_tokens(migrated_db, rsa_keys, jwks):
@@ -480,6 +485,57 @@ def test_malformed_jwks_entries_fail_closed_as_authentication_errors(migrated_db
             verifier.verify(valid_token, idp)
 
 
+def test_oidc_verifier_enforces_jwk_signing_restrictions_and_normalizes_numeric_dates(
+    migrated_db,
+    rsa_keys,
+    jwks,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        idp = SecurityService(session).get_identity_provider(fixture["organization_id"], fixture["idp_id"])
+        verifier = OidcTokenVerifier()
+        valid_token = _token(rsa_keys["primary"], subject="owner-sub")
+
+        base_key = jwks["keys"][0]
+        for restricted_key in [
+            {**base_key, "use": "enc"},
+            {**base_key, "key_ops": ["sign"]},
+            {**base_key, "key_ops": "verify"},
+            {**base_key, "alg": "RS384"},
+        ]:
+            verifier._jwks_cache[idp.jwks_uri] = ({"keys": [restricted_key]}, datetime.now(UTC))
+            with pytest.raises(AuthenticationError):
+                verifier.verify(valid_token, idp)
+
+        verifier._jwks_cache[idp.jwks_uri] = (
+            {"keys": [{**base_key, "key_ops": ["verify"]}]},
+            datetime.now(UTC),
+        )
+        assert verifier.verify(valid_token, idp).subject == "owner-sub"
+
+        now = datetime.now(UTC).timestamp()
+        fractional_numeric_date_token = jwt.encode(
+            {
+                "iss": ISSUER_A,
+                "aud": AUDIENCE,
+                "sub": "owner-sub",
+                "iat": now,
+                "nbf": now - 1.25,
+                "exp": now + 600.75,
+            },
+            rsa_keys["primary"],
+            algorithm="RS256",
+            headers={"kid": "primary"},
+        )
+        verifier._jwks_cache[idp.jwks_uri] = (jwks, datetime.now(UTC))
+        claims = verifier.verify(fractional_numeric_date_token, idp)
+
+        assert claims.subject == "owner-sub"
+        assert isinstance(claims.expires_at, int)
+        assert isinstance(claims.not_before, int)
+
+
 def test_identity_resolution_uses_issuer_and_subject_not_subject_alone(migrated_db):
     _engine, session_factory = migrated_db
     with session_factory() as session:
@@ -518,6 +574,106 @@ def test_identity_resolution_uses_issuer_and_subject_not_subject_alone(migrated_
         context = security.context_from_claims(org_b.id, _claims("same-sub", issuer=ISSUER_B), request_id="req")
 
         assert context.user_id == user_b.id
+
+
+def test_authentication_binds_identity_to_verifying_provider(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        repo = PlatformRepository(session)
+        org = repo.create_organization(OrganizationCreate(slug="provider-binding", name="Provider Binding"))
+        user = repo.create_user(UserCreate(email="provider-user@example.com"))
+        repo.add_membership(org.id, user.id, "viewer")
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        idp_a = security.create_identity_provider(
+            org.id,
+            IdentityProviderCreate(name="primary", issuer=ISSUER_A, audience="audience-a", jwks_uri=JWKS_URI),
+            allow_development_targets=True,
+        )
+        idp_b = security.create_identity_provider(
+            org.id,
+            IdentityProviderCreate(name="secondary", issuer=ISSUER_A, audience="audience-b", jwks_uri=JWKS_URI),
+            allow_development_targets=True,
+        )
+        security.create_user_identity(
+            org.id,
+            UserIdentityCreate(
+                user_id=user.id,
+                identity_provider_id=idp_a.id,
+                issuer=ISSUER_A,
+                subject="shared-sub",
+            ),
+        )
+        token = "verified-by-provider-b"
+        security.verifier = DeterministicTokenVerifier(
+            {
+                token: TokenClaims(
+                    issuer=ISSUER_A,
+                    subject="shared-sub",
+                    audience="audience-b",
+                    expires_at=int((datetime.now(UTC) + timedelta(minutes=5)).timestamp()),
+                    algorithm="RS256",
+                    key_id="primary",
+                )
+            }
+        )
+
+        with pytest.raises(PermissionError):
+            security.authenticate_bearer(org.id, token, request_id="req-provider-b")
+
+        assert security.context_from_claims(
+            org.id,
+            _claims("shared-sub", audience="audience-a"),
+            request_id="req-provider-a",
+            identity_provider_id=idp_a.id,
+        ).user_id == user.id
+        with pytest.raises(PermissionError):
+            security.context_from_claims(
+                org.id,
+                _claims("shared-sub", audience="audience-b"),
+                request_id="req-provider-b",
+                identity_provider_id=idp_b.id,
+            )
+
+
+def test_global_identity_binding_is_database_enforced(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        repo = PlatformRepository(session)
+        org_a = repo.create_organization(OrganizationCreate(slug="global-a", name="Global A"))
+        org_b = repo.create_organization(OrganizationCreate(slug="global-b", name="Global B"))
+        user_a = repo.create_user(UserCreate(email="global-a@example.com"))
+        user_b = repo.create_user(UserCreate(email="global-b@example.com"))
+        repo.add_membership(org_a.id, user_a.id, "viewer")
+        repo.add_membership(org_b.id, user_b.id, "viewer")
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        idp_a = security.create_identity_provider(
+            org_a.id,
+            IdentityProviderCreate(name="primary", issuer=ISSUER_A, audience=AUDIENCE, jwks_uri=JWKS_URI),
+            allow_development_targets=True,
+        )
+        idp_b = security.create_identity_provider(
+            org_b.id,
+            IdentityProviderCreate(name="primary", issuer=ISSUER_A, audience=AUDIENCE, jwks_uri=JWKS_URI),
+            allow_development_targets=True,
+        )
+        security.create_user_identity(
+            org_a.id,
+            UserIdentityCreate(user_id=user_a.id, identity_provider_id=idp_a.id, issuer=ISSUER_A, subject="global-sub"),
+        )
+        session.flush()
+
+        with pytest.raises(IntegrityError):
+            session.add(
+                UserIdentity(
+                    organization_id=org_b.id,
+                    user_id=user_b.id,
+                    identity_provider_id=idp_b.id,
+                    issuer=ISSUER_A,
+                    subject="global-sub",
+                    profile={},
+                )
+            )
+            session.flush()
 
 
 def test_membership_and_tenant_authorization_fail_closed(migrated_db):
@@ -771,6 +927,65 @@ def test_postgres_serializes_concurrent_final_owner_demotions(migrated_db):
     assert active_owner_count == 1
 
 
+def test_postgres_serializes_concurrent_final_identity_provider_deactivation(migrated_db):
+    engine, session_factory = migrated_db
+    if engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL row-lock regression requires PostgreSQL")
+
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        second_idp = SecurityService(session, verifier=DeterministicTokenVerifier({})).create_identity_provider(
+            fixture["organization_id"],
+            IdentityProviderCreate(
+                name="secondary",
+                issuer=ISSUER_B,
+                audience=AUDIENCE,
+                jwks_uri="https://issuer-b.example/.well-known/jwks.json",
+            ),
+            allow_development_targets=True,
+        )
+        idp_ids = [fixture["idp_id"], second_idp.id]
+        session.commit()
+
+    barrier = threading.Barrier(2)
+
+    def deactivate(identity_provider_id: str) -> str:
+        with session_factory() as session:
+            security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+            barrier.wait(timeout=10)
+            try:
+                security.update_identity_provider(
+                    fixture["organization_id"],
+                    identity_provider_id,
+                    IdentityProviderUpdate(status="inactive"),
+                )
+                time.sleep(0.2)
+                session.commit()
+                return "deactivated"
+            except PermissionError:
+                session.rollback()
+                return "blocked"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = sorted(
+            [executor.submit(deactivate, identity_provider_id) for identity_provider_id in idp_ids],
+            key=lambda future: future.result(),
+        )
+        outcomes = [future.result() for future in results]
+
+    with session_factory() as session:
+        active_idp_count = session.scalar(
+            text(
+                "select count(*) from organization_identity_providers "
+                "where organization_id = :organization_id and status = 'active'"
+            ),
+            {"organization_id": fixture["organization_id"]},
+        )
+
+    assert outcomes == ["blocked", "deactivated"]
+    assert active_idp_count == 1
+
+
 def test_service_principal_scopes_are_machine_only(migrated_db):
     _engine, session_factory = migrated_db
     with session_factory() as session:
@@ -860,6 +1075,9 @@ def test_secret_references_do_not_expose_values_and_plaintext_source_config_is_r
         assert payload["rotation_metadata"]["last_token"] == "[REDACTED]"
         with pytest.raises(ValueError):
             assert_no_plaintext_secrets({"nested": {"api_key": "plaintext"}})
+        for invalid_reference in [{}, {"name": "hunter2"}, {"secret_reference_id": ""}]:
+            with pytest.raises(ValueError):
+                assert_no_plaintext_secrets({"auth": {"password": invalid_reference}})
         IngestionService(session).register_source(
             SourceRegistration(
                 organization_id=fixture["organization_id"],
@@ -1065,17 +1283,30 @@ def test_bootstrap_security_provisioning_is_idempotent_and_org_scoped(migrated_d
         assert session.query(User).count() == 1
         assert session.query(OrganizationMembership).count() == 1
 
+        with pytest.raises(PermissionError):
+            SecurityService(session).bootstrap_initial_owner(
+                request.model_copy(update={"organization_slug": "globex", "organization_name": "Globex"})
+            )
+        session.rollback()
+
         second_org = SecurityService(session).bootstrap_initial_owner(
-            request.model_copy(update={"organization_slug": "globex", "organization_name": "Globex"})
+            request.model_copy(
+                update={
+                    "organization_slug": "globex",
+                    "organization_name": "Globex",
+                    "owner_email": "globex-owner@example.com",
+                    "subject": "globex-owner-sub",
+                }
+            )
         )
         context = SecurityService(session).context_from_claims(
             second_org["organization_id"],
-            _claims("owner-sub"),
+            _claims("globex-owner-sub"),
             request_id="req-second-org",
         )
 
-        assert context.user_id == first["user_id"]
-        assert session.query(User).count() == 1
+        assert context.user_id == second_org["user_id"]
+        assert session.query(User).count() == 2
         assert session.query(OrganizationMembership).count() == 2
         assert session.query(UserIdentity).count() == 2
 
@@ -1681,6 +1912,35 @@ def test_service_principal_patch_unknown_and_cross_tenant_are_generic_403(
         )
         assert response.status_code == 403
         assert response.json() == {"detail": "not authorized for this organization"}
+
+    oversized_principal_id = "p" * 300
+    oversized_response = client.patch(
+        f"/api/security/{org_id}/service-principals/{oversized_principal_id}",
+        headers=headers,
+        json={"status": "inactive"},
+    )
+    assert oversized_response.status_code == 403
+    assert oversized_response.json() == {"detail": "not authorized for this organization"}
+
+    with session_factory() as session:
+        resource_ids = [
+            event.resource_id
+            for event in session.query(SecurityAuditEvent).filter_by(
+                organization_id=org_id,
+                action="security.service_principal.update",
+                resource_type="service_principal",
+            )
+        ]
+        assert any(resource_id.startswith("sha256:") for resource_id in resource_ids if resource_id)
+        assert all(resource_id is None or len(resource_id) <= 255 for resource_id in resource_ids)
+
+    missing_user = client.post(
+        f"/api/security/{org_id}/memberships",
+        headers=headers,
+        json={"user_id": "00000000-0000-4000-8000-000000000000", "role": "viewer"},
+    )
+    assert missing_user.status_code == 403
+    assert missing_user.json() == {"detail": "not authorized for this organization"}
 
 
 def test_security_mutation_audits_record_target_resource_ids(migrated_db, monkeypatch, rsa_keys, jwks):

@@ -152,6 +152,7 @@ class OrganizationIdentityProvider(Base, TimestampMixin):
 class UserIdentity(Base, TimestampMixin):
     __tablename__ = "user_identities"
     __table_args__ = (
+        UniqueConstraint("issuer", "subject", name="uq_user_identity_global_issuer_subject"),
         UniqueConstraint("identity_provider_id", "subject", name="uq_user_identity_provider_subject"),
         UniqueConstraint("organization_id", "issuer", "subject", name="uq_user_identity_org_issuer_subject"),
         ForeignKeyConstraint(

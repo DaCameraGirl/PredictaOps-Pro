@@ -41,7 +41,12 @@ def assert_no_plaintext_secrets(value: Any, *, path: str = "config") -> None:
         for key, item in value.items():
             key_text = str(key)
             if is_secret_key(key_text):
-                if isinstance(item, Mapping) and set(item) <= {"secret_reference_id", "provider", "name"}:
+                if (
+                    isinstance(item, Mapping)
+                    and set(item) <= {"secret_reference_id", "provider", "name"}
+                    and isinstance(item.get("secret_reference_id"), str)
+                    and item["secret_reference_id"].strip()
+                ):
                     continue
                 raise ValueError(f"{path}.{key_text} must use a secret reference instead of a plaintext value")
             assert_no_plaintext_secrets(item, path=f"{path}.{key_text}")

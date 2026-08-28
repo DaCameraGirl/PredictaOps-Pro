@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 import httpx
 import jwt
 from jwt import PyJWK
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -62,6 +63,7 @@ SUPPORTED_ENVIRONMENTS = {"development", "test", "production"}
 DEFAULT_HTTPS_PORT = 443
 DEFAULT_JWKS_CACHE_TTL_SECONDS = 300.0
 MAX_AUDIT_HTTP_PATH_LENGTH = 1024
+MAX_AUDIT_RESOURCE_ID_LENGTH = 255
 
 
 class AuthenticationError(PermissionError):
@@ -200,7 +202,7 @@ class OidcTokenVerifier:
         if algorithm not in ASYMMETRIC_OIDC_ALGORITHMS or algorithm not in set(idp.allowed_algorithms or []):
             raise AuthenticationError(SAFE_AUTH_ERROR)
         key_id = header.get("kid")
-        key = self._key_for_token(idp.jwks_uri, key_id)
+        key = self._key_for_token(idp.jwks_uri, key_id, algorithm)
         try:
             claims = jwt.decode(
                 token,
@@ -215,28 +217,36 @@ class OidcTokenVerifier:
         subject = claims.get("sub")
         if not subject:
             raise AuthenticationError(SAFE_AUTH_ERROR)
+        try:
+            expires_at = _numeric_date_to_int(claims["exp"])
+            not_before = _numeric_date_to_int(claims["nbf"]) if claims.get("nbf") is not None else None
+        except (TypeError, ValueError) as exc:
+            raise AuthenticationError(SAFE_AUTH_ERROR) from exc
         profile = {
             key: value
             for key, value in claims.items()
             if key not in {"iss", "sub", "aud", "exp", "nbf", "iat", "jti"}
         }
-        return TokenClaims(
-            issuer=claims["iss"],
-            subject=subject,
-            audience=claims["aud"],
-            expires_at=claims["exp"],
-            not_before=claims.get("nbf"),
-            algorithm=algorithm,
-            key_id=key_id,
-            profile=redact_value(profile),
-        )
+        try:
+            return TokenClaims(
+                issuer=claims["iss"],
+                subject=subject,
+                audience=claims["aud"],
+                expires_at=expires_at,
+                not_before=not_before,
+                algorithm=algorithm,
+                key_id=key_id,
+                profile=redact_value(profile),
+            )
+        except ValidationError as exc:
+            raise AuthenticationError(SAFE_AUTH_ERROR) from exc
 
-    def _key_for_token(self, jwks_uri: str, key_id: str | None):
+    def _key_for_token(self, jwks_uri: str, key_id: str | None, algorithm: str):
         jwks = self._load_jwks(jwks_uri, refresh=False)
-        key = _select_jwk(jwks, key_id)
+        key = _select_jwk(jwks, key_id, algorithm)
         if key is None:
             jwks = self._load_jwks(jwks_uri, refresh=True)
-            key = _select_jwk(jwks, key_id)
+            key = _select_jwk(jwks, key_id, algorithm)
         if key is None:
             raise AuthenticationError(SAFE_AUTH_ERROR)
         try:
@@ -380,17 +390,46 @@ class DeterministicTokenVerifier:
         return claims
 
 
-def _select_jwk(jwks: dict[str, Any], key_id: str | None) -> dict[str, Any] | None:
+def _select_jwk(jwks: dict[str, Any], key_id: str | None, algorithm: str) -> dict[str, Any] | None:
     keys = jwks.get("keys") or []
     _validated_jwk_entries(keys)
     if key_id:
-        return next((key for key in keys if key.get("kid") == key_id), None)
-    return keys[0] if len(keys) == 1 else None
+        key = next((key for key in keys if key.get("kid") == key_id), None)
+        return key if key is not None and _jwk_allows_signing(key, algorithm) else None
+    if len(keys) != 1:
+        return None
+    key = keys[0]
+    return key if _jwk_allows_signing(key, algorithm) else None
 
 
 def _validated_jwk_entries(keys: list[Any]) -> None:
     if any(not isinstance(key, Mapping) for key in keys):
         raise AuthenticationError(SAFE_AUTH_ERROR)
+
+
+def _jwk_allows_signing(key: Mapping[str, Any], algorithm: str) -> bool:
+    use = key.get("use")
+    if use is not None and use != "sig":
+        return False
+    key_ops = key.get("key_ops")
+    if key_ops is not None and (not isinstance(key_ops, list) or "verify" not in key_ops):
+        return False
+    key_algorithm = key.get("alg")
+    if key_algorithm is not None and key_algorithm != algorithm:
+        return False
+    return True
+
+
+def _numeric_date_to_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError("NumericDate must be numeric")
+    return int(value)
+
+
+def _audit_resource_id(resource_id: str | None) -> str | None:
+    if resource_id is None or len(resource_id) <= MAX_AUDIT_RESOURCE_ID_LENGTH:
+        return resource_id
+    return f"sha256:{hashlib.sha256(resource_id.encode('utf-8')).hexdigest()}"
 
 
 def _require_asymmetric_oidc_algorithms(algorithms: list[str]) -> None:
@@ -476,6 +515,7 @@ class SecurityService:
         identity_provider_id: str,
         request: IdentityProviderUpdate,
     ) -> OrganizationIdentityProvider:
+        self._lock_organization_for_owner_transition(organization_id)
         idp = self.get_identity_provider(organization_id, identity_provider_id)
         if idp is None:
             raise AuthorizationError("identity provider does not belong to this organization")
@@ -661,6 +701,8 @@ class SecurityService:
         )
         user = self.session.scalar(select(User).where(User.email == request.owner_email.lower()))
         if existing_identity is not None:
+            if existing_identity.organization_id != org.id:
+                raise AuthorizationError("issuer and subject are already bound to another organization")
             existing_user = self.session.get(User, existing_identity.user_id)
             if user is not None and user.id != existing_identity.user_id:
                 raise AuthorizationError("issuer and subject are already bound to another local user")
@@ -749,16 +791,31 @@ class SecurityService:
             except AuthenticationError as exc:
                 last_error = exc
                 continue
-            return self.context_from_claims(organization_id, claims, request_id=request_id)
+            return self.context_from_claims(
+                organization_id,
+                claims,
+                request_id=request_id,
+                identity_provider_id=idp.id,
+            )
         raise AuthenticationError(SAFE_AUTH_ERROR) from last_error
 
-    def context_from_claims(self, organization_id: str, claims: TokenClaims, *, request_id: str) -> SecurityContext:
+    def context_from_claims(
+        self,
+        organization_id: str,
+        claims: TokenClaims,
+        *,
+        request_id: str,
+        identity_provider_id: str | None = None,
+    ) -> SecurityContext:
+        identity_filters = [
+            UserIdentity.organization_id == organization_id,
+            UserIdentity.issuer == claims.issuer,
+            UserIdentity.subject == claims.subject,
+        ]
+        if identity_provider_id is not None:
+            identity_filters.append(UserIdentity.identity_provider_id == identity_provider_id)
         identity = self.session.scalar(
-            select(UserIdentity).where(
-                UserIdentity.organization_id == organization_id,
-                UserIdentity.issuer == claims.issuer,
-                UserIdentity.subject == claims.subject,
-            )
+            select(UserIdentity).where(*identity_filters)
         )
         if identity is not None:
             user = self.session.get(User, identity.user_id)
@@ -854,6 +911,9 @@ class SecurityService:
             )
         )
         if membership is None:
+            user = self.session.get(User, request.user_id)
+            if user is None:
+                raise AuthorizationError("user does not exist")
             membership = self.repo.add_membership(organization_id, request.user_id, request.role)
         elif membership.role == "owner" and request.role != "owner" and OWNERS_MANAGE not in actor.permissions:
             raise AuthorizationError("only owners may demote owners")
@@ -965,7 +1025,7 @@ class SecurityService:
             action=action,
             required_permission=required_permission,
             resource_type=resource_type,
-            resource_id=resource_id,
+            resource_id=_audit_resource_id(resource_id),
             outcome=outcome,
             reason_code=reason_code,
             http_method=http_method,
