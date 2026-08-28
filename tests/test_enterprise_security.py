@@ -870,6 +870,7 @@ def test_postgres_serializes_concurrent_human_service_principal_collisions(migra
                 session.commit()
                 return "created-human"
             except (IntegrityError, PermissionError):
+                assert session.scalar(select(func.count()).select_from(User)) >= 1
                 session.rollback()
                 return "blocked"
 
@@ -892,6 +893,7 @@ def test_postgres_serializes_concurrent_human_service_principal_collisions(migra
                 session.commit()
                 return "created-service"
             except (IntegrityError, PermissionError):
+                assert session.scalar(select(func.count()).select_from(User)) >= 1
                 session.rollback()
                 return "blocked"
 
@@ -1287,6 +1289,15 @@ def test_postgres_serializes_concurrent_final_identity_provider_deactivation(mig
             ),
             allow_development_targets=True,
         )
+        SecurityService(session, verifier=DeterministicTokenVerifier({})).create_user_identity(
+            fixture["organization_id"],
+            UserIdentityCreate(
+                user_id=fixture["users"]["owner"],
+                identity_provider_id=second_idp.id,
+                issuer=ISSUER_B,
+                subject="owner-concurrent-secondary-sub",
+            ),
+        )
         idp_ids = [fixture["idp_id"], second_idp.id]
         session.commit()
 
@@ -1558,10 +1569,19 @@ def test_oidc_resolved_address_validation_rejects_unsafe_dns_answers(monkeypatch
     monkeypatch.setattr("enterprise_security.service.socket.getaddrinfo", resolver_for(["93.184.216.34"]))
     assert _validated_oidc_addresses("issuer.example", 443) == ("93.184.216.34",)
 
-    for address in ["127.0.0.1", "10.0.0.5", "169.254.169.254"]:
+    for address in [
+        "127.0.0.1",
+        "10.0.0.5",
+        "100.64.0.1",
+        "169.254.169.254",
+        "192.0.2.1",
+        "203.0.113.1",
+    ]:
         monkeypatch.setattr("enterprise_security.service.socket.getaddrinfo", resolver_for([address]))
         with pytest.raises(SecurityConfigurationError):
             _validated_oidc_addresses("issuer.example", 443)
+        with pytest.raises(SecurityConfigurationError):
+            validate_oidc_endpoint(f"https://{address}/jwks")
 
     monkeypatch.setattr(
         "enterprise_security.service.socket.getaddrinfo",
@@ -1856,6 +1876,31 @@ def test_bootstrap_rejects_inactive_existing_owner_user(migrated_db):
         assert session.query(UserIdentity).count() == 0
 
 
+@pytest.mark.parametrize("org_state", ["inactive", "archived"])
+def test_bootstrap_rejects_inactive_or_archived_existing_organization(migrated_db, org_state):
+    _engine, session_factory = migrated_db
+    request = BootstrapSecurityRequest(
+        organization_slug="acme",
+        organization_name="Acme",
+        owner_email="owner@example.com",
+        issuer=ISSUER_A,
+        subject="owner-sub",
+        audience=AUDIENCE,
+        jwks_uri=JWKS_URI,
+    )
+    with session_factory() as session:
+        org = PlatformRepository(session).create_organization(OrganizationCreate(slug="acme", name="Acme"))
+        org.lifecycle_state = org_state
+        session.flush()
+
+        with pytest.raises(SecurityConfigurationError):
+            SecurityService(session).bootstrap_initial_owner(request)
+
+        assert session.query(OrganizationIdentityProvider).count() == 0
+        assert session.query(OrganizationMembership).count() == 0
+        assert session.query(UserIdentity).count() == 0
+
+
 def test_identity_provider_update_preserves_recovery_path(migrated_db):
     _engine, session_factory = migrated_db
     with session_factory() as session:
@@ -1879,6 +1924,15 @@ def test_identity_provider_update_preserves_recovery_path(migrated_db):
             ),
             allow_development_targets=True,
         )
+        security.create_user_identity(
+            fixture["organization_id"],
+            UserIdentityCreate(
+                user_id=fixture["users"]["owner"],
+                identity_provider_id=second_idp.id,
+                issuer=ISSUER_B,
+                subject="owner-b-sub",
+            ),
+        )
         deactivated = security.update_identity_provider(
             fixture["organization_id"],
             fixture["idp_id"],
@@ -1901,6 +1955,138 @@ def test_identity_provider_update_preserves_recovery_path(migrated_db):
 
         assert second_idp.status == "active"
         assert bootstrap_result["identity_provider_id"] == fixture["idp_id"]
+        assert session.get(OrganizationIdentityProvider, fixture["idp_id"]).status == "active"
+
+
+def test_identity_provider_deactivation_requires_owner_reachable_through_another_provider(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session)
+        second_idp = security.create_identity_provider(
+            fixture["organization_id"],
+            IdentityProviderCreate(
+                name="secondary",
+                issuer=ISSUER_B,
+                audience=AUDIENCE,
+                jwks_uri="https://issuer-b.example/jwks",
+            ),
+            allow_development_targets=True,
+        )
+
+        with pytest.raises(PermissionError):
+            security.update_identity_provider(
+                fixture["organization_id"],
+                fixture["idp_id"],
+                IdentityProviderUpdate(status="inactive"),
+            )
+
+        security.create_user_identity(
+            fixture["organization_id"],
+            UserIdentityCreate(
+                user_id=fixture["users"]["owner"],
+                identity_provider_id=second_idp.id,
+                issuer=ISSUER_B,
+                subject="owner-secondary-sub",
+            ),
+        )
+
+        deactivated = security.update_identity_provider(
+            fixture["organization_id"],
+            fixture["idp_id"],
+            IdentityProviderUpdate(status="inactive"),
+        )
+
+        assert deactivated.status == "inactive"
+
+
+@pytest.mark.parametrize("owner_state", ["inactive", "archived"])
+def test_identity_provider_deactivation_ignores_inactive_or_archived_owners(migrated_db, owner_state):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session)
+        second_idp = security.create_identity_provider(
+            fixture["organization_id"],
+            IdentityProviderCreate(
+                name="secondary",
+                issuer=ISSUER_B,
+                audience=AUDIENCE,
+                jwks_uri="https://issuer-b.example/jwks",
+            ),
+            allow_development_targets=True,
+        )
+        security.change_membership_role(
+            fixture["organization_id"],
+            MembershipChange(user_id=fixture["users"]["admin"], role="owner"),
+            actor=security.context_from_claims(
+                fixture["organization_id"],
+                _claims(fixture["subjects"]["owner"]),
+                request_id="req-owner",
+            ),
+        )
+        security.create_user_identity(
+            fixture["organization_id"],
+            UserIdentityCreate(
+                user_id=fixture["users"]["admin"],
+                identity_provider_id=second_idp.id,
+                issuer=ISSUER_B,
+                subject="admin-secondary-owner-sub",
+            ),
+        )
+        admin_membership = session.scalar(
+            select(OrganizationMembership).where(
+                OrganizationMembership.organization_id == fixture["organization_id"],
+                OrganizationMembership.user_id == fixture["users"]["admin"],
+            )
+        )
+        admin_membership.lifecycle_state = owner_state
+        session.flush()
+
+        with pytest.raises(PermissionError):
+            security.update_identity_provider(
+                fixture["organization_id"],
+                fixture["idp_id"],
+                IdentityProviderUpdate(status="inactive"),
+            )
+
+        assert session.get(OrganizationIdentityProvider, fixture["idp_id"]).status == "active"
+
+
+def test_identity_provider_deactivation_ignores_inactive_recovery_provider(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session)
+        second_idp = security.create_identity_provider(
+            fixture["organization_id"],
+            IdentityProviderCreate(
+                name="secondary",
+                issuer=ISSUER_B,
+                audience=AUDIENCE,
+                jwks_uri="https://issuer-b.example/jwks",
+            ),
+            allow_development_targets=True,
+        )
+        security.create_user_identity(
+            fixture["organization_id"],
+            UserIdentityCreate(
+                user_id=fixture["users"]["owner"],
+                identity_provider_id=second_idp.id,
+                issuer=ISSUER_B,
+                subject="owner-inactive-provider-sub",
+            ),
+        )
+        second_idp.status = "inactive"
+        session.flush()
+
+        with pytest.raises(PermissionError):
+            security.update_identity_provider(
+                fixture["organization_id"],
+                fixture["idp_id"],
+                IdentityProviderUpdate(status="inactive"),
+            )
+
         assert session.get(OrganizationIdentityProvider, fixture["idp_id"]).status == "active"
 
 
@@ -2347,12 +2533,23 @@ def test_security_admin_api_onboards_users_updates_idps_and_rotates_secrets(
             "jwks_uri": "https://issuer-b.example/.well-known/jwks.json",
         },
     )
+    assert created_idp.status_code == 200
+    with session_factory() as session:
+        SecurityService(session).create_user_identity(
+            org_id,
+            UserIdentityCreate(
+                user_id=fixture["users"]["owner"],
+                identity_provider_id=created_idp.json()["id"],
+                issuer=ISSUER_B,
+                subject="owner-api-secondary-sub",
+            ),
+        )
+        session.commit()
     updated_idp = client.patch(
         f"/api/security/{org_id}/identity-providers/{fixture['idp_id']}",
         headers=owner_headers,
         json={"status": "inactive"},
     )
-    assert created_idp.status_code == 200
     assert updated_idp.status_code == 200
     assert updated_idp.json()["status"] == "inactive"
 
@@ -2489,6 +2686,56 @@ def test_service_principal_patch_unknown_and_cross_tenant_are_generic_403(
     assert missing_user.json() == {"detail": "not authorized for this organization"}
 
 
+def test_duplicate_identity_provider_creation_returns_stable_conflict(
+    migrated_db,
+    monkeypatch,
+    rsa_keys,
+    jwks,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        session.commit()
+
+    _app_main, client = _enterprise_app(monkeypatch, session_factory, jwks=jwks)
+    headers = {"Authorization": f"Bearer {_token(rsa_keys['primary'], subject='owner-sub')}"}
+    org_id = fixture["organization_id"]
+
+    duplicate_name = client.post(
+        f"/api/security/{org_id}/identity-providers",
+        headers=headers,
+        json={
+            "name": "primary",
+            "issuer": ISSUER_B,
+            "audience": "new-audience",
+            "jwks_uri": "https://issuer-b.example/.well-known/jwks.json",
+        },
+    )
+    duplicate_issuer_audience = client.post(
+        f"/api/security/{org_id}/identity-providers",
+        headers=headers,
+        json={
+            "name": "unique-name",
+            "issuer": ISSUER_A,
+            "audience": AUDIENCE,
+            "jwks_uri": JWKS_URI,
+        },
+    )
+
+    assert duplicate_name.status_code == 409
+    assert duplicate_name.json() == {"detail": "resource conflict"}
+    assert duplicate_issuer_audience.status_code == 409
+    assert duplicate_issuer_audience.json() == {"detail": "resource conflict"}
+    with session_factory() as session:
+        failures = session.query(SecurityAuditEvent).filter_by(
+            organization_id=org_id,
+            action="security.idp.create",
+            outcome="failed",
+            reason_code="resource_conflict",
+        )
+        assert failures.count() == 2
+
+
 def test_security_mutation_audits_record_target_resource_ids(migrated_db, monkeypatch, rsa_keys, jwks):
     _engine, session_factory = migrated_db
     with session_factory() as session:
@@ -2561,6 +2808,79 @@ def test_security_mutation_audits_record_target_resource_ids(migrated_db, monkey
         fixture["service_principal_id"],
     ) in audit_targets
     assert ("security.secret.update", "secret_reference", secret.json()["id"]) in audit_targets
+
+
+def test_rejected_security_mutations_are_not_audited_as_allowed(migrated_db, monkeypatch, rsa_keys, jwks):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        second_idp = SecurityService(session).create_identity_provider(
+            fixture["organization_id"],
+            IdentityProviderCreate(
+                name="secondary-unreachable",
+                issuer=ISSUER_B,
+                audience=AUDIENCE,
+                jwks_uri="https://issuer-b.example/.well-known/jwks.json",
+            ),
+            allow_development_targets=True,
+        )
+        session.commit()
+
+    _app_main, client = _enterprise_app(monkeypatch, session_factory, jwks=jwks)
+    headers = {"Authorization": f"Bearer {_token(rsa_keys['primary'], subject='owner-sub')}"}
+    org_id = fixture["organization_id"]
+    owner_user_id = fixture["users"]["owner"]
+
+    idp_rejection = client.patch(
+        f"/api/security/{org_id}/identity-providers/{fixture['idp_id']}",
+        headers=headers,
+        json={"status": "inactive"},
+    )
+    owner_rejection = client.patch(
+        f"/api/security/{org_id}/memberships/{owner_user_id}",
+        headers=headers,
+        json={"lifecycle_state": "inactive"},
+    )
+
+    assert idp_rejection.status_code == 403
+    assert owner_rejection.status_code == 403
+    with session_factory() as session:
+        allowed_rejection_count = session.query(SecurityAuditEvent).filter(
+            SecurityAuditEvent.organization_id == org_id,
+            SecurityAuditEvent.outcome == "allowed",
+            (
+                (
+                    (SecurityAuditEvent.action == "security.idp.update")
+                    & (SecurityAuditEvent.resource_id == fixture["idp_id"])
+                )
+                | (
+                    (SecurityAuditEvent.action == "security.membership.auth")
+                    & (SecurityAuditEvent.resource_id == owner_user_id)
+                )
+                | (SecurityAuditEvent.action == "members.status")
+            ),
+        ).count()
+        denied_targets = {
+            (event.action, event.resource_type, event.resource_id, event.outcome, event.reason_code)
+            for event in session.query(SecurityAuditEvent).filter_by(organization_id=org_id, outcome="denied")
+        }
+        assert session.get(OrganizationIdentityProvider, second_idp.id).status == "active"
+
+    assert allowed_rejection_count == 0
+    assert (
+        "security.idp.update",
+        "identity_provider",
+        fixture["idp_id"],
+        "denied",
+        "operation_rejected",
+    ) in denied_targets
+    assert (
+        "security.membership.auth",
+        "membership",
+        owner_user_id,
+        "denied",
+        "operation_rejected",
+    ) in denied_targets
 
 
 def test_service_principal_cannot_create_human_note_via_api(migrated_db, monkeypatch, rsa_keys, jwks):

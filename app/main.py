@@ -68,6 +68,7 @@ from enterprise_security.service import (
     MAX_AUDIT_HTTP_PATH_LENGTH,
     AuthenticationError,
     AuthorizationError,
+    ConflictError,
     OidcTokenVerifier,
     SecurityService,
     audit_event_payload,
@@ -336,6 +337,7 @@ def _authorize(
     action: str,
     resource_type: str | None = None,
     resource_id: str | None = None,
+    audit_allowed: bool = True,
 ):
     if not _enterprise_security_enabled():
         if action.startswith("security.") and action != "security.me":
@@ -359,6 +361,7 @@ def _authorize(
             resource_id=resource_id,
             http_method=request.method,
             http_path=request.url.path,
+            audit_allowed=audit_allowed,
         )
         return context
     except AuthenticationError as exc:
@@ -367,6 +370,33 @@ def _authorize(
     except AuthorizationError as exc:
         session.commit()
         raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
+
+
+def _record_security_mutation_audit(
+    session,
+    request: Request,
+    context,
+    *,
+    action: str,
+    required_permission: str,
+    resource_type: str | None = None,
+    resource_id: str | None = None,
+    outcome: str,
+    reason_code: str,
+):
+    if context is None:
+        return
+    _security_service(session).record_audit_event(
+        context=context,
+        action=action,
+        required_permission=required_permission,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        outcome=outcome,
+        reason_code=reason_code,
+        http_method=request.method,
+        http_path=request.url.path,
+    )
 
 
 def _authenticated_user_id(context, fallback_user_id: str | None) -> str:
@@ -575,15 +605,65 @@ def get_current_security_context(organization_id: str, request: Request):
 @app.post("/api/security/{organization_id}/identity-providers")
 def create_identity_provider(organization_id: str, request: IdentityProviderCreate, http_request: Request):
     with SessionLocal() as session:
+        context = None
         try:
-            _authorize(session, http_request, organization_id, SECURITY_MANAGE, action="security.idp.create")
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                SECURITY_MANAGE,
+                action="security.idp.create",
+                audit_allowed=False,
+            )
             idp = _security_service(session).create_identity_provider(
                 organization_id,
                 request,
                 allow_development_targets=SECURITY_SETTINGS.environment != "production",
             )
+            _record_security_mutation_audit(
+                session,
+                http_request,
+                context,
+                action="security.idp.create",
+                required_permission=SECURITY_MANAGE,
+                resource_type="identity_provider",
+                resource_id=idp.id,
+                outcome="allowed",
+                reason_code="operation_succeeded",
+            )
             session.commit()
             return identity_provider_payload(idp)
+        except ConflictError as exc:
+            session.rollback()
+            _record_security_mutation_audit(
+                session,
+                http_request,
+                context,
+                action="security.idp.create",
+                required_permission=SECURITY_MANAGE,
+                resource_type="identity_provider",
+                outcome="failed",
+                reason_code="resource_conflict",
+            )
+            session.commit()
+            raise HTTPException(status_code=409, detail="resource conflict") from exc
+        except AuthorizationError as exc:
+            if context is None:
+                session.commit()
+            else:
+                session.rollback()
+                _record_security_mutation_audit(
+                    session,
+                    http_request,
+                    context,
+                    action="security.idp.create",
+                    required_permission=SECURITY_MANAGE,
+                    resource_type="identity_provider",
+                    outcome="denied",
+                    reason_code="operation_rejected",
+                )
+                session.commit()
+            raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
         except ValueError as exc:
             session.rollback()
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -613,8 +693,9 @@ def update_identity_provider(
     http_request: Request,
 ):
     with SessionLocal() as session:
+        context = None
         try:
-            _authorize(
+            context = _authorize(
                 session,
                 http_request,
                 organization_id,
@@ -622,12 +703,39 @@ def update_identity_provider(
                 action="security.idp.update",
                 resource_type="identity_provider",
                 resource_id=identity_provider_id,
+                audit_allowed=False,
             )
             idp = _security_service(session).update_identity_provider(organization_id, identity_provider_id, request)
+            _record_security_mutation_audit(
+                session,
+                http_request,
+                context,
+                action="security.idp.update",
+                required_permission=SECURITY_MANAGE,
+                resource_type="identity_provider",
+                resource_id=identity_provider_id,
+                outcome="allowed",
+                reason_code="operation_succeeded",
+            )
             session.commit()
             return identity_provider_payload(idp)
         except AuthorizationError as exc:
-            session.commit()
+            if context is None:
+                session.commit()
+            else:
+                session.rollback()
+                _record_security_mutation_audit(
+                    session,
+                    http_request,
+                    context,
+                    action="security.idp.update",
+                    required_permission=SECURITY_MANAGE,
+                    resource_type="identity_provider",
+                    resource_id=identity_provider_id,
+                    outcome="denied",
+                    reason_code="operation_rejected",
+                )
+                session.commit()
             raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
         except ValueError as exc:
             session.rollback()
@@ -640,6 +748,7 @@ def update_identity_provider(
 @app.post("/api/security/{organization_id}/user-identities")
 def onboard_user_identity(organization_id: str, request: UserIdentityOnboard, http_request: Request):
     with SessionLocal() as session:
+        context = None
         try:
             context = _authorize(
                 session,
@@ -647,8 +756,20 @@ def onboard_user_identity(organization_id: str, request: UserIdentityOnboard, ht
                 organization_id,
                 SECURITY_MANAGE,
                 action="security.user_identity.onboard",
+                audit_allowed=False,
             )
             result = _security_service(session).onboard_user_identity(organization_id, request, actor=context)
+            _record_security_mutation_audit(
+                session,
+                http_request,
+                context,
+                action="security.user_identity.onboard",
+                required_permission=SECURITY_MANAGE,
+                resource_type="user_identity",
+                resource_id=result["identity"].id,
+                outcome="allowed",
+                reason_code="operation_succeeded",
+            )
             session.commit()
             user = result["user"]
             return {
@@ -669,8 +790,36 @@ def onboard_user_identity(organization_id: str, request: UserIdentityOnboard, ht
                     "last_seen_at": result["identity"].last_seen_at,
                 },
             }
-        except AuthorizationError as exc:
+        except ConflictError as exc:
+            session.rollback()
+            _record_security_mutation_audit(
+                session,
+                http_request,
+                context,
+                action="security.user_identity.onboard",
+                required_permission=SECURITY_MANAGE,
+                resource_type="user_identity",
+                outcome="failed",
+                reason_code="resource_conflict",
+            )
             session.commit()
+            raise HTTPException(status_code=409, detail="resource conflict") from exc
+        except AuthorizationError as exc:
+            if context is None:
+                session.commit()
+            else:
+                session.rollback()
+                _record_security_mutation_audit(
+                    session,
+                    http_request,
+                    context,
+                    action="security.user_identity.onboard",
+                    required_permission=SECURITY_MANAGE,
+                    resource_type="user_identity",
+                    outcome="denied",
+                    reason_code="operation_rejected",
+                )
+                session.commit()
             raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
         except ValueError as exc:
             session.rollback()
@@ -684,6 +833,7 @@ def onboard_user_identity(organization_id: str, request: UserIdentityOnboard, ht
 def change_membership_role(organization_id: str, request: MembershipChange, http_request: Request):
     with SessionLocal() as session:
         security = _security_service(session)
+        context = None
         try:
             context = _authorize(
                 session,
@@ -693,12 +843,39 @@ def change_membership_role(organization_id: str, request: MembershipChange, http
                 action="security.membership.auth",
                 resource_type="membership",
                 resource_id=request.user_id,
+                audit_allowed=False,
             )
             membership = security.change_membership_role(organization_id, request, actor=context)
+            _record_security_mutation_audit(
+                session,
+                http_request,
+                context,
+                action="security.membership.auth",
+                required_permission=PLATFORM_READ,
+                resource_type="membership",
+                resource_id=request.user_id,
+                outcome="allowed",
+                reason_code="operation_succeeded",
+            )
             session.commit()
             return _membership_payload(membership)
         except AuthorizationError as exc:
-            session.commit()
+            if context is None:
+                session.commit()
+            else:
+                session.rollback()
+                _record_security_mutation_audit(
+                    session,
+                    http_request,
+                    context,
+                    action="security.membership.auth",
+                    required_permission=PLATFORM_READ,
+                    resource_type="membership",
+                    resource_id=request.user_id,
+                    outcome="denied",
+                    reason_code="operation_rejected",
+                )
+                session.commit()
             raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
         except ValueError as exc:
             session.rollback()
@@ -717,6 +894,7 @@ def change_membership_status(
 ):
     with SessionLocal() as session:
         security = _security_service(session)
+        context = None
         try:
             context = _authorize(
                 session,
@@ -726,12 +904,39 @@ def change_membership_status(
                 action="security.membership.auth",
                 resource_type="membership",
                 resource_id=user_id,
+                audit_allowed=False,
             )
             membership = security.change_membership_status(organization_id, user_id, request, actor=context)
+            _record_security_mutation_audit(
+                session,
+                http_request,
+                context,
+                action="security.membership.auth",
+                required_permission=PLATFORM_READ,
+                resource_type="membership",
+                resource_id=user_id,
+                outcome="allowed",
+                reason_code="operation_succeeded",
+            )
             session.commit()
             return _membership_payload(membership)
         except AuthorizationError as exc:
-            session.commit()
+            if context is None:
+                session.commit()
+            else:
+                session.rollback()
+                _record_security_mutation_audit(
+                    session,
+                    http_request,
+                    context,
+                    action="security.membership.auth",
+                    required_permission=PLATFORM_READ,
+                    resource_type="membership",
+                    resource_id=user_id,
+                    outcome="denied",
+                    reason_code="operation_rejected",
+                )
+                session.commit()
             raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
         except ValueError as exc:
             session.rollback()
@@ -744,19 +949,60 @@ def change_membership_status(
 @app.post("/api/security/{organization_id}/service-principals")
 def create_service_principal(organization_id: str, request: ServicePrincipalCreate, http_request: Request):
     with SessionLocal() as session:
+        context = None
         try:
-            _authorize(
+            context = _authorize(
                 session,
                 http_request,
                 organization_id,
                 SECURITY_MANAGE,
                 action="security.service_principal.create",
+                audit_allowed=False,
             )
             principal = _security_service(session).create_service_principal(organization_id, request)
+            _record_security_mutation_audit(
+                session,
+                http_request,
+                context,
+                action="security.service_principal.create",
+                required_permission=SECURITY_MANAGE,
+                resource_type="service_principal",
+                resource_id=principal.id,
+                outcome="allowed",
+                reason_code="operation_succeeded",
+            )
             session.commit()
             return service_principal_payload(principal)
-        except AuthorizationError as exc:
+        except ConflictError as exc:
+            session.rollback()
+            _record_security_mutation_audit(
+                session,
+                http_request,
+                context,
+                action="security.service_principal.create",
+                required_permission=SECURITY_MANAGE,
+                resource_type="service_principal",
+                outcome="failed",
+                reason_code="resource_conflict",
+            )
             session.commit()
+            raise HTTPException(status_code=409, detail="resource conflict") from exc
+        except AuthorizationError as exc:
+            if context is None:
+                session.commit()
+            else:
+                session.rollback()
+                _record_security_mutation_audit(
+                    session,
+                    http_request,
+                    context,
+                    action="security.service_principal.create",
+                    required_permission=SECURITY_MANAGE,
+                    resource_type="service_principal",
+                    outcome="denied",
+                    reason_code="operation_rejected",
+                )
+                session.commit()
             raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
         except ValueError as exc:
             session.rollback()
@@ -787,8 +1033,9 @@ def update_service_principal(
     http_request: Request,
 ):
     with SessionLocal() as session:
+        context = None
         try:
-            _authorize(
+            context = _authorize(
                 session,
                 http_request,
                 organization_id,
@@ -796,12 +1043,39 @@ def update_service_principal(
                 action="security.service_principal.update",
                 resource_type="service_principal",
                 resource_id=principal_id,
+                audit_allowed=False,
             )
             principal = _security_service(session).update_service_principal(organization_id, principal_id, request)
+            _record_security_mutation_audit(
+                session,
+                http_request,
+                context,
+                action="security.service_principal.update",
+                required_permission=SECURITY_MANAGE,
+                resource_type="service_principal",
+                resource_id=principal_id,
+                outcome="allowed",
+                reason_code="operation_succeeded",
+            )
             session.commit()
             return service_principal_payload(principal)
         except AuthorizationError as exc:
-            session.commit()
+            if context is None:
+                session.commit()
+            else:
+                session.rollback()
+                _record_security_mutation_audit(
+                    session,
+                    http_request,
+                    context,
+                    action="security.service_principal.update",
+                    required_permission=SECURITY_MANAGE,
+                    resource_type="service_principal",
+                    resource_id=principal_id,
+                    outcome="denied",
+                    reason_code="operation_rejected",
+                )
+                session.commit()
             raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
         except ValueError as exc:
             session.rollback()
@@ -814,6 +1088,7 @@ def update_service_principal(
 @app.post("/api/security/{organization_id}/secret-references")
 def create_secret_reference(organization_id: str, request: SecretReferenceCreate, http_request: Request):
     with SessionLocal() as session:
+        context = None
         try:
             context = _authorize(
                 session,
@@ -821,16 +1096,42 @@ def create_secret_reference(organization_id: str, request: SecretReferenceCreate
                 organization_id,
                 SECRETS_MANAGE,
                 action="security.secret.create",
+                audit_allowed=False,
             )
             secret = _security_service(session).create_secret_reference(
                 organization_id,
                 request,
                 created_by_user_id=_authenticated_user_id(context, None),
             )
+            _record_security_mutation_audit(
+                session,
+                http_request,
+                context,
+                action="security.secret.create",
+                required_permission=SECRETS_MANAGE,
+                resource_type="secret_reference",
+                resource_id=secret.id,
+                outcome="allowed",
+                reason_code="operation_succeeded",
+            )
             session.commit()
             return secret_reference_payload(secret)
         except AuthorizationError as exc:
-            session.commit()
+            if context is None:
+                session.commit()
+            else:
+                session.rollback()
+                _record_security_mutation_audit(
+                    session,
+                    http_request,
+                    context,
+                    action="security.secret.create",
+                    required_permission=SECRETS_MANAGE,
+                    resource_type="secret_reference",
+                    outcome="denied",
+                    reason_code="operation_rejected",
+                )
+                session.commit()
             raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
         except ValueError as exc:
             session.rollback()
@@ -861,8 +1162,9 @@ def update_secret_reference(
     http_request: Request,
 ):
     with SessionLocal() as session:
+        context = None
         try:
-            _authorize(
+            context = _authorize(
                 session,
                 http_request,
                 organization_id,
@@ -870,12 +1172,39 @@ def update_secret_reference(
                 action="security.secret.update",
                 resource_type="secret_reference",
                 resource_id=secret_id,
+                audit_allowed=False,
             )
             secret = _security_service(session).update_secret_reference(organization_id, secret_id, request)
+            _record_security_mutation_audit(
+                session,
+                http_request,
+                context,
+                action="security.secret.update",
+                required_permission=SECRETS_MANAGE,
+                resource_type="secret_reference",
+                resource_id=secret_id,
+                outcome="allowed",
+                reason_code="operation_succeeded",
+            )
             session.commit()
             return secret_reference_payload(secret)
         except AuthorizationError as exc:
-            session.commit()
+            if context is None:
+                session.commit()
+            else:
+                session.rollback()
+                _record_security_mutation_audit(
+                    session,
+                    http_request,
+                    context,
+                    action="security.secret.update",
+                    required_permission=SECRETS_MANAGE,
+                    resource_type="secret_reference",
+                    resource_id=secret_id,
+                    outcome="denied",
+                    reason_code="operation_rejected",
+                )
+                session.commit()
             raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
         except ValueError as exc:
             session.rollback()

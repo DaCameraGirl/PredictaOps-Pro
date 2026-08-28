@@ -79,6 +79,10 @@ class AuthorizationError(PermissionError):
     pass
 
 
+class ConflictError(AuthorizationError):
+    pass
+
+
 class SecurityConfigurationError(ValueError):
     pass
 
@@ -161,13 +165,7 @@ def validate_oidc_endpoint(url: str, *, allow_development_targets: bool = False)
         if not allow_development_targets:
             _validated_oidc_addresses(host, parsed.port or DEFAULT_HTTPS_PORT)
         return
-    if not allow_development_targets and (
-        address.is_loopback
-        or address.is_link_local
-        or address.is_private
-        or address.is_reserved
-        or address.is_multicast
-    ):
+    if not allow_development_targets and _unsafe_oidc_address(address):
         raise SecurityConfigurationError("OIDC endpoint must not target private or unsafe addresses")
 
 
@@ -190,14 +188,7 @@ def _validated_oidc_addresses(host: str, port: int) -> tuple[str, ...]:
 
 
 def _unsafe_oidc_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    return (
-        address.is_loopback
-        or address.is_link_local
-        or address.is_private
-        or address.is_reserved
-        or address.is_multicast
-        or address.is_unspecified
-    )
+    return not address.is_global
 
 
 class OidcTokenVerifier:
@@ -532,8 +523,12 @@ class SecurityService:
             status="active",
             claim_mapping=request.claim_mapping,
         )
-        self.session.add(idp)
-        self.session.flush()
+        try:
+            with self.session.begin_nested():
+                self.session.add(idp)
+                self.session.flush()
+        except IntegrityError as exc:
+            raise ConflictError("identity provider already exists") from exc
         return idp
 
     def update_identity_provider(
@@ -546,10 +541,13 @@ class SecurityService:
         idp = self.get_identity_provider(organization_id, identity_provider_id)
         if idp is None:
             raise AuthorizationError("identity provider does not belong to this organization")
-        if idp.status == "active" and request.status != "active" and self._active_identity_provider_count(
-            organization_id
-        ) <= 1:
-            raise AuthorizationError("cannot deactivate the final active identity provider")
+        if idp.status == "active" and request.status != "active":
+            if self._active_identity_provider_count(organization_id) <= 1:
+                raise AuthorizationError("cannot deactivate the final active identity provider")
+            if self._reachable_active_owner_count_excluding_idp(organization_id, idp.id) <= 0:
+                raise AuthorizationError(
+                    "cannot deactivate an identity provider while no active owner is reachable elsewhere"
+                )
         idp.status = request.status
         self.session.flush()
         return idp
@@ -587,16 +585,20 @@ class SecurityService:
             subject=request.subject,
             profile=redact_value(request.profile),
         )
-        self.session.add(identity)
-        self.session.flush()
-        self._create_external_principal_identity(
-            organization_id=organization_id,
-            identity_provider_id=request.identity_provider_id,
-            issuer=request.issuer,
-            subject=request.subject,
-            principal_type="user",
-            user_identity_id=identity.id,
-        )
+        try:
+            with self.session.begin_nested():
+                self.session.add(identity)
+                self.session.flush()
+                self._create_external_principal_identity(
+                    organization_id=organization_id,
+                    identity_provider_id=request.identity_provider_id,
+                    issuer=request.issuer,
+                    subject=request.subject,
+                    principal_type="user",
+                    user_identity_id=identity.id,
+                )
+        except IntegrityError as exc:
+            raise ConflictError("issuer and subject are already bound to another principal") from exc
         return identity
 
     def onboard_user_identity(
@@ -612,7 +614,7 @@ class SecurityService:
             raise AuthorizationError("active identity provider does not belong to this organization")
         if idp.issuer != request.issuer:
             raise SecurityConfigurationError("identity issuer must match the identity provider")
-        self._authorize_membership_role_assignment(actor, request.role)
+        self._authorize_membership_role_assignment(actor, request.role, audit_allowed=False)
 
         email = request.email.lower()
         existing_identity = self.session.scalar(
@@ -694,16 +696,20 @@ class SecurityService:
             status="active",
             metadata_json=redact_value(request.metadata),
         )
-        self.session.add(principal)
-        self.session.flush()
-        self._create_external_principal_identity(
-            organization_id=organization_id,
-            identity_provider_id=idp.id,
-            issuer=request.issuer,
-            subject=request.external_subject,
-            principal_type="service",
-            service_principal_id=principal.id,
-        )
+        try:
+            with self.session.begin_nested():
+                self.session.add(principal)
+                self.session.flush()
+                self._create_external_principal_identity(
+                    organization_id=organization_id,
+                    identity_provider_id=idp.id,
+                    issuer=request.issuer,
+                    subject=request.external_subject,
+                    principal_type="service",
+                    service_principal_id=principal.id,
+                )
+        except IntegrityError as exc:
+            raise ConflictError("issuer and subject are already bound to another principal") from exc
         return principal
 
     def update_service_principal(
@@ -769,6 +775,8 @@ class SecurityService:
         org = self.repo.get_or_create_organization(
             OrganizationCreate(slug=request.organization_slug, name=request.organization_name)
         )
+        if org.lifecycle_state != "active":
+            raise SecurityConfigurationError("bootstrap organization is not active")
         existing_identity = self.session.scalar(
             select(UserIdentity).where(UserIdentity.issuer == request.issuer, UserIdentity.subject == request.subject)
         )
@@ -964,6 +972,7 @@ class SecurityService:
         http_method: str | None = None,
         http_path: str | None = None,
         request_metadata: dict[str, Any] | None = None,
+        audit_allowed: bool = True,
     ) -> None:
         if permission not in context.permissions:
             self.record_audit_event(
@@ -979,6 +988,8 @@ class SecurityService:
                 request_metadata=request_metadata,
             )
             raise AuthorizationError(SAFE_FORBIDDEN_ERROR)
+        if not audit_allowed:
+            return
         self.record_audit_event(
             context=context,
             action=action,
@@ -1000,7 +1011,7 @@ class SecurityService:
         actor: SecurityContext,
     ) -> OrganizationMembership:
         self._lock_organization_for_owner_transition(organization_id)
-        self._authorize_membership_role_assignment(actor, request.role)
+        self._authorize_membership_role_assignment(actor, request.role, audit_allowed=False)
         membership = self.session.scalar(
             select(OrganizationMembership).where(
                 OrganizationMembership.organization_id == organization_id,
@@ -1016,6 +1027,7 @@ class SecurityService:
             raise AuthorizationError("only owners may demote owners")
         else:
             if membership.role == "owner" and membership.lifecycle_state == "active" and request.role != "owner":
+                self.session.flush()
                 active_owner_count = self._active_owner_count(organization_id)
                 if active_owner_count <= 1:
                     raise AuthorizationError("cannot demote the final active owner")
@@ -1043,11 +1055,44 @@ class SecurityService:
         )
         return int(count or 0)
 
-    def _authorize_membership_role_assignment(self, actor: SecurityContext, role: str) -> None:
+    def _reachable_active_owner_count_excluding_idp(self, organization_id: str, excluded_idp_id: str) -> int:
+        count = self.session.scalar(
+            select(func.count(func.distinct(OrganizationMembership.user_id)))
+            .select_from(OrganizationMembership)
+            .join(User, User.id == OrganizationMembership.user_id)
+            .join(
+                UserIdentity,
+                UserIdentity.user_id == OrganizationMembership.user_id,
+            )
+            .join(
+                OrganizationIdentityProvider,
+                OrganizationIdentityProvider.id == UserIdentity.identity_provider_id,
+            )
+            .where(
+                OrganizationMembership.organization_id == organization_id,
+                OrganizationMembership.role == "owner",
+                OrganizationMembership.lifecycle_state == "active",
+                User.lifecycle_state == "active",
+                UserIdentity.organization_id == organization_id,
+                OrganizationIdentityProvider.organization_id == organization_id,
+                OrganizationIdentityProvider.status == "active",
+                OrganizationIdentityProvider.id != excluded_idp_id,
+            )
+        )
+        return int(count or 0)
+
+    def _authorize_membership_role_assignment(
+        self,
+        actor: SecurityContext,
+        role: str,
+        *,
+        audit_allowed: bool = True,
+    ) -> None:
         self.require_permission(
             actor,
             OWNERS_MANAGE if role == "owner" else "members.manage",
             action="members.role",
+            audit_allowed=audit_allowed,
         )
 
     def _lock_organization_for_owner_transition(self, organization_id: str) -> Organization:
@@ -1120,10 +1165,7 @@ class SecurityService:
             service_principal_id=service_principal_id,
         )
         self.session.add(binding)
-        try:
-            self.session.flush()
-        except IntegrityError as exc:
-            raise AuthorizationError("issuer and subject are already bound to another principal") from exc
+        self.session.flush()
 
     def change_membership_status(
         self,
@@ -1143,8 +1185,9 @@ class SecurityService:
         if membership is None:
             raise AuthorizationError("membership does not exist")
         permission = OWNERS_MANAGE if membership.role == "owner" else "members.manage"
-        self.require_permission(actor, permission, action="members.status")
+        self.require_permission(actor, permission, action="members.status", audit_allowed=False)
         if membership.role == "owner" and request.lifecycle_state != "active":
+            self.session.flush()
             if self._active_owner_count(organization_id) <= 1:
                 raise AuthorizationError("cannot deactivate the final active owner")
         membership.lifecycle_state = request.lifecycle_state
