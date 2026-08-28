@@ -8,6 +8,7 @@ import json
 import os
 import socket
 import ssl
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -62,6 +63,7 @@ SUPPORTED_SECURITY_MODES = {"disabled", "enterprise", "test"}
 SUPPORTED_ENVIRONMENTS = {"development", "test", "production"}
 DEFAULT_HTTPS_PORT = 443
 DEFAULT_JWKS_CACHE_TTL_SECONDS = 300.0
+MAX_JWKS_RESPONSE_BYTES = 65_536
 MAX_AUDIT_HTTP_PATH_LENGTH = 1024
 MAX_AUDIT_RESOURCE_ID_LENGTH = 255
 
@@ -302,16 +304,25 @@ def _fetch_jwks_with_pinned_address(jwks_uri: str, *, timeout_seconds: float) ->
     last_error: Exception | None = None
     for address in addresses:
         try:
+            deadline = time.monotonic() + timeout_seconds
             with socket.create_connection((address, port), timeout=timeout_seconds) as raw_socket:
                 context = ssl.create_default_context()
                 with context.wrap_socket(raw_socket, server_hostname=host) as tls_socket:
                     tls_socket.settimeout(timeout_seconds)
                     tls_socket.sendall(request)
                     chunks = []
+                    total_bytes = 0
                     while True:
+                        remaining_seconds = deadline - time.monotonic()
+                        if remaining_seconds <= 0:
+                            raise AuthenticationError(SAFE_AUTH_ERROR)
+                        tls_socket.settimeout(remaining_seconds)
                         chunk = tls_socket.recv(65536)
                         if not chunk:
                             break
+                        total_bytes += len(chunk)
+                        if total_bytes > MAX_JWKS_RESPONSE_BYTES:
+                            raise AuthenticationError(SAFE_AUTH_ERROR)
                         chunks.append(chunk)
             return _parse_jwks_http_response(b"".join(chunks))
         except Exception as exc:
@@ -578,6 +589,11 @@ class SecurityService:
         )
         user = self.session.scalar(select(User).where(User.email == email))
         if existing_identity is not None:
+            if (
+                existing_identity.organization_id != organization_id
+                or existing_identity.identity_provider_id != idp.id
+            ):
+                raise AuthorizationError("issuer and subject are already bound to another identity")
             existing_user = self.session.get(User, existing_identity.user_id)
             if user is not None and user.id != existing_identity.user_id:
                 raise AuthorizationError("issuer and subject are already bound to another local user")
@@ -714,6 +730,8 @@ class SecurityService:
                     full_name=request.owner_full_name,
                 )
             )
+        elif user.lifecycle_state != "active":
+            raise AuthorizationError("bootstrap owner user is not active")
         membership = self.repo.get_active_membership(org.id, user.id)
         if membership is None:
             existing = self.session.scalar(
@@ -783,6 +801,7 @@ class SecurityService:
         }
 
     def authenticate_bearer(self, organization_id: str, token: str, *, request_id: str) -> SecurityContext:
+        self._require_active_org(organization_id)
         idps = self.list_active_identity_providers(organization_id)
         last_error: Exception | None = None
         for idp in idps:
@@ -807,6 +826,7 @@ class SecurityService:
         request_id: str,
         identity_provider_id: str | None = None,
     ) -> SecurityContext:
+        self._require_active_org(organization_id)
         identity_filters = [
             UserIdentity.organization_id == organization_id,
             UserIdentity.issuer == claims.issuer,
@@ -1117,6 +1137,12 @@ class SecurityService:
         org = self.session.get(Organization, organization_id)
         if org is None:
             raise AuthorizationError("organization does not exist")
+        return org
+
+    def _require_active_org(self, organization_id: str) -> Organization:
+        org = self._require_org(organization_id)
+        if org.lifecycle_state != "active":
+            raise AuthorizationError(SAFE_FORBIDDEN_ERROR)
         return org
 
 

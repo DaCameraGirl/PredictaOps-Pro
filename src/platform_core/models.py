@@ -216,6 +216,12 @@ class SecretReference(Base, TimestampMixin):
 class SecurityAuditEvent(Base):
     __tablename__ = "security_audit_events"
     __table_args__ = (
+        Index(
+            "ix_security_audit_events_org_occurred_id",
+            "organization_id",
+            text("occurred_at DESC"),
+            text("id DESC"),
+        ),
         CheckConstraint("principal_type in ('user', 'service', 'system', 'anonymous')", name="ck_audit_principal_type"),
         CheckConstraint("outcome in ('allowed', 'denied', 'failed')", name="ck_audit_outcome"),
     )

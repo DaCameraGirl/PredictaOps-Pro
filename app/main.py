@@ -942,7 +942,6 @@ def register_organization_ingestion_source(organization_id: str, registration: S
             "name": source.name,
             "source_type": source.source_type,
             "status": source.status,
-            "config": source.config,
         }
 
 

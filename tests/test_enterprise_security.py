@@ -16,7 +16,7 @@ from alembic.config import Config
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -44,6 +44,7 @@ from enterprise_security.permissions import (
 from enterprise_security.redaction import assert_no_plaintext_secrets
 from enterprise_security.service import (
     MAX_AUDIT_HTTP_PATH_LENGTH,
+    MAX_JWKS_RESPONSE_BYTES,
     AuthenticationError,
     DeterministicTokenVerifier,
     EnvironmentSecretResolver,
@@ -86,6 +87,7 @@ from platform_core.models import (
     MaintenanceCase,
     MaintenanceNote,
     MLModelPromotionEvent,
+    Organization,
     OrganizationIdentityProvider,
     OrganizationMembership,
     SecretReference,
@@ -359,6 +361,7 @@ def test_migration_creates_enterprise_security_tables(migrated_db):
     identity_constraints = {
         constraint["name"] for constraint in inspect(engine).get_unique_constraints("user_identities")
     }
+    audit_indexes = {index["name"] for index in inspect(engine).get_indexes("security_audit_events")}
 
     assert {
         "organization_identity_providers",
@@ -369,6 +372,7 @@ def test_migration_creates_enterprise_security_tables(migrated_db):
     }.issubset(tables)
     assert columns["issuer"]["nullable"] is False
     assert "uq_user_identity_global_issuer_subject" in identity_constraints
+    assert "ix_security_audit_events_org_occurred_id" in audit_indexes
 
 
 def test_oidc_verifier_accepts_valid_signed_token_and_rejects_bad_tokens(migrated_db, rsa_keys, jwks):
@@ -725,6 +729,21 @@ def test_membership_and_tenant_authorization_fail_closed(migrated_db):
             )
 
 
+def test_authentication_rejects_inactive_organizations(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        org = session.get(Organization, fixture["organization_id"])
+        org.lifecycle_state = "inactive"
+        claims = _claims(fixture["subjects"]["owner"])
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({"owner-token": claims}))
+
+        with pytest.raises(PermissionError):
+            security.context_from_claims(fixture["organization_id"], claims, request_id="req-inactive-org")
+        with pytest.raises(PermissionError):
+            security.authenticate_bearer(fixture["organization_id"], "owner-token", request_id="req-inactive-org")
+
+
 def test_role_policy_and_owner_protection_rules(migrated_db):
     _engine, session_factory = migrated_db
     with session_factory() as session:
@@ -862,6 +881,51 @@ def test_onboarding_existing_identity_cannot_bypass_final_owner_protection(migra
         owner_membership = session.query(OrganizationMembership).filter_by(user_id=fixture["users"]["owner"]).one()
         assert owner_membership.role == "owner"
         assert owner_membership.lifecycle_state == "active"
+
+
+def test_onboarding_validates_identity_binding_before_membership_mutation(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session)
+        owner = security.context_from_claims(
+            fixture["organization_id"],
+            _claims(fixture["subjects"]["owner"]),
+            request_id="req-owner",
+        )
+        conflicting_idp = security.create_identity_provider(
+            fixture["organization_id"],
+            IdentityProviderCreate(
+                name="same-issuer-secondary",
+                issuer=ISSUER_A,
+                audience="secondary-audience",
+                jwks_uri=JWKS_URI,
+            ),
+            allow_development_targets=True,
+        )
+        membership = session.scalar(
+            select(OrganizationMembership).where(
+                OrganizationMembership.organization_id == fixture["organization_id"],
+                OrganizationMembership.user_id == fixture["users"]["bob"],
+            )
+        )
+        assert membership.role == "technician"
+
+        with pytest.raises(PermissionError):
+            security.onboard_user_identity(
+                fixture["organization_id"],
+                UserIdentityOnboard(
+                    email="bob@example.com",
+                    identity_provider_id=conflicting_idp.id,
+                    issuer=ISSUER_A,
+                    subject=fixture["subjects"]["bob"],
+                    role="admin",
+                ),
+                actor=owner,
+            )
+
+        assert membership.role == "technician"
+        assert membership.lifecycle_state == "active"
 
 
 def test_postgres_serializes_concurrent_final_owner_demotions(migrated_db):
@@ -1097,6 +1161,43 @@ def test_secret_references_do_not_expose_values_and_plaintext_source_config_is_r
             )
 
 
+def test_enterprise_ingestion_source_registration_omits_legacy_plaintext_config(
+    migrated_db,
+    monkeypatch,
+    rsa_keys,
+    jwks,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        session.add(
+            IngestionSource(
+                organization_id=fixture["organization_id"],
+                name="Legacy ABB",
+                source_type="abb",
+                status="active",
+                config={"auth": {"token": "legacy-plaintext-token"}},
+            )
+        )
+        session.commit()
+
+    _app_main, client = _enterprise_app(monkeypatch, session_factory, jwks=jwks)
+    response = client.post(
+        f"/api/ingestion/{fixture['organization_id']}/sources",
+        headers={"Authorization": f"Bearer {_token(rsa_keys['primary'], subject='engineer-sub')}"},
+        json={
+            "organization_id": fixture["organization_id"],
+            "source_type": "abb",
+            "name": "Legacy ABB",
+            "config": {"auth": {"token": {"secret_reference_id": "safe-reference"}}},
+        },
+    )
+
+    assert response.status_code == 200
+    assert "config" not in response.json()
+    assert "legacy-plaintext-token" not in response.text
+
+
 def test_security_configuration_rejects_dangerous_production_settings(monkeypatch):
     monkeypatch.setenv("PMS_ENVIRONMENT", "production")
     monkeypatch.setenv("PMS_SECURITY_MODE", "enterprise")
@@ -1206,7 +1307,7 @@ def test_oidc_jwks_fetch_pins_validated_connection_destination(monkeypatch):
             return False
 
         def settimeout(self, timeout):
-            assert timeout == 2.0
+            assert 0 < timeout <= 2.0
 
         def sendall(self, request):
             assert b"Host: issuer.example\r\n" in request
@@ -1234,6 +1335,89 @@ def test_oidc_jwks_fetch_pins_validated_connection_destination(monkeypatch):
     }
     assert resolver_calls == [("issuer.example", 443)]
     assert connected_addresses == [("93.184.216.34", 443)]
+
+
+def test_oidc_jwks_fetch_bounds_response_size_and_overall_deadline(monkeypatch):
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "issuer.example"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    class FakeRawSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeSslContext:
+        def __init__(self, tls_socket):
+            self.tls_socket = tls_socket
+
+        def wrap_socket(self, raw_socket, *, server_hostname):
+            assert isinstance(raw_socket, FakeRawSocket)
+            assert server_hostname == "issuer.example"
+            return self.tls_socket
+
+    class OversizedTlsSocket:
+        def __init__(self):
+            self._chunks = [
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n",
+                b"x" * (MAX_JWKS_RESPONSE_BYTES + 1),
+            ]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def settimeout(self, _timeout):
+            return None
+
+        def sendall(self, _request):
+            return None
+
+        def recv(self, _size):
+            return self._chunks.pop(0)
+
+    monkeypatch.setattr("enterprise_security.service.socket.getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr("enterprise_security.service.socket.create_connection", lambda *args, **kwargs: FakeRawSocket())
+    monkeypatch.setattr(
+        "enterprise_security.service.ssl.create_default_context",
+        lambda: FakeSslContext(OversizedTlsSocket()),
+    )
+    with pytest.raises(AuthenticationError):
+        _fetch_jwks_with_pinned_address("https://issuer.example/.well-known/jwks.json", timeout_seconds=2.0)
+
+    class TrickleTlsSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def settimeout(self, _timeout):
+            return None
+
+        def sendall(self, _request):
+            return None
+
+        def recv(self, _size):
+            return b"x"
+
+    monotonic_now = {"value": 0.0}
+
+    def fake_monotonic():
+        monotonic_now["value"] += 0.6
+        return monotonic_now["value"]
+
+    monkeypatch.setattr(
+        "enterprise_security.service.ssl.create_default_context",
+        lambda: FakeSslContext(TrickleTlsSocket()),
+    )
+    monkeypatch.setattr("enterprise_security.service.time.monotonic", fake_monotonic)
+    with pytest.raises(AuthenticationError):
+        _fetch_jwks_with_pinned_address("https://issuer.example/.well-known/jwks.json", timeout_seconds=1.0)
 
 
 def test_bootstrap_cli_algorithm_override_replaces_default(monkeypatch):
@@ -1309,6 +1493,29 @@ def test_bootstrap_security_provisioning_is_idempotent_and_org_scoped(migrated_d
         assert session.query(User).count() == 2
         assert session.query(OrganizationMembership).count() == 2
         assert session.query(UserIdentity).count() == 2
+
+
+def test_bootstrap_rejects_inactive_existing_owner_user(migrated_db):
+    _engine, session_factory = migrated_db
+    request = BootstrapSecurityRequest(
+        organization_slug="acme",
+        organization_name="Acme",
+        owner_email="owner@example.com",
+        issuer=ISSUER_A,
+        subject="owner-sub",
+        audience=AUDIENCE,
+        jwks_uri=JWKS_URI,
+    )
+    with session_factory() as session:
+        repo = PlatformRepository(session)
+        user = repo.create_user(UserCreate(email="owner@example.com"))
+        user.lifecycle_state = "inactive"
+
+        with pytest.raises(PermissionError):
+            SecurityService(session).bootstrap_initial_owner(request)
+
+        assert session.query(OrganizationMembership).count() == 0
+        assert session.query(UserIdentity).count() == 0
 
 
 def test_identity_provider_update_preserves_recovery_path(migrated_db):

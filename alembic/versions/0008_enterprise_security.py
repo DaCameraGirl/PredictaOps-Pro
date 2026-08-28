@@ -159,9 +159,15 @@ def upgrade() -> None:
     )
     for column in ["organization_id", "request_id", "service_principal_id", "user_id"]:
         op.create_index(f"ix_security_audit_events_{column}", "security_audit_events", [column])
+    op.create_index(
+        "ix_security_audit_events_org_occurred_id",
+        "security_audit_events",
+        ["organization_id", sa.text("occurred_at DESC"), sa.text("id DESC")],
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("ix_security_audit_events_org_occurred_id", table_name="security_audit_events")
     op.drop_table("security_audit_events")
     op.drop_table("secret_references")
     op.drop_table("service_principals")
