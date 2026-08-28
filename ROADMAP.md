@@ -85,7 +85,13 @@ GitHub pull request numbers may drift after branch renames or replacement PRs.
    explicit reassignment workflow. CMMS adapter timeouts, runtime failures, and invalid statuses are persisted as
    traceable sync outcomes without mutating existing external bindings.
 7. **Production Slice 12 - Enterprise Security**
-   RBAC, SSO/OIDC, tenant isolation, audit logs, secrets, and security hardening.
+   Generic OIDC bearer-token verification, issuer-plus-subject identity mapping, local membership/service-principal
+   authorization, centralized permission policy, actor-spoofing removal from public APIs, owner-protection rules,
+   organization-scoped IdP/service-principal/secret-reference administration, external secret-reference metadata and
+   runtime resolver boundary, plaintext connector-credential rejection, append-only sanitized security audit events,
+   production CORS/docs/OIDC safety checks, operator-run initial security bootstrap, secured API coverage across
+   platform, ingestion, analytics, ML, serving, and maintenance, and PostgreSQL migration/CI coverage. This slice does
+   not add browser SSO UI, SCIM, cloud vault integrations, custom role design, SIEM export, or compliance certification.
 8. **Production Slice 13 - Full Studio UI**
    Fleet to site to machine to bearing to sensor drill-down, health, risk, work-order, and model views.
 9. **Production Slice 14 - Agentic Copilot**

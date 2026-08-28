@@ -256,6 +256,91 @@ POST /api/maintenance/{organization_id}/cases/{case_id}/resolve
 GET  /api/maintenance/{organization_id}/health
 ```
 
+## Enterprise security
+
+Production Slice 12 adds the backend security contract for enterprise
+operation. In enterprise mode, public production APIs require a verified bearer
+token, resolve identity by OIDC issuer plus subject, map that external identity
+to a local user identity or service principal, and authorize from local
+organization membership or explicit service-principal scopes. IdP role/group
+claims are treated as identity-provider metadata only; the application database
+decides authorization.
+
+OIDC verification uses signed JWT access tokens and an organization-scoped JWKS
+configuration with explicit signing-algorithm allowlists. It validates issuer,
+audience, expiration, not-before, subject, key ID, and signature. `alg=none`,
+unexpected algorithms, invalid signatures, expired tokens, wrong issuer/audience,
+unknown keys after one JWKS refresh, and provider/network failures fail closed
+with generic `401` responses.
+
+Human actor fields on public APIs are derived from the authenticated security
+context in enterprise mode. Clients can still request assignees/owners where the
+domain allows that, but they cannot claim that another user acknowledged an
+alert, opened a case, authored a technician note, approved a model, approved a
+work order, or initiated CMMS sync. Service principals are separate non-human
+identities with explicit machine scopes such as ingestion, analytics, or
+prediction; they cannot create human maintenance facts or manage security.
+
+Security data added in this slice:
+
+```text
+organization_identity_providers
+user_identities
+service_principals
+secret_references
+security_audit_events
+```
+
+Secret values are not persisted. `secret_references` store provider/locator
+metadata only, normal list responses omit locators, and ingestion source
+configuration rejects plaintext credential-looking keys such as passwords,
+tokens, API keys, client secrets, and credentials. Runtime resolution currently
+supports an environment-backed resolver plus deterministic in-memory test
+resolver; cloud vault integrations are intentionally deferred.
+
+Privileged authorization outcomes and successful privileged mutations produce
+append-only `security_audit_events` with sanitized metadata, request IDs, actor
+identity, permission used, resource context, and allowed/denied outcome. Audit
+queries are organization-scoped, bounded, and require audit permission.
+
+Enterprise mode also tightens HTTP security configuration. Production rejects
+wildcard CORS, test-auth mode, unsafe OIDC/JWKS targets, and unprotected OpenAPI
+docs by default. The FastAPI app emits request IDs plus basic security response
+headers. TLS termination is expected upstream in production deployment.
+
+Operator-run first-time bootstrap:
+
+```bash
+python scripts/bootstrap_enterprise_security.py \
+  --organization-slug acme \
+  --organization-name "Acme Manufacturing" \
+  --owner-email owner@example.com \
+  --issuer https://idp.example.com/ \
+  --subject oidc-subject \
+  --audience predictive-maintenance-api \
+  --jwks-uri https://idp.example.com/.well-known/jwks.json
+```
+
+Useful security endpoints:
+
+```text
+GET   /api/security/{organization_id}/me
+POST  /api/security/{organization_id}/identity-providers
+GET   /api/security/{organization_id}/identity-providers
+POST  /api/security/{organization_id}/memberships
+PATCH /api/security/{organization_id}/memberships/{user_id}
+POST  /api/security/{organization_id}/service-principals
+GET   /api/security/{organization_id}/service-principals
+PATCH /api/security/{organization_id}/service-principals/{principal_id}
+POST  /api/security/{organization_id}/secret-references
+GET   /api/security/{organization_id}/secret-references
+GET   /api/security/{organization_id}/audit-events
+```
+
+This is not a browser SSO screen, SCIM, SIEM export, cloud secrets-vault
+integration, custom role designer, or compliance certification. Those remain
+outside Slice 12.
+
 ## Rebuild the current Test 2 model
 
 The existing downloader is intentionally Test-2-only:
@@ -314,8 +399,8 @@ uvicorn app.main:app --reload
 ## Validation
 
 Pull requests run Ruff, the full pytest suite including browser E2E coverage, a
-PostgreSQL migration/platform-stack job through Maintenance Operations, and a
-Docker build in GitHub Actions.
+PostgreSQL migration/platform-stack job through Enterprise Security, and a Docker
+build in GitHub Actions.
 
 ```bash
 python -m ruff check src app tests scripts

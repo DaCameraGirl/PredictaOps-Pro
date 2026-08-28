@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -14,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import inspect
+from sqlalchemy import inspect, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from analytics_pipeline.service import AnalyticsService
@@ -29,6 +30,46 @@ from bearing_data import (
 )
 from bearing_profiling import feature_trend, summarize
 from degradation_signal import DegradationSignal
+from enterprise_security.contracts import (
+    IdentityProviderCreate,
+    MembershipChange,
+    MembershipStatusChange,
+    SecretReferenceCreate,
+    ServicePrincipalCreate,
+    ServicePrincipalUpdate,
+)
+from enterprise_security.permissions import (
+    ANALYTICS_READ,
+    ANALYTICS_RUN,
+    AUDIT_READ,
+    INGESTION_MANAGE,
+    INGESTION_WRITE,
+    MAINTENANCE_CMMS_SYNC,
+    MAINTENANCE_MANAGE,
+    MAINTENANCE_READ,
+    MAINTENANCE_WORK_ORDER_APPROVE,
+    ML_EXPERIMENT_RUN,
+    ML_MODEL_PROMOTE_PRODUCTION,
+    ML_MODEL_PROMOTE_VALIDATED,
+    ML_MODEL_REGISTER,
+    ML_READ,
+    PLATFORM_READ,
+    PREDICTION_READ,
+    SECRETS_MANAGE,
+    SECURITY_MANAGE,
+    SERVING_BIND,
+    SERVING_PREDICT,
+)
+from enterprise_security.service import (
+    AuthenticationError,
+    AuthorizationError,
+    SecurityService,
+    audit_event_payload,
+    identity_provider_payload,
+    secret_reference_payload,
+    security_settings,
+    service_principal_payload,
+)
 from explain_bearing import BearingRulExplainer
 from industrial_ingestion.contracts import SourceRegistration
 from industrial_ingestion.service import IngestionService
@@ -73,7 +114,7 @@ from ml_platform.contracts import (
 from ml_platform.service import MLPlatformService
 from platform_core.config import database_settings, safe_database_label
 from platform_core.database import SessionLocal, check_database
-from platform_core.models import Base
+from platform_core.models import Asset, Base, Component, Organization, Sensor, Site
 from platform_core.services import PlatformService, get_platform_inventory
 from production_serving.contracts import PredictionRequest, ServingBindingCreate
 from production_serving.service import ProductionServingService
@@ -84,11 +125,36 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
+SECURITY_SETTINGS = security_settings()
 
-app = FastAPI(title="Predictive Maintenance Studio")
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+app = FastAPI(
+    title="Predictive Maintenance Studio",
+    docs_url=None if SECURITY_SETTINGS.environment == "production" and not SECURITY_SETTINGS.docs_enabled else "/docs",
+    redoc_url=(
+        None if SECURITY_SETTINGS.environment == "production" and not SECURITY_SETTINGS.docs_enabled else "/redoc"
+    ),
+    openapi_url=None
+    if SECURITY_SETTINGS.environment == "production" and not SECURITY_SETTINGS.docs_enabled
+    else "/openapi.json",
 )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(SECURITY_SETTINGS.cors_allowed_origins),
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+)
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid4().hex
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
 
 _explainer = BearingRulExplainer()
 _table = load_feature_table(DEFAULT_RUN)
@@ -224,6 +290,83 @@ def _rul_support(bearing: str, degradation: dict) -> dict:
     }
 
 
+def _enterprise_security_enabled() -> bool:
+    return SECURITY_SETTINGS.mode == "enterprise"
+
+
+def _reject_enterprise_legacy_endpoint() -> None:
+    if _enterprise_security_enabled():
+        raise HTTPException(status_code=403, detail="legacy IMS demo endpoint is disabled in enterprise mode")
+
+
+def _bearer_token(request: Request) -> str:
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        raise AuthenticationError("invalid or missing authentication")
+    return token
+
+
+def _authorize(
+    session,
+    request: Request,
+    organization_id: str,
+    permission: str,
+    *,
+    action: str,
+    resource_type: str | None = None,
+    resource_id: str | None = None,
+):
+    if not _enterprise_security_enabled():
+        return None
+    security = SecurityService(session)
+    try:
+        context = security.authenticate_bearer(
+            organization_id,
+            _bearer_token(request),
+            request_id=getattr(request.state, "request_id", uuid4().hex),
+        )
+        security.require_permission(
+            context,
+            permission,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            http_method=request.method,
+            http_path=request.url.path,
+        )
+        return context
+    except AuthenticationError as exc:
+        session.rollback()
+        raise HTTPException(status_code=401, detail="invalid or missing authentication") from exc
+    except AuthorizationError as exc:
+        session.commit()
+        raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
+
+
+def _authenticated_user_id(context, fallback_user_id: str | None) -> str:
+    if not _enterprise_security_enabled():
+        if fallback_user_id is None:
+            raise HTTPException(status_code=400, detail="user id is required when enterprise security is disabled")
+        return fallback_user_id
+    try:
+        return context.require_user()
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="human user principal required") from exc
+
+
+def _membership_payload(membership) -> dict:
+    return {
+        "id": membership.id,
+        "organization_id": membership.organization_id,
+        "user_id": membership.user_id,
+        "role": membership.role,
+        "lifecycle_state": membership.lifecycle_state,
+        "created_at": membership.created_at,
+        "updated_at": membership.updated_at,
+    }
+
+
 def _prediction_payload(bearing: str, row: pd.DataFrame, ts) -> dict:
     diagnostic_output = _explainer.predict(row)
     degradation = _degradation.evaluate(bearing, ts)
@@ -280,6 +423,8 @@ def platform_health():
 
 @app.post("/api/platform/bootstrap/ims")
 def bootstrap_platform_ims():
+    if _enterprise_security_enabled():
+        raise HTTPException(status_code=403, detail="IMS bootstrap is disabled as an unauthenticated enterprise API")
     with SessionLocal() as session:
         try:
             summary = PlatformService(session).bootstrap_ims_registry()
@@ -292,6 +437,8 @@ def bootstrap_platform_ims():
 
 @app.get("/api/platform/inventory")
 def platform_inventory():
+    if _enterprise_security_enabled():
+        raise HTTPException(status_code=403, detail="use organization-scoped inventory in enterprise mode")
     with SessionLocal() as session:
         try:
             return get_platform_inventory(session)
@@ -299,8 +446,312 @@ def platform_inventory():
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
+@app.get("/api/platform/{organization_id}/inventory")
+def organization_platform_inventory(organization_id: str, request: Request):
+    with SessionLocal() as session:
+        try:
+            _authorize(session, request, organization_id, PLATFORM_READ, action="platform.inventory.read")
+            organization = session.get(Organization, organization_id)
+            if organization is None:
+                raise HTTPException(status_code=404, detail="organization not found")
+            sites = list(
+                session.scalars(
+                    select(Site)
+                    .where(Site.organization_id == organization_id)
+                    .order_by(Site.slug)
+                )
+            )
+            assets = list(
+                session.scalars(
+                    select(Asset)
+                    .where(Asset.organization_id == organization_id)
+                    .order_by(Asset.slug)
+                )
+            )
+            components = list(
+                session.scalars(
+                    select(Component)
+                    .where(Component.organization_id == organization_id)
+                    .order_by(Component.slug)
+                )
+            )
+            sensors = list(
+                session.scalars(
+                    select(Sensor)
+                    .where(Sensor.organization_id == organization_id)
+                    .order_by(Sensor.slug)
+                )
+            )
+            session.commit()
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return {
+            "organizations": [
+                {"id": organization.id, "slug": organization.slug, "name": organization.name},
+            ],
+            "sites": [
+                {"id": site.id, "slug": site.slug, "name": site.name, "timezone": site.timezone}
+                for site in sites
+            ],
+            "assets": [
+                {
+                    "id": asset.id,
+                    "site_id": asset.site_id,
+                    "slug": asset.slug,
+                    "name": asset.name,
+                    "asset_type": asset.asset_type,
+                }
+                for asset in assets
+            ],
+            "components": [
+                {
+                    "id": component.id,
+                    "asset_id": component.asset_id,
+                    "slug": component.slug,
+                    "name": component.name,
+                    "component_type": component.component_type,
+                }
+                for component in components
+            ],
+            "sensors": [
+                {
+                    "id": sensor.id,
+                    "component_id": sensor.component_id,
+                    "slug": sensor.slug,
+                    "name": sensor.name,
+                    "sensor_type": sensor.sensor_type,
+                    "unit": sensor.unit,
+                    "sampling_rate_hz": sensor.sampling_rate_hz,
+                    "channel_name": sensor.channel_name,
+                    "axis": sensor.axis,
+                    "manufacturer": sensor.manufacturer,
+                    "model": sensor.model,
+                }
+                for sensor in sensors
+            ],
+        }
+
+
+@app.get("/api/security/{organization_id}/me")
+def get_current_security_context(organization_id: str, request: Request):
+    with SessionLocal() as session:
+        try:
+            context = _authorize(session, request, organization_id, PLATFORM_READ, action="security.me")
+            session.commit()
+            if context is None:
+                return {"security_mode": "disabled"}
+            return context.model_dump(exclude={"subject"})
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/security/{organization_id}/identity-providers")
+def create_identity_provider(organization_id: str, request: IdentityProviderCreate, http_request: Request):
+    with SessionLocal() as session:
+        try:
+            _authorize(session, http_request, organization_id, SECURITY_MANAGE, action="security.idp.create")
+            idp = SecurityService(session).create_identity_provider(organization_id, request)
+            session.commit()
+            return identity_provider_payload(idp)
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.get("/api/security/{organization_id}/identity-providers")
+def list_identity_providers(organization_id: str, request: Request):
+    with SessionLocal() as session:
+        try:
+            _authorize(session, request, organization_id, SECURITY_MANAGE, action="security.idp.list")
+            idps = SecurityService(session).list_identity_providers(organization_id)
+            session.commit()
+            return {"identity_providers": [identity_provider_payload(idp) for idp in idps]}
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/security/{organization_id}/memberships")
+def change_membership_role(organization_id: str, request: MembershipChange, http_request: Request):
+    with SessionLocal() as session:
+        security = SecurityService(session)
+        try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                PLATFORM_READ,
+                action="security.membership.auth",
+            )
+            membership = security.change_membership_role(organization_id, request, actor=context)
+            session.commit()
+            return _membership_payload(membership)
+        except AuthorizationError as exc:
+            session.commit()
+            raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.patch("/api/security/{organization_id}/memberships/{user_id}")
+def change_membership_status(
+    organization_id: str,
+    user_id: str,
+    request: MembershipStatusChange,
+    http_request: Request,
+):
+    with SessionLocal() as session:
+        security = SecurityService(session)
+        try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                PLATFORM_READ,
+                action="security.membership.auth",
+            )
+            membership = security.change_membership_status(organization_id, user_id, request, actor=context)
+            session.commit()
+            return _membership_payload(membership)
+        except AuthorizationError as exc:
+            session.commit()
+            raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/security/{organization_id}/service-principals")
+def create_service_principal(organization_id: str, request: ServicePrincipalCreate, http_request: Request):
+    with SessionLocal() as session:
+        try:
+            _authorize(
+                session,
+                http_request,
+                organization_id,
+                SECURITY_MANAGE,
+                action="security.service_principal.create",
+            )
+            principal = SecurityService(session).create_service_principal(organization_id, request)
+            session.commit()
+            return service_principal_payload(principal)
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.get("/api/security/{organization_id}/service-principals")
+def list_service_principals(organization_id: str, request: Request):
+    with SessionLocal() as session:
+        try:
+            _authorize(session, request, organization_id, SECURITY_MANAGE, action="security.service_principal.list")
+            principals = SecurityService(session).list_service_principals(organization_id)
+            session.commit()
+            return {"service_principals": [service_principal_payload(principal) for principal in principals]}
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.patch("/api/security/{organization_id}/service-principals/{principal_id}")
+def update_service_principal(
+    organization_id: str,
+    principal_id: str,
+    request: ServicePrincipalUpdate,
+    http_request: Request,
+):
+    with SessionLocal() as session:
+        try:
+            _authorize(
+                session,
+                http_request,
+                organization_id,
+                SECURITY_MANAGE,
+                action="security.service_principal.update",
+            )
+            principal = SecurityService(session).update_service_principal(organization_id, principal_id, request)
+            session.commit()
+            return service_principal_payload(principal)
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/security/{organization_id}/secret-references")
+def create_secret_reference(organization_id: str, request: SecretReferenceCreate, http_request: Request):
+    with SessionLocal() as session:
+        try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                SECRETS_MANAGE,
+                action="security.secret.create",
+            )
+            secret = SecurityService(session).create_secret_reference(
+                organization_id,
+                request,
+                created_by_user_id=_authenticated_user_id(context, None),
+            )
+            session.commit()
+            return secret_reference_payload(secret)
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.get("/api/security/{organization_id}/secret-references")
+def list_secret_references(organization_id: str, request: Request):
+    with SessionLocal() as session:
+        try:
+            _authorize(session, request, organization_id, SECRETS_MANAGE, action="security.secret.list")
+            secrets = SecurityService(session).list_secret_references(organization_id)
+            session.commit()
+            return {"secret_references": [secret_reference_payload(secret) for secret in secrets]}
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.get("/api/security/{organization_id}/audit-events")
+def list_security_audit_events(organization_id: str, request: Request, limit: int = 100, offset: int = 0):
+    with SessionLocal() as session:
+        try:
+            security = SecurityService(session)
+            _authorize(session, request, organization_id, AUDIT_READ, action="security.audit.list")
+            events = security.list_audit_events(organization_id, limit=limit, offset=offset)
+            session.commit()
+            return {"audit_events": [audit_event_payload(event) for event in events]}
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
 @app.post("/api/ingestion/sources")
 def register_ingestion_source(registration: SourceRegistration):
+    if _enterprise_security_enabled():
+        raise HTTPException(status_code=403, detail="use organization-scoped ingestion source registration")
     with SessionLocal() as session:
         try:
             source = IngestionService(session).register_source(registration)
@@ -317,6 +768,30 @@ def register_ingestion_source(registration: SourceRegistration):
             "name": source.name,
             "source_type": source.source_type,
             "status": source.status,
+        }
+
+
+@app.post("/api/ingestion/{organization_id}/sources")
+def register_organization_ingestion_source(organization_id: str, registration: SourceRegistration, request: Request):
+    with SessionLocal() as session:
+        try:
+            _authorize(session, request, organization_id, INGESTION_MANAGE, action="ingestion.source.register")
+            scoped_registration = registration.model_copy(update={"organization_id": organization_id})
+            source = IngestionService(session).register_source(scoped_registration)
+            session.commit()
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+        return {
+            "id": source.id,
+            "organization_id": source.organization_id,
+            "name": source.name,
+            "source_type": source.source_type,
+            "status": source.status,
+            "config": source.config,
         }
 
 
@@ -349,6 +824,9 @@ async def _json_body(request: Request):
 
 @app.post("/api/ingestion/{organization_id}/rest")
 async def ingest_rest(organization_id: str, request: Request, source_name: str = "REST Push"):
+    with SessionLocal() as session:
+        _authorize(session, request, organization_id, INGESTION_WRITE, action="ingestion.rest.write")
+        session.commit()
     return _ingest_payload(organization_id, "rest", await _json_body(request), source_name)
 
 
@@ -359,16 +837,25 @@ async def ingest_mqtt(
     source_name: str = "MQTT Bridge",
     topic: str | None = None,
 ):
+    with SessionLocal() as session:
+        _authorize(session, request, organization_id, INGESTION_WRITE, action="ingestion.mqtt.write")
+        session.commit()
     return _ingest_payload(organization_id, "mqtt", await request.body(), source_name, topic=topic)
 
 
 @app.post("/api/ingestion/{organization_id}/opcua")
 async def ingest_opcua(organization_id: str, request: Request, source_name: str = "OPC-UA Bridge"):
+    with SessionLocal() as session:
+        _authorize(session, request, organization_id, INGESTION_WRITE, action="ingestion.opcua.write")
+        session.commit()
     return _ingest_payload(organization_id, "opcua", await _json_body(request), source_name)
 
 
 @app.post("/api/ingestion/{organization_id}/abb")
 async def ingest_abb(organization_id: str, request: Request, source_name: str = "ABB Adapter"):
+    with SessionLocal() as session:
+        _authorize(session, request, organization_id, INGESTION_WRITE, action="ingestion.abb.write")
+        session.commit()
     return _ingest_payload(organization_id, "abb", await _json_body(request), source_name)
 
 
@@ -379,6 +866,9 @@ async def ingest_csv_file(
     source_name: str = "CSV File",
     source_uri: str | None = None,
 ):
+    with SessionLocal() as session:
+        _authorize(session, request, organization_id, INGESTION_WRITE, action="ingestion.csv.write")
+        session.commit()
     return _ingest_payload(organization_id, "csv", await request.body(), source_name, source_uri=source_uri)
 
 
@@ -389,13 +879,17 @@ async def ingest_parquet_file(
     source_name: str = "Parquet File",
     source_uri: str | None = None,
 ):
+    with SessionLocal() as session:
+        _authorize(session, request, organization_id, INGESTION_WRITE, action="ingestion.parquet.write")
+        session.commit()
     return _ingest_payload(organization_id, "parquet", await request.body(), source_name, source_uri=source_uri)
 
 
 @app.post("/api/ingestion/{organization_id}/replay/{batch_id}")
-def replay_ingestion_batch(organization_id: str, batch_id: str, source_name: str = "Replay"):
+def replay_ingestion_batch(organization_id: str, batch_id: str, request: Request, source_name: str = "Replay"):
     with SessionLocal() as session:
         try:
+            _authorize(session, request, organization_id, INGESTION_WRITE, action="ingestion.replay")
             receipt = IngestionService(session).replay_batch(organization_id, batch_id, source_name=source_name)
             session.commit()
         except ValueError as exc:
@@ -408,18 +902,20 @@ def replay_ingestion_batch(organization_id: str, batch_id: str, source_name: str
 
 
 @app.get("/api/ingestion/{organization_id}/health")
-def ingestion_health(organization_id: str):
+def ingestion_health(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, request, organization_id, INGESTION_MANAGE, action="ingestion.health.read")
             return IngestionService(session).health(organization_id)
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
 @app.post("/api/analytics/{organization_id}/batches/{batch_id}/compute")
-def compute_analytics_batch(organization_id: str, batch_id: str):
+def compute_analytics_batch(organization_id: str, batch_id: str, request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, request, organization_id, ANALYTICS_RUN, action="analytics.batch.compute")
             receipt = AnalyticsService(session).compute_batch(organization_id, batch_id)
             session.commit()
         except ValueError as exc:
@@ -432,9 +928,10 @@ def compute_analytics_batch(organization_id: str, batch_id: str):
 
 
 @app.post("/api/analytics/{organization_id}/sensors/{sensor_id}/recompute")
-def recompute_analytics_sensor(organization_id: str, sensor_id: str):
+def recompute_analytics_sensor(organization_id: str, sensor_id: str, request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, request, organization_id, ANALYTICS_RUN, action="analytics.sensor.recompute")
             receipt = AnalyticsService(session).recompute_sensor(organization_id, sensor_id)
             session.commit()
         except ValueError as exc:
@@ -447,18 +944,20 @@ def recompute_analytics_sensor(organization_id: str, sensor_id: str):
 
 
 @app.get("/api/analytics/{organization_id}/health")
-def analytics_health(organization_id: str):
+def analytics_health(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, request, organization_id, ANALYTICS_READ, action="analytics.health.read")
             return AnalyticsService(session).health(organization_id)
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
 @app.post("/api/ml/{organization_id}/dataset-versions")
-def create_ml_dataset_version(organization_id: str, request: DatasetVersionCreate):
+def create_ml_dataset_version(organization_id: str, request: DatasetVersionCreate, http_request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, http_request, organization_id, ML_EXPERIMENT_RUN, action="ml.dataset.create")
             dataset = MLPlatformService(session).create_dataset_version(organization_id, request)
             session.commit()
         except ValueError as exc:
@@ -471,19 +970,22 @@ def create_ml_dataset_version(organization_id: str, request: DatasetVersionCreat
 
 
 @app.get("/api/ml/{organization_id}/dataset-versions")
-def list_ml_dataset_versions(organization_id: str):
+def list_ml_dataset_versions(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, request, organization_id, ML_READ, action="ml.dataset.list")
             datasets = MLPlatformService(session).list_dataset_versions(organization_id)
+            session.commit()
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
         return {"dataset_versions": [_dataset_version_payload(dataset) for dataset in datasets]}
 
 
 @app.post("/api/ml/{organization_id}/experiments")
-def run_ml_experiment(organization_id: str, request: ExperimentCreate):
+def run_ml_experiment(organization_id: str, request: ExperimentCreate, http_request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, http_request, organization_id, ML_EXPERIMENT_RUN, action="ml.experiment.run")
             experiment = MLPlatformService(session).run_experiment(organization_id, request)
             session.commit()
         except ValueError as exc:
@@ -496,20 +998,24 @@ def run_ml_experiment(organization_id: str, request: ExperimentCreate):
 
 
 @app.get("/api/ml/{organization_id}/experiments")
-def list_ml_experiments(organization_id: str):
+def list_ml_experiments(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, request, organization_id, ML_READ, action="ml.experiment.list")
             experiments = MLPlatformService(session).list_experiments(organization_id)
+            session.commit()
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
         return {"experiments": [_experiment_payload(experiment) for experiment in experiments]}
 
 
 @app.get("/api/ml/{organization_id}/experiments/{experiment_run_id}")
-def get_ml_experiment(organization_id: str, experiment_run_id: str):
+def get_ml_experiment(organization_id: str, experiment_run_id: str, request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, request, organization_id, ML_READ, action="ml.experiment.get")
             experiment = MLPlatformService(session).get_experiment(organization_id, experiment_run_id)
+            session.commit()
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except SQLAlchemyError as exc:
@@ -518,9 +1024,10 @@ def get_ml_experiment(organization_id: str, experiment_run_id: str):
 
 
 @app.post("/api/ml/{organization_id}/registries")
-def create_ml_registry(organization_id: str, request: RegistryCreate):
+def create_ml_registry(organization_id: str, request: RegistryCreate, http_request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, http_request, organization_id, ML_MODEL_REGISTER, action="ml.registry.create")
             registry = MLPlatformService(session).create_registry(organization_id, request)
             session.commit()
         except ValueError as exc:
@@ -533,18 +1040,21 @@ def create_ml_registry(organization_id: str, request: RegistryCreate):
 
 
 @app.get("/api/ml/{organization_id}/registries")
-def list_ml_registries(organization_id: str):
+def list_ml_registries(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, request, organization_id, ML_READ, action="ml.registry.list")
+            session.commit()
             return {"registries": MLPlatformService(session).list_registries(organization_id)}
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
 @app.post("/api/ml/{organization_id}/model-versions")
-def register_ml_model_version(organization_id: str, request: ModelVersionCreate):
+def register_ml_model_version(organization_id: str, request: ModelVersionCreate, http_request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, http_request, organization_id, ML_MODEL_REGISTER, action="ml.model.register")
             model_version = MLPlatformService(session).register_model_version(organization_id, request)
             session.commit()
         except ValueError as exc:
@@ -557,9 +1067,22 @@ def register_ml_model_version(organization_id: str, request: ModelVersionCreate)
 
 
 @app.post("/api/ml/{organization_id}/model-versions/{model_version_id}/promote")
-def promote_ml_model_version(organization_id: str, model_version_id: str, request: PromoteModelVersion):
+def promote_ml_model_version(
+    organization_id: str,
+    model_version_id: str,
+    request: PromoteModelVersion,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            permission = (
+                ML_MODEL_PROMOTE_PRODUCTION
+                if request.target_stage == "production"
+                else ML_MODEL_PROMOTE_VALIDATED
+            )
+            context = _authorize(session, http_request, organization_id, permission, action="ml.model.promote")
+            if _enterprise_security_enabled() and request.target_stage == "production":
+                request = request.model_copy(update={"approved_by_user_id": _authenticated_user_id(context, None)})
             model_version = MLPlatformService(session).promote_model_version(
                 organization_id,
                 model_version_id,
@@ -576,9 +1099,23 @@ def promote_ml_model_version(organization_id: str, model_version_id: str, reques
 
 
 @app.post("/api/ml/{organization_id}/registries/{registry_id}/rollback")
-def rollback_ml_model_version(organization_id: str, registry_id: str, request: RollbackModelVersion):
+def rollback_ml_model_version(
+    organization_id: str,
+    registry_id: str,
+    request: RollbackModelVersion,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                ML_MODEL_PROMOTE_PRODUCTION,
+                action="ml.model.rollback",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"approved_by_user_id": _authenticated_user_id(context, None)})
             model_version = MLPlatformService(session).rollback_model_version(organization_id, registry_id, request)
             session.commit()
         except ValueError as exc:
@@ -591,9 +1128,12 @@ def rollback_ml_model_version(organization_id: str, registry_id: str, request: R
 
 
 @app.post("/api/serving/{organization_id}/bindings")
-def create_serving_binding(organization_id: str, request: ServingBindingCreate):
+def create_serving_binding(organization_id: str, request: ServingBindingCreate, http_request: Request):
     with SessionLocal() as session:
         try:
+            context = _authorize(session, http_request, organization_id, SERVING_BIND, action="serving.binding.create")
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"approved_by_user_id": _authenticated_user_id(context, None)})
             binding = ProductionServingService(session).bind_model(organization_id, request)
             session.commit()
         except ValueError as exc:
@@ -606,9 +1146,10 @@ def create_serving_binding(organization_id: str, request: ServingBindingCreate):
 
 
 @app.post("/api/serving/{organization_id}/predict/rul")
-def predict_production_rul(organization_id: str, request: PredictionRequest):
+def predict_production_rul(organization_id: str, request: PredictionRequest, http_request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, http_request, organization_id, SERVING_PREDICT, action="serving.predict.rul")
             prediction = ProductionServingService(session).predict_rul(organization_id, request)
             session.commit()
         except ValueError as exc:
@@ -621,28 +1162,36 @@ def predict_production_rul(organization_id: str, request: PredictionRequest):
 
 
 @app.get("/api/serving/{organization_id}/predictions")
-def list_production_predictions(organization_id: str, sensor_id: str | None = None):
+def list_production_predictions(organization_id: str, request: Request, sensor_id: str | None = None):
     with SessionLocal() as session:
         try:
+            _authorize(session, request, organization_id, PREDICTION_READ, action="serving.prediction.list")
             predictions = ProductionServingService(session).prediction_history(organization_id, sensor_id=sensor_id)
+            session.commit()
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
         return {"predictions": predictions}
 
 
 @app.get("/api/serving/{organization_id}/health")
-def production_serving_health(organization_id: str):
+def production_serving_health(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, request, organization_id, PREDICTION_READ, action="serving.health.read")
             return ProductionServingService(session).health(organization_id)
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
 @app.post("/api/maintenance/{organization_id}/alerts/evaluate-prediction")
-def evaluate_maintenance_alert_from_prediction(organization_id: str, request: PredictionAlertEvaluationRequest):
+def evaluate_maintenance_alert_from_prediction(
+    organization_id: str,
+    request: PredictionAlertEvaluationRequest,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            _authorize(session, http_request, organization_id, MAINTENANCE_MANAGE, action="maintenance.alert.evaluate")
             result = MaintenanceOperationsService(session).evaluate_prediction_alert(organization_id, request)
             session.commit()
         except ValueError as exc:
@@ -655,19 +1204,25 @@ def evaluate_maintenance_alert_from_prediction(organization_id: str, request: Pr
 
 
 @app.get("/api/maintenance/{organization_id}/alerts")
-def list_maintenance_alerts(organization_id: str, status: str | None = None):
+def list_maintenance_alerts(organization_id: str, request: Request, status: str | None = None):
     with SessionLocal() as session:
         try:
-            return {"alerts": MaintenanceOperationsService(session).list_alerts(organization_id, status=status)}
+            _authorize(session, request, organization_id, MAINTENANCE_READ, action="maintenance.alert.list")
+            alerts = MaintenanceOperationsService(session).list_alerts(organization_id, status=status)
+            session.commit()
+            return {"alerts": alerts}
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
 @app.get("/api/maintenance/{organization_id}/alerts/{alert_id}")
-def get_maintenance_alert(organization_id: str, alert_id: str):
+def get_maintenance_alert(organization_id: str, alert_id: str, request: Request):
     with SessionLocal() as session:
         try:
-            return MaintenanceOperationsService(session).get_alert(organization_id, alert_id)
+            _authorize(session, request, organization_id, MAINTENANCE_READ, action="maintenance.alert.get")
+            alert = MaintenanceOperationsService(session).get_alert(organization_id, alert_id)
+            session.commit()
+            return alert
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except SQLAlchemyError as exc:
@@ -675,9 +1230,23 @@ def get_maintenance_alert(organization_id: str, alert_id: str):
 
 
 @app.post("/api/maintenance/{organization_id}/alerts/{alert_id}/acknowledge")
-def acknowledge_maintenance_alert(organization_id: str, alert_id: str, request: AlertAcknowledgeRequest):
+def acknowledge_maintenance_alert(
+    organization_id: str,
+    alert_id: str,
+    request: AlertAcknowledgeRequest,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.alert.acknowledge",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"acknowledged_by_user_id": _authenticated_user_id(context, None)})
             alert = MaintenanceOperationsService(session).acknowledge_alert(organization_id, alert_id, request)
             session.commit()
         except ValueError as exc:
@@ -690,9 +1259,18 @@ def acknowledge_maintenance_alert(organization_id: str, alert_id: str, request: 
 
 
 @app.post("/api/maintenance/{organization_id}/alerts/{alert_id}/resolve")
-def resolve_maintenance_alert(organization_id: str, alert_id: str, request: AlertResolveRequest):
+def resolve_maintenance_alert(organization_id: str, alert_id: str, request: AlertResolveRequest, http_request: Request):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.alert.resolve",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"resolved_by_user_id": _authenticated_user_id(context, None)})
             alert = MaintenanceOperationsService(session).resolve_alert(organization_id, alert_id, request)
             session.commit()
         except ValueError as exc:
@@ -705,9 +1283,18 @@ def resolve_maintenance_alert(organization_id: str, alert_id: str, request: Aler
 
 
 @app.post("/api/maintenance/{organization_id}/cases")
-def open_maintenance_case(organization_id: str, request: CaseCreate):
+def open_maintenance_case(organization_id: str, request: CaseCreate, http_request: Request):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.case.create",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"opened_by_user_id": _authenticated_user_id(context, None)})
             case = MaintenanceOperationsService(session).open_case(organization_id, request)
             session.commit()
         except ValueError as exc:
@@ -720,9 +1307,23 @@ def open_maintenance_case(organization_id: str, request: CaseCreate):
 
 
 @app.post("/api/maintenance/{organization_id}/alerts/{alert_id}/case")
-def open_maintenance_case_from_alert(organization_id: str, alert_id: str, request: CaseCreateFromAlertRequest):
+def open_maintenance_case_from_alert(
+    organization_id: str,
+    alert_id: str,
+    request: CaseCreateFromAlertRequest,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.case.create_from_alert",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"opened_by_user_id": _authenticated_user_id(context, None)})
             case = MaintenanceOperationsService(session).open_case_from_alert(organization_id, alert_id, request)
             session.commit()
         except ValueError as exc:
@@ -735,19 +1336,25 @@ def open_maintenance_case_from_alert(organization_id: str, alert_id: str, reques
 
 
 @app.get("/api/maintenance/{organization_id}/cases")
-def list_maintenance_cases(organization_id: str, status: str | None = None):
+def list_maintenance_cases(organization_id: str, request: Request, status: str | None = None):
     with SessionLocal() as session:
         try:
-            return {"cases": MaintenanceOperationsService(session).list_cases(organization_id, status=status)}
+            _authorize(session, request, organization_id, MAINTENANCE_READ, action="maintenance.case.list")
+            cases = MaintenanceOperationsService(session).list_cases(organization_id, status=status)
+            session.commit()
+            return {"cases": cases}
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
 @app.get("/api/maintenance/{organization_id}/cases/{case_id}")
-def get_maintenance_case(organization_id: str, case_id: str):
+def get_maintenance_case(organization_id: str, case_id: str, request: Request):
     with SessionLocal() as session:
         try:
-            return MaintenanceOperationsService(session).get_case(organization_id, case_id)
+            _authorize(session, request, organization_id, MAINTENANCE_READ, action="maintenance.case.get")
+            case = MaintenanceOperationsService(session).get_case(organization_id, case_id)
+            session.commit()
+            return case
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except SQLAlchemyError as exc:
@@ -755,9 +1362,23 @@ def get_maintenance_case(organization_id: str, case_id: str):
 
 
 @app.post("/api/maintenance/{organization_id}/cases/{case_id}/transition")
-def transition_maintenance_case(organization_id: str, case_id: str, request: CaseTransitionRequest):
+def transition_maintenance_case(
+    organization_id: str,
+    case_id: str,
+    request: CaseTransitionRequest,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.case.transition",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"actor_user_id": _authenticated_user_id(context, None)})
             case = MaintenanceOperationsService(session).transition_case(organization_id, case_id, request)
             session.commit()
         except ValueError as exc:
@@ -770,9 +1391,23 @@ def transition_maintenance_case(organization_id: str, case_id: str, request: Cas
 
 
 @app.post("/api/maintenance/{organization_id}/cases/{case_id}/inspections")
-def request_maintenance_inspection(organization_id: str, case_id: str, request: InspectionRequestCreate):
+def request_maintenance_inspection(
+    organization_id: str,
+    case_id: str,
+    request: InspectionRequestCreate,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.inspection.request",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"requested_by_user_id": _authenticated_user_id(context, None)})
             inspection = MaintenanceOperationsService(session).request_inspection(organization_id, case_id, request)
             session.commit()
         except ValueError as exc:
@@ -785,9 +1420,23 @@ def request_maintenance_inspection(organization_id: str, case_id: str, request: 
 
 
 @app.post("/api/maintenance/{organization_id}/inspections/{inspection_id}/start")
-def start_maintenance_inspection(organization_id: str, inspection_id: str, request: InspectionStartRequest):
+def start_maintenance_inspection(
+    organization_id: str,
+    inspection_id: str,
+    request: InspectionStartRequest,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.inspection.start",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"started_by_user_id": _authenticated_user_id(context, None)})
             inspection = MaintenanceOperationsService(session).start_inspection(organization_id, inspection_id, request)
             session.commit()
         except ValueError as exc:
@@ -800,9 +1449,23 @@ def start_maintenance_inspection(organization_id: str, inspection_id: str, reque
 
 
 @app.post("/api/maintenance/{organization_id}/inspections/{inspection_id}/complete")
-def complete_maintenance_inspection(organization_id: str, inspection_id: str, request: InspectionCompleteRequest):
+def complete_maintenance_inspection(
+    organization_id: str,
+    inspection_id: str,
+    request: InspectionCompleteRequest,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.inspection.complete",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"performed_by_user_id": _authenticated_user_id(context, None)})
             inspection = MaintenanceOperationsService(session).complete_inspection(
                 organization_id,
                 inspection_id,
@@ -819,9 +1482,23 @@ def complete_maintenance_inspection(organization_id: str, inspection_id: str, re
 
 
 @app.post("/api/maintenance/{organization_id}/inspections/{inspection_id}/cancel")
-def cancel_maintenance_inspection(organization_id: str, inspection_id: str, request: InspectionCancelRequest):
+def cancel_maintenance_inspection(
+    organization_id: str,
+    inspection_id: str,
+    request: InspectionCancelRequest,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.inspection.cancel",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"cancelled_by_user_id": _authenticated_user_id(context, None)})
             inspection = MaintenanceOperationsService(session).cancel_inspection(
                 organization_id,
                 inspection_id,
@@ -838,9 +1515,18 @@ def cancel_maintenance_inspection(organization_id: str, inspection_id: str, requ
 
 
 @app.post("/api/maintenance/{organization_id}/cases/{case_id}/notes")
-def add_maintenance_note(organization_id: str, case_id: str, request: NoteCreate):
+def add_maintenance_note(organization_id: str, case_id: str, request: NoteCreate, http_request: Request):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.note.add",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"author_user_id": _authenticated_user_id(context, None)})
             note = MaintenanceOperationsService(session).add_note(organization_id, case_id, request)
             session.commit()
         except ValueError as exc:
@@ -853,10 +1539,13 @@ def add_maintenance_note(organization_id: str, case_id: str, request: NoteCreate
 
 
 @app.get("/api/maintenance/{organization_id}/cases/{case_id}/notes")
-def list_maintenance_notes(organization_id: str, case_id: str):
+def list_maintenance_notes(organization_id: str, case_id: str, request: Request):
     with SessionLocal() as session:
         try:
-            return {"notes": MaintenanceOperationsService(session).list_notes(organization_id, case_id)}
+            _authorize(session, request, organization_id, MAINTENANCE_READ, action="maintenance.note.list")
+            notes = MaintenanceOperationsService(session).list_notes(organization_id, case_id)
+            session.commit()
+            return {"notes": notes}
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except SQLAlchemyError as exc:
@@ -864,9 +1553,18 @@ def list_maintenance_notes(organization_id: str, case_id: str):
 
 
 @app.post("/api/maintenance/{organization_id}/cases/{case_id}/work-orders")
-def create_maintenance_work_order(organization_id: str, case_id: str, request: WorkOrderCreate):
+def create_maintenance_work_order(organization_id: str, case_id: str, request: WorkOrderCreate, http_request: Request):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.work_order.create",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"requested_by_user_id": _authenticated_user_id(context, None)})
             work_order = MaintenanceOperationsService(session).create_work_order(organization_id, case_id, request)
             session.commit()
         except ValueError as exc:
@@ -879,9 +1577,23 @@ def create_maintenance_work_order(organization_id: str, case_id: str, request: W
 
 
 @app.post("/api/maintenance/{organization_id}/work-orders/{work_order_id}/approve")
-def approve_maintenance_work_order(organization_id: str, work_order_id: str, request: WorkOrderApproveRequest):
+def approve_maintenance_work_order(
+    organization_id: str,
+    work_order_id: str,
+    request: WorkOrderApproveRequest,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_WORK_ORDER_APPROVE,
+                action="maintenance.work_order.approve",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"approved_by_user_id": _authenticated_user_id(context, None)})
             work_order = MaintenanceOperationsService(session).approve_work_order(
                 organization_id,
                 work_order_id,
@@ -898,9 +1610,23 @@ def approve_maintenance_work_order(organization_id: str, work_order_id: str, req
 
 
 @app.post("/api/maintenance/{organization_id}/work-orders/{work_order_id}/start")
-def start_maintenance_work_order(organization_id: str, work_order_id: str, request: WorkOrderStartRequest):
+def start_maintenance_work_order(
+    organization_id: str,
+    work_order_id: str,
+    request: WorkOrderStartRequest,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.work_order.start",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"started_by_user_id": _authenticated_user_id(context, None)})
             work_order = MaintenanceOperationsService(session).start_work_order(organization_id, work_order_id, request)
             session.commit()
         except ValueError as exc:
@@ -913,9 +1639,23 @@ def start_maintenance_work_order(organization_id: str, work_order_id: str, reque
 
 
 @app.post("/api/maintenance/{organization_id}/work-orders/{work_order_id}/complete")
-def complete_maintenance_work_order(organization_id: str, work_order_id: str, request: WorkOrderCompleteRequest):
+def complete_maintenance_work_order(
+    organization_id: str,
+    work_order_id: str,
+    request: WorkOrderCompleteRequest,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.work_order.complete",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"completed_by_user_id": _authenticated_user_id(context, None)})
             work_order = MaintenanceOperationsService(session).complete_work_order(
                 organization_id,
                 work_order_id,
@@ -932,9 +1672,23 @@ def complete_maintenance_work_order(organization_id: str, work_order_id: str, re
 
 
 @app.post("/api/maintenance/{organization_id}/work-orders/{work_order_id}/cancel")
-def cancel_maintenance_work_order(organization_id: str, work_order_id: str, request: WorkOrderCancelRequest):
+def cancel_maintenance_work_order(
+    organization_id: str,
+    work_order_id: str,
+    request: WorkOrderCancelRequest,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.work_order.cancel",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"cancelled_by_user_id": _authenticated_user_id(context, None)})
             work_order = MaintenanceOperationsService(session).cancel_work_order(
                 organization_id,
                 work_order_id,
@@ -951,9 +1705,23 @@ def cancel_maintenance_work_order(organization_id: str, work_order_id: str, requ
 
 
 @app.post("/api/maintenance/{organization_id}/work-orders/{work_order_id}/cmms-sync")
-def sync_maintenance_work_order_to_cmms(organization_id: str, work_order_id: str, request: CmmsSyncRequest):
+def sync_maintenance_work_order_to_cmms(
+    organization_id: str,
+    work_order_id: str,
+    request: CmmsSyncRequest,
+    http_request: Request,
+):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_CMMS_SYNC,
+                action="maintenance.cmms.sync",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"initiated_by_user_id": _authenticated_user_id(context, None)})
             sync = MaintenanceOperationsService(session).sync_work_order_to_cmms(
                 organization_id,
                 work_order_id,
@@ -970,10 +1738,12 @@ def sync_maintenance_work_order_to_cmms(organization_id: str, work_order_id: str
 
 
 @app.get("/api/maintenance/{organization_id}/work-orders/{work_order_id}/cmms-sync")
-def list_maintenance_work_order_cmms_syncs(organization_id: str, work_order_id: str):
+def list_maintenance_work_order_cmms_syncs(organization_id: str, work_order_id: str, request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, request, organization_id, MAINTENANCE_READ, action="maintenance.cmms.list")
             syncs = MaintenanceOperationsService(session).list_cmms_sync_records(organization_id, work_order_id)
+            session.commit()
             return {"sync_records": syncs}
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -982,9 +1752,18 @@ def list_maintenance_work_order_cmms_syncs(organization_id: str, work_order_id: 
 
 
 @app.post("/api/maintenance/{organization_id}/cases/{case_id}/resolve")
-def resolve_maintenance_case(organization_id: str, case_id: str, request: ResolutionCreate):
+def resolve_maintenance_case(organization_id: str, case_id: str, request: ResolutionCreate, http_request: Request):
     with SessionLocal() as session:
         try:
+            context = _authorize(
+                session,
+                http_request,
+                organization_id,
+                MAINTENANCE_MANAGE,
+                action="maintenance.case.resolve",
+            )
+            if _enterprise_security_enabled():
+                request = request.model_copy(update={"resolved_by_user_id": _authenticated_user_id(context, None)})
             resolution = MaintenanceOperationsService(session).resolve_case(organization_id, case_id, request)
             session.commit()
         except ValueError as exc:
@@ -997,9 +1776,10 @@ def resolve_maintenance_case(organization_id: str, case_id: str, request: Resolu
 
 
 @app.get("/api/maintenance/{organization_id}/health")
-def maintenance_operations_health(organization_id: str):
+def maintenance_operations_health(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
+            _authorize(session, request, organization_id, MAINTENANCE_READ, action="maintenance.health.read")
             return MaintenanceOperationsService(session).health(organization_id)
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
@@ -1096,6 +1876,7 @@ def _serving_binding_payload(binding) -> dict:
 
 @app.get("/api/profile")
 def profile():
+    _reject_enterprise_legacy_endpoint()
     return {
         **summarize(_table),
         "model": _metrics,
@@ -1106,6 +1887,7 @@ def profile():
 
 @app.get("/api/timeline")
 def timeline():
+    _reject_enterprise_legacy_endpoint()
     return {
         "n_snapshots": len(_timestamps),
         "timestamps": [ts.isoformat() for ts in _timestamps],
@@ -1116,6 +1898,7 @@ def timeline():
 
 @app.get("/api/snapshot/{index}")
 def snapshot(index: int):
+    _reject_enterprise_legacy_endpoint()
     ts = _timestamps[index] if 0 <= index < len(_timestamps) else None
     if ts is None:
         raise HTTPException(status_code=404, detail="snapshot index out of range")
@@ -1126,6 +1909,7 @@ def snapshot(index: int):
 
 @app.get("/api/snapshot/{index}/bearing/{bearing_id}")
 def bearing_detail(index: int, bearing_id: str):
+    _reject_enterprise_legacy_endpoint()
     if bearing_id not in BEARING_COLS:
         raise HTTPException(status_code=404, detail=f"unknown bearing {bearing_id}")
     row = _row_at(bearing_id, index)
@@ -1143,6 +1927,7 @@ def bearing_detail(index: int, bearing_id: str):
 @app.get("/api/bearing1-trend")
 def bearing1_trend():
     """Predicted vs. real RUL across bearing 1's whole life, sampled for the chart."""
+    _reject_enterprise_legacy_endpoint()
     step = max(1, len(_failed) // 200)
     sampled = _failed.iloc[::step]
     points = []
@@ -1161,6 +1946,7 @@ def bearing1_trend():
 
 @app.get("/api/feature-trend/{bearing_id}")
 def feature_trend_endpoint(bearing_id: str):
+    _reject_enterprise_legacy_endpoint()
     if bearing_id not in BEARING_COLS:
         raise HTTPException(status_code=404, detail=f"unknown bearing {bearing_id}")
     return {
@@ -1172,6 +1958,7 @@ def feature_trend_endpoint(bearing_id: str):
 
 @app.get("/api/waveform/{index}/bearing/{bearing_id}")
 def waveform(index: int, bearing_id: str):
+    _reject_enterprise_legacy_endpoint()
     if _waveforms is None:
         raise HTTPException(status_code=503, detail="waveform cache not available on this deployment")
     if bearing_id not in BEARING_COLS:
@@ -1184,6 +1971,7 @@ def waveform(index: int, bearing_id: str):
 
 @app.get("/api/export/trajectory/{bearing_id}.csv")
 def export_trajectory_csv(bearing_id: str):
+    _reject_enterprise_legacy_endpoint()
     if bearing_id not in BEARING_COLS:
         raise HTTPException(status_code=404, detail=f"unknown bearing {bearing_id}")
     sub = _table[_table["bearing"] == bearing_id].sort_values("timestamp")

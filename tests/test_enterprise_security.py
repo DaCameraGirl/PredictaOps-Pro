@@ -1,0 +1,711 @@
+from __future__ import annotations
+
+import base64
+import importlib
+import os
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import jwt
+import pytest
+from alembic.config import Config
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi.testclient import TestClient
+from sqlalchemy import inspect, text
+from sqlalchemy.orm import sessionmaker
+
+from alembic import command
+from enterprise_security.contracts import (
+    BootstrapSecurityRequest,
+    IdentityProviderCreate,
+    MembershipChange,
+    MembershipStatusChange,
+    SecretReferenceCreate,
+    ServicePrincipalCreate,
+    TokenClaims,
+    UserIdentityCreate,
+)
+from enterprise_security.permissions import (
+    INGESTION_WRITE,
+    MAINTENANCE_MANAGE,
+    ML_MODEL_PROMOTE_PRODUCTION,
+    SECURITY_MANAGE,
+    SERVICE_ALLOWED_PERMISSIONS,
+    SERVING_PREDICT,
+)
+from enterprise_security.redaction import assert_no_plaintext_secrets
+from enterprise_security.service import (
+    AuthenticationError,
+    DeterministicTokenVerifier,
+    InMemorySecretResolver,
+    OidcTokenVerifier,
+    SecurityConfigurationError,
+    SecurityService,
+    audit_event_payload,
+    secret_reference_payload,
+    security_settings,
+    validate_oidc_endpoint,
+)
+from industrial_ingestion.contracts import SourceRegistration
+from industrial_ingestion.service import IngestionService
+from maintenance_operations.contracts import CaseCreate
+from maintenance_operations.service import MaintenanceOperationsService
+from platform_core.contracts import (
+    AssetCreate,
+    ComponentCreate,
+    OrganizationCreate,
+    SensorCreate,
+    SiteCreate,
+    UserCreate,
+)
+from platform_core.database import make_engine
+from platform_core.models import (
+    Base,
+    IngestionSource,
+    MaintenanceCase,
+    MaintenanceNote,
+    OrganizationMembership,
+    SecretReference,
+    SecurityAuditEvent,
+    User,
+)
+from platform_core.repositories import PlatformRepository
+
+ROOT = Path(__file__).resolve().parent.parent
+ISSUER_A = "https://issuer-a.example/"
+ISSUER_B = "https://issuer-b.example/"
+AUDIENCE = "predictive-maintenance-api"
+JWKS_URI = "https://issuer-a.example/.well-known/jwks.json"
+
+
+@pytest.fixture
+def migrated_db(tmp_path, monkeypatch):
+    external_url = os.environ.get("PMS_PLATFORM_CORE_TEST_DATABASE_URL")
+    if external_url:
+        url = external_url
+    else:
+        db_path = tmp_path / "platform.db"
+        url = f"sqlite:///{db_path.as_posix()}"
+        monkeypatch.setenv("PMS_DATABASE_URL", url)
+
+    cfg = Config(str(ROOT / "alembic.ini"))
+    if external_url:
+        clean_engine = make_engine(url)
+        try:
+            Base.metadata.drop_all(clean_engine)
+            with clean_engine.begin() as connection:
+                connection.execute(text("DROP TABLE IF EXISTS alembic_version"))
+        finally:
+            clean_engine.dispose()
+    command.upgrade(cfg, "head")
+    engine = make_engine(url)
+    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+    try:
+        yield engine, session_factory
+    finally:
+        if external_url:
+            Base.metadata.drop_all(engine)
+            with engine.begin() as connection:
+                connection.execute(text("DROP TABLE IF EXISTS alembic_version"))
+        engine.dispose()
+
+
+@pytest.fixture
+def rsa_keys():
+    primary = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    alternate = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return {"primary": primary, "alternate": alternate}
+
+
+@pytest.fixture
+def jwks(rsa_keys):
+    return {"keys": [_jwk_from_public_key(rsa_keys["primary"].public_key(), kid="primary")]}
+
+
+def _b64url_int(value: int) -> str:
+    size = (value.bit_length() + 7) // 8
+    return base64.urlsafe_b64encode(value.to_bytes(size, "big")).rstrip(b"=").decode()
+
+
+def _jwk_from_public_key(public_key, *, kid: str) -> dict:
+    numbers = public_key.public_numbers()
+    return {
+        "kty": "RSA",
+        "use": "sig",
+        "kid": kid,
+        "alg": "RS256",
+        "n": _b64url_int(numbers.n),
+        "e": _b64url_int(numbers.e),
+    }
+
+
+def _token(
+    key,
+    *,
+    issuer: str = ISSUER_A,
+    audience: str = AUDIENCE,
+    subject: str = "alice-sub",
+    kid: str = "primary",
+    expires_delta: timedelta = timedelta(minutes=10),
+) -> str:
+    now = datetime.now(UTC)
+    return jwt.encode(
+        {
+            "iss": issuer,
+            "aud": audience,
+            "sub": subject,
+            "iat": now,
+            "nbf": now - timedelta(seconds=1),
+            "exp": now + expires_delta,
+            "email": f"{subject}@example.com",
+        },
+        key,
+        algorithm="RS256",
+        headers={"kid": kid},
+    )
+
+
+def _seed_security(session, *, jwks_uri: str = JWKS_URI):
+    repo = PlatformRepository(session)
+    org = repo.create_organization(OrganizationCreate(slug="acme", name="Acme Manufacturing"))
+    other_org = repo.create_organization(OrganizationCreate(slug="globex", name="Globex"))
+    site = repo.create_site(org.id, SiteCreate(slug="atlanta", name="Atlanta Plant"))
+    asset = repo.create_asset(org.id, AssetCreate(site_id=site.id, slug="pump", name="Pump", asset_type="pump"))
+    component = repo.create_component(
+        org.id,
+        ComponentCreate(asset_id=asset.id, slug="bearing", name="Bearing", component_type="bearing"),
+    )
+    sensor = repo.create_sensor(
+        org.id,
+        SensorCreate(component_id=component.id, slug="vib", name="Vibration", sensor_type="accelerometer", unit="g"),
+    )
+    users = {
+        "owner": repo.create_user(UserCreate(email="owner@example.com", external_subject="legacy-owner")),
+        "admin": repo.create_user(UserCreate(email="admin@example.com", external_subject="legacy-admin")),
+        "engineer": repo.create_user(UserCreate(email="engineer@example.com", external_subject="legacy-engineer")),
+        "technician": repo.create_user(UserCreate(email="tech@example.com", external_subject="legacy-tech")),
+        "viewer": repo.create_user(UserCreate(email="viewer@example.com", external_subject="legacy-viewer")),
+        "bob": repo.create_user(UserCreate(email="bob@example.com", external_subject="legacy-bob")),
+        "outsider": repo.create_user(UserCreate(email="outsider@example.com", external_subject="legacy-outsider")),
+    }
+    for role in ["owner", "admin", "engineer", "technician", "viewer"]:
+        repo.add_membership(org.id, users[role].id, role)
+    repo.add_membership(org.id, users["bob"].id, "technician")
+    repo.add_membership(other_org.id, users["outsider"].id, "owner")
+    security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+    idp = security.create_identity_provider(
+        org.id,
+        IdentityProviderCreate(name="primary", issuer=ISSUER_A, audience=AUDIENCE, jwks_uri=jwks_uri),
+        allow_development_targets=True,
+    )
+    other_idp = security.create_identity_provider(
+        other_org.id,
+        IdentityProviderCreate(
+            name="primary",
+            issuer=ISSUER_A,
+            audience=AUDIENCE,
+            jwks_uri=JWKS_URI,
+        ),
+        allow_development_targets=True,
+    )
+    subject_by_role = {
+        "owner": "owner-sub",
+        "admin": "admin-sub",
+        "engineer": "engineer-sub",
+        "technician": "tech-sub",
+        "viewer": "viewer-sub",
+        "bob": "bob-sub",
+    }
+    for role, subject in subject_by_role.items():
+        security.create_user_identity(
+            org.id,
+            UserIdentityCreate(
+                user_id=users[role].id,
+                identity_provider_id=idp.id,
+                issuer=ISSUER_A,
+                subject=subject,
+            ),
+        )
+    security.create_user_identity(
+        other_org.id,
+        UserIdentityCreate(
+            user_id=users["outsider"].id,
+            identity_provider_id=other_idp.id,
+            issuer=ISSUER_A,
+            subject="outsider-sub",
+        ),
+    )
+    service_principal = security.create_service_principal(
+        org.id,
+        ServicePrincipalCreate(
+            name="ingestion-robot",
+            external_subject="robot-sub",
+            issuer=ISSUER_A,
+            permissions=[INGESTION_WRITE],
+        ),
+    )
+    return {
+        "organization_id": org.id,
+        "other_organization_id": other_org.id,
+        "idp_id": idp.id,
+        "site_id": site.id,
+        "asset_id": asset.id,
+        "component_id": component.id,
+        "sensor_id": sensor.id,
+        "users": {role: user.id for role, user in users.items()},
+        "subjects": subject_by_role,
+        "service_principal_id": service_principal.id,
+    }
+
+
+def _claims(subject: str, *, issuer: str = ISSUER_A, audience: str = AUDIENCE) -> TokenClaims:
+    return TokenClaims(
+        issuer=issuer,
+        subject=subject,
+        audience=audience,
+        expires_at=int((datetime.now(UTC) + timedelta(minutes=5)).timestamp()),
+        algorithm="RS256",
+        key_id="primary",
+    )
+
+
+def test_migration_creates_enterprise_security_tables(migrated_db):
+    engine, _session_factory = migrated_db
+    tables = set(inspect(engine).get_table_names())
+
+    assert {
+        "organization_identity_providers",
+        "user_identities",
+        "service_principals",
+        "secret_references",
+        "security_audit_events",
+    }.issubset(tables)
+
+
+def test_oidc_verifier_accepts_valid_signed_token_and_rejects_bad_tokens(migrated_db, rsa_keys, jwks):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        idp = SecurityService(session).get_identity_provider(fixture["organization_id"], fixture["idp_id"])
+        verifier = OidcTokenVerifier()
+        verifier._jwks_cache[idp.jwks_uri] = jwks
+
+        valid = verifier.verify(_token(rsa_keys["primary"], subject="owner-sub"), idp)
+        assert valid.issuer == ISSUER_A
+        assert valid.subject == "owner-sub"
+
+        bad_signature = _token(rsa_keys["alternate"], subject="owner-sub")
+        expired = _token(rsa_keys["primary"], subject="owner-sub", expires_delta=timedelta(seconds=-5))
+        wrong_issuer = _token(rsa_keys["primary"], issuer="https://wrong.example/", subject="owner-sub")
+        wrong_audience = _token(rsa_keys["primary"], audience="wrong-audience", subject="owner-sub")
+        none_alg = jwt.encode(
+            {"iss": ISSUER_A, "aud": AUDIENCE, "sub": "owner-sub", "exp": datetime.now(UTC) + timedelta(minutes=5)},
+            key="",
+            algorithm="none",
+            headers={"kid": "primary"},
+        )
+
+        for token in [bad_signature, expired, wrong_issuer, wrong_audience, none_alg]:
+            with pytest.raises(AuthenticationError):
+                verifier.verify(token, idp)
+
+
+def test_unknown_kid_refreshes_jwks_once_then_fails_closed(migrated_db, rsa_keys):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        idp = SecurityService(session).get_identity_provider(fixture["organization_id"], fixture["idp_id"])
+        verifier = OidcTokenVerifier()
+        calls = []
+
+        def fake_load_jwks(_jwks_uri, *, refresh):
+            calls.append(refresh)
+            return {"keys": [_jwk_from_public_key(rsa_keys["primary"].public_key(), kid="primary")]}
+
+        verifier._load_jwks = fake_load_jwks
+        with pytest.raises(AuthenticationError):
+            verifier.verify(_token(rsa_keys["primary"], subject="owner-sub", kid="rotated"), idp)
+
+        assert calls == [False, True]
+
+
+def test_identity_resolution_uses_issuer_and_subject_not_subject_alone(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        repo = PlatformRepository(session)
+        org_a = repo.create_organization(OrganizationCreate(slug="a", name="A"))
+        org_b = repo.create_organization(OrganizationCreate(slug="b", name="B"))
+        user_a = repo.create_user(UserCreate(email="same-a@example.com", external_subject="same-sub"))
+        user_b = repo.create_user(UserCreate(email="same-b@example.com"))
+        repo.add_membership(org_a.id, user_a.id, "viewer")
+        repo.add_membership(org_b.id, user_b.id, "viewer")
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        idp_a = security.create_identity_provider(
+            org_a.id,
+            IdentityProviderCreate(name="idp-a", issuer=ISSUER_A, audience=AUDIENCE, jwks_uri=JWKS_URI),
+            allow_development_targets=True,
+        )
+        idp_b = security.create_identity_provider(
+            org_b.id,
+            IdentityProviderCreate(
+                name="idp-b",
+                issuer=ISSUER_B,
+                audience=AUDIENCE,
+                jwks_uri="https://issuer-b.example/jwks",
+            ),
+            allow_development_targets=True,
+        )
+        security.create_user_identity(
+            org_a.id,
+            UserIdentityCreate(user_id=user_a.id, identity_provider_id=idp_a.id, issuer=ISSUER_A, subject="same-sub"),
+        )
+        security.create_user_identity(
+            org_b.id,
+            UserIdentityCreate(user_id=user_b.id, identity_provider_id=idp_b.id, issuer=ISSUER_B, subject="same-sub"),
+        )
+
+        context = security.context_from_claims(org_b.id, _claims("same-sub", issuer=ISSUER_B), request_id="req")
+
+        assert context.user_id == user_b.id
+
+
+def test_membership_and_tenant_authorization_fail_closed(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        viewer = security.context_from_claims(
+            fixture["organization_id"],
+            _claims(fixture["subjects"]["viewer"]),
+            request_id="req-viewer",
+        )
+        assert viewer.role == "viewer"
+        with pytest.raises(PermissionError):
+            security.require_permission(viewer, MAINTENANCE_MANAGE, action="maintenance.case.create")
+
+        membership = session.get(OrganizationMembership, viewer.user_id)
+        assert membership is None
+        actual_membership = session.query(OrganizationMembership).filter_by(user_id=viewer.user_id).one()
+        actual_membership.lifecycle_state = "inactive"
+        session.flush()
+        with pytest.raises(PermissionError):
+            security.context_from_claims(
+                fixture["organization_id"],
+                _claims(fixture["subjects"]["viewer"]),
+                request_id="req",
+            )
+        with pytest.raises(PermissionError):
+            security.context_from_claims(
+                fixture["other_organization_id"],
+                _claims(fixture["subjects"]["engineer"]),
+                request_id="req-cross",
+            )
+
+
+def test_role_policy_and_owner_protection_rules(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        admin = security.context_from_claims(
+            fixture["organization_id"],
+            _claims(fixture["subjects"]["admin"]),
+            request_id="req-admin",
+        )
+        owner = security.context_from_claims(
+            fixture["organization_id"],
+            _claims(fixture["subjects"]["owner"]),
+            request_id="req-owner",
+        )
+
+        with pytest.raises(PermissionError):
+            security.change_membership_role(
+                fixture["organization_id"],
+                MembershipChange(user_id=fixture["users"]["admin"], role="owner"),
+                actor=admin,
+            )
+        promoted = security.change_membership_role(
+            fixture["organization_id"],
+            MembershipChange(user_id=fixture["users"]["admin"], role="owner"),
+            actor=owner,
+        )
+        assert promoted.role == "owner"
+
+        original_owner = session.query(OrganizationMembership).filter_by(user_id=fixture["users"]["owner"]).one()
+        promoted.lifecycle_state = "inactive"
+        with pytest.raises(PermissionError):
+            security.change_membership_status(
+                fixture["organization_id"],
+                fixture["users"]["owner"],
+                MembershipStatusChange(lifecycle_state="inactive"),
+                actor=owner,
+            )
+        assert original_owner.lifecycle_state == "active"
+
+
+def test_service_principal_scopes_are_machine_only(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        service = security.context_from_claims(
+            fixture["organization_id"],
+            _claims("robot-sub"),
+            request_id="req-service",
+        )
+
+        assert service.principal_type == "service"
+        security.require_permission(service, INGESTION_WRITE, action="ingestion.write")
+        with pytest.raises(PermissionError):
+            security.require_permission(service, MAINTENANCE_MANAGE, action="maintenance.note.add")
+        with pytest.raises(ValueError):
+            security.create_service_principal(
+                fixture["organization_id"],
+                ServicePrincipalCreate(
+                    name="bad-robot",
+                    external_subject="bad-robot",
+                    permissions=[ML_MODEL_PROMOTE_PRODUCTION],
+                ),
+            )
+        assert INGESTION_WRITE in SERVICE_ALLOWED_PERMISSIONS
+        assert SERVING_PREDICT in SERVICE_ALLOWED_PERMISSIONS
+
+
+def test_secret_references_do_not_expose_values_and_plaintext_source_config_is_rejected(migrated_db, monkeypatch):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        secret = security.create_secret_reference(
+            fixture["organization_id"],
+            SecretReferenceCreate(
+                name="abb-token",
+                purpose="abb_api_token",
+                provider="env",
+                locator="ABB_TOKEN",
+                rotation_metadata={"last_token": "should-redact"},
+            ),
+            created_by_user_id=fixture["users"]["owner"],
+        )
+        monkeypatch.setenv("ABB_TOKEN", "super-secret-value")
+        resolved = InMemorySecretResolver({"ABB_TOKEN": "super-secret-value"}).resolve(secret)
+
+        assert resolved == "super-secret-value"
+        payload = secret_reference_payload(secret)
+        assert "locator" not in payload
+        assert "super-secret-value" not in str(payload)
+        assert payload["rotation_metadata"]["last_token"] == "[REDACTED]"
+        with pytest.raises(ValueError):
+            assert_no_plaintext_secrets({"nested": {"api_key": "plaintext"}})
+        IngestionService(session).register_source(
+            SourceRegistration(
+                organization_id=fixture["organization_id"],
+                source_type="abb",
+                name="ABB",
+                config={"auth": {"token": {"secret_reference_id": secret.id}}},
+            )
+        )
+        with pytest.raises(ValueError):
+            IngestionService(session).register_source(
+                SourceRegistration(
+                    organization_id=fixture["organization_id"],
+                    source_type="abb",
+                    name="Bad ABB",
+                    config={"auth": {"token": "plaintext"}},
+                )
+            )
+
+
+def test_security_configuration_rejects_dangerous_production_settings(monkeypatch):
+    monkeypatch.setenv("PMS_ENVIRONMENT", "production")
+    monkeypatch.setenv("PMS_SECURITY_MODE", "enterprise")
+    monkeypatch.setenv("PMS_CORS_ALLOWED_ORIGINS", "*")
+    with pytest.raises(SecurityConfigurationError):
+        security_settings()
+    monkeypatch.setenv("PMS_CORS_ALLOWED_ORIGINS", "https://studio.example")
+    monkeypatch.setenv("PMS_ENABLE_DOCS", "1")
+    with pytest.raises(SecurityConfigurationError):
+        security_settings()
+    monkeypatch.setenv("PMS_ENABLE_DOCS", "0")
+    monkeypatch.setenv("PMS_TEST_AUTH", "1")
+    with pytest.raises(SecurityConfigurationError):
+        security_settings()
+    with pytest.raises(SecurityConfigurationError):
+        validate_oidc_endpoint("http://127.0.0.1/jwks")
+
+
+def test_bootstrap_security_provisioning_is_idempotent(migrated_db):
+    _engine, session_factory = migrated_db
+    request = BootstrapSecurityRequest(
+        organization_slug="acme",
+        organization_name="Acme",
+        owner_email="owner@example.com",
+        issuer=ISSUER_A,
+        subject="owner-sub",
+        audience=AUDIENCE,
+        jwks_uri=JWKS_URI,
+    )
+    with session_factory() as session:
+        first = SecurityService(session).bootstrap_initial_owner(request)
+        second = SecurityService(session).bootstrap_initial_owner(request)
+        session.commit()
+
+        assert first == second
+        assert session.query(User).count() == 1
+        assert session.query(OrganizationMembership).count() == 1
+
+
+def test_authenticated_api_enforces_tenant_permissions_and_blocks_actor_spoofing(
+    migrated_db,
+    monkeypatch,
+    rsa_keys,
+    jwks,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        session.commit()
+
+    monkeypatch.setenv("PMS_SECURITY_MODE", "enterprise")
+    monkeypatch.setenv("PMS_ENVIRONMENT", "development")
+    monkeypatch.setenv("PMS_CORS_ALLOWED_ORIGINS", "http://testserver")
+    import app.main as app_main
+
+    app_main = importlib.reload(app_main)
+    monkeypatch.setattr(app_main, "SessionLocal", session_factory)
+    monkeypatch.setattr(OidcTokenVerifier, "_load_jwks", lambda self, uri, refresh: jwks)
+    client = TestClient(app_main.app)
+
+    def auth(subject: str, *, issuer: str = ISSUER_A, key=None) -> dict[str, str]:
+        return {"Authorization": f"Bearer {_token(key or rsa_keys['primary'], issuer=issuer, subject=subject)}"}
+
+    org_id = fixture["organization_id"]
+    viewer_headers = auth(fixture["subjects"]["viewer"])
+    owner_headers = auth(fixture["subjects"]["owner"])
+    engineer_headers = auth(fixture["subjects"]["engineer"])
+    tech_headers = auth(fixture["subjects"]["technician"])
+    outsider_headers = auth("outsider-sub")
+
+    denied = client.post(
+        f"/api/ingestion/{org_id}/sources",
+        headers=viewer_headers,
+        json={"organization_id": org_id, "source_type": "rest", "name": "Viewer Source"},
+    )
+    assert denied.status_code == 403
+
+    other_org_body = fixture["other_organization_id"]
+    created = client.post(
+        f"/api/ingestion/{org_id}/sources",
+        headers=engineer_headers,
+        json={
+            "organization_id": other_org_body,
+            "source_type": "rest",
+            "name": "Engineer Source",
+            "config": {"auth": {"token": {"secret_reference_id": "ref"}}},
+        },
+    )
+    assert created.status_code == 200
+    assert created.json()["organization_id"] == org_id
+
+    inventory = client.get(f"/api/platform/{org_id}/inventory", headers=engineer_headers)
+    assert inventory.status_code == 200
+    assert [organization["id"] for organization in inventory.json()["organizations"]] == [org_id]
+    assert inventory.json()["assets"][0]["site_id"] == fixture["site_id"]
+
+    legacy_profile = client.get("/api/profile", headers=engineer_headers)
+    assert legacy_profile.status_code == 403
+
+    cross_tenant = client.get(f"/api/maintenance/{org_id}/cases", headers=outsider_headers)
+    assert cross_tenant.status_code == 403
+
+    viewer_audit = client.get(f"/api/security/{org_id}/audit-events", headers=viewer_headers)
+    assert viewer_audit.status_code == 403
+    owner_audit = client.get(f"/api/security/{org_id}/audit-events", headers=owner_headers)
+    assert owner_audit.status_code == 200
+
+    spoofed = client.post(
+        f"/api/maintenance/{org_id}/cases",
+        headers=tech_headers,
+        json={
+            "title": "Manual inspection case",
+            "priority": "medium",
+            "opened_by_user_id": fixture["users"]["bob"],
+            "summary": "Operator heard noise.",
+        },
+    )
+    assert spoofed.status_code == 200
+    assert spoofed.json()["opened_by_user_id"] == fixture["users"]["technician"]
+
+    with session_factory() as session:
+        source = session.query(IngestionSource).filter_by(name="Engineer Source").one()
+        case = session.query(MaintenanceCase).one()
+        denied_events = session.query(SecurityAuditEvent).filter_by(outcome="denied").all()
+
+    assert source.organization_id == org_id
+    assert case.opened_by_user_id == fixture["users"]["technician"]
+    assert any(event.required_permission == "ingestion.manage" for event in denied_events)
+
+
+def test_service_principal_cannot_create_human_note_via_api(migrated_db, monkeypatch, rsa_keys, jwks):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        case = MaintenanceOperationsService(session).open_case(
+            fixture["organization_id"],
+            CaseCreate(
+                title="Manual case",
+                priority="medium",
+                opened_by_user_id=fixture["users"]["technician"],
+                summary="Needs inspection.",
+            ),
+        )
+        session.commit()
+
+    monkeypatch.setenv("PMS_SECURITY_MODE", "enterprise")
+    monkeypatch.setenv("PMS_ENVIRONMENT", "development")
+    monkeypatch.setenv("PMS_CORS_ALLOWED_ORIGINS", "http://testserver")
+    import app.main as app_main
+
+    app_main = importlib.reload(app_main)
+    monkeypatch.setattr(app_main, "SessionLocal", session_factory)
+    monkeypatch.setattr(OidcTokenVerifier, "_load_jwks", lambda self, uri, refresh: jwks)
+    client = TestClient(app_main.app)
+    token = _token(rsa_keys["primary"], subject="robot-sub")
+
+    response = client.post(
+        f"/api/maintenance/{fixture['organization_id']}/cases/{case.id}/notes",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"author_user_id": fixture["users"]["bob"], "body": "Machine wrote this."},
+    )
+
+    assert response.status_code == 403
+    with session_factory() as session:
+        assert session.query(MaintenanceNote).count() == 0
+
+
+def test_audit_payload_is_sanitized_and_append_only_through_api(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        context = security.context_from_claims(
+            fixture["organization_id"],
+            _claims(fixture["subjects"]["owner"]),
+            request_id="req-audit",
+        )
+        event = security.record_audit_event(
+            context=context,
+            action="security.secret.create",
+            required_permission=SECURITY_MANAGE,
+            resource_type="secret_reference",
+            resource_id="secret-1",
+            outcome="allowed",
+            reason_code="permission_granted",
+            request_metadata={"Authorization": "Bearer abc", "safe": "ok"},
+        )
+        session.commit()
+
+        payload = audit_event_payload(event)
+        assert payload["request_metadata"]["Authorization"] == "[REDACTED]"
+        assert "abc" not in str(payload)
+        assert session.query(SecretReference).count() == 0
