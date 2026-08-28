@@ -918,14 +918,25 @@ def _policy_contract_error(policy: dict[str, Any], dataset: MLDatasetVersion) ->
     min_validation_groups = policy.get("min_validation_groups")
     if min_validation_groups is None:
         return None
-    try:
-        required_groups = int(min_validation_groups)
-    except (TypeError, ValueError):
+    required_groups = _strict_integer_policy_value(min_validation_groups)
+    if required_groups is None:
         return "abstention policy min_validation_groups must be an integer"
     if required_groups < 1:
         return "abstention policy min_validation_groups must be positive"
     if dataset.validation_group_count < required_groups:
         return "model validation evidence does not satisfy min_validation_groups abstention policy"
+    return None
+
+
+def _strict_integer_policy_value(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        digits = value[1:] if value.startswith("-") else value
+        if digits and all("0" <= char <= "9" for char in digits):
+            return int(value)
     return None
 
 

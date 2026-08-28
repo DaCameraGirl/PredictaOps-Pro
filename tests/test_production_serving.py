@@ -152,6 +152,7 @@ def _seed_feature_rows(
     feature_names: list[str] | None = None,
     base_time: datetime | None = None,
     feature_units: dict[str, str | None] | None = None,
+    include_sparse_validation_group: bool = False,
 ) -> None:
     feature_names = feature_names or ["scalar.rms"]
     feature_units = feature_units or {}
@@ -171,10 +172,20 @@ def _seed_feature_rows(
         provenance={"test": "production-serving"},
     )
     base_time = base_time or datetime.now(UTC)
-    for sensor_id, run_id, group, offset in [
+    validation_groups = [
         (fixture["sensor_a_id"], run.id, "bearing-a", 0.0),
         (fixture["sensor_b_id"], run_b.id, "bearing-b", 10.0),
-    ]:
+    ]
+    if include_sparse_validation_group:
+        run_sparse = repo.create_analytics_run(
+            fixture["organization_id"],
+            run_kind="sensor",
+            sensor_id=fixture["sensor_sparse_id"],
+            algorithm_version="analytics-v1",
+            provenance={"test": "production-serving"},
+        )
+        validation_groups.append((fixture["sensor_sparse_id"], run_sparse.id, "bearing-c", 20.0))
+    for sensor_id, run_id, group, offset in validation_groups:
         for index in range(4):
             for feature_name in feature_names:
                 value = float(index + offset)
@@ -209,6 +220,7 @@ def _production_model(
     base_time: datetime | None = None,
     feature_units: dict[str, str | None] | None = None,
     abstention_policy: dict | None = None,
+    include_sparse_validation_group: bool = False,
     registry_name: str = "bearing-rul",
     registry_task: str = "rul_regression",
     target_name: str = "RUL_hours",
@@ -217,7 +229,14 @@ def _production_model(
     model_version_label: str = "1.0.0",
 ):
     feature_names = feature_names or ["scalar.rms"]
-    _seed_feature_rows(session, fixture, feature_names=feature_names, base_time=base_time, feature_units=feature_units)
+    _seed_feature_rows(
+        session,
+        fixture,
+        feature_names=feature_names,
+        base_time=base_time,
+        feature_units=feature_units,
+        include_sparse_validation_group=include_sparse_validation_group,
+    )
     ml_service = MLPlatformService(session, ModelArtifactStore(tmp_path / "models"))
     dataset = ml_service.create_dataset_version(
         fixture["organization_id"],
@@ -813,6 +832,57 @@ def test_prediction_rejects_unmet_min_validation_groups_policy(migrated_db, serv
         assert prediction.prediction_status == "unsupported"
         assert prediction.abstention_code == "UNMET_ABSTENTION_POLICY"
         assert prediction.model_resolution["evidence"]["validation_group_count"] == 2
+
+
+def test_prediction_accepts_integer_min_validation_groups_policy(migrated_db, serving_fixture, tmp_path):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        registry, model_version, dataset = _production_model(
+            session,
+            serving_fixture,
+            tmp_path,
+            abstention_policy={"min_validation_groups": 3},
+            include_sparse_validation_group=True,
+        )
+        _bind_sensor(session, serving_fixture, registry, model_version)
+
+        prediction = ProductionServingService(session, ModelArtifactStore(tmp_path / "models")).predict_rul(
+            serving_fixture["organization_id"],
+            PredictionRequest(sensor_id=serving_fixture["sensor_a_id"], registry_id=registry.id),
+        )
+        session.commit()
+
+        assert dataset.validation_group_count == 3
+        assert prediction.prediction_status == "supported"
+        assert prediction.abstention_code is None
+
+
+@pytest.mark.parametrize("policy_value", [2.5, True, "not-an-integer", 0, -1])
+def test_prediction_rejects_invalid_min_validation_groups_policy(
+    migrated_db,
+    serving_fixture,
+    tmp_path,
+    policy_value,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        registry, model_version, _dataset = _production_model(
+            session,
+            serving_fixture,
+            tmp_path,
+            abstention_policy={"min_validation_groups": policy_value},
+        )
+        _bind_sensor(session, serving_fixture, registry, model_version)
+
+        prediction = ProductionServingService(session, ModelArtifactStore(tmp_path / "models")).predict_rul(
+            serving_fixture["organization_id"],
+            PredictionRequest(sensor_id=serving_fixture["sensor_a_id"], registry_id=registry.id),
+        )
+        session.commit()
+
+        assert prediction.prediction_status == "unsupported"
+        assert prediction.abstention_code == "UNMET_ABSTENTION_POLICY"
+        assert "min_validation_groups" in prediction.abstention_reason
 
 
 def test_historical_prediction_uses_explicit_observed_at_as_as_of_time(
