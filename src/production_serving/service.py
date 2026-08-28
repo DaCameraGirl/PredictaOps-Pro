@@ -25,6 +25,8 @@ from production_serving.contracts import PredictionRequest, PredictionResponse, 
 
 SCOPE_SPECIFICITY = {"organization": 0, "site": 1, "asset": 2, "component": 3, "sensor": 4}
 RUL_TASK = "rul_regression"
+RUL_TARGET_NAME = "RUL_hours"
+RUL_TARGET_UNIT = "h"
 SUPPORTED_REASON_CODE = "SUPPORTED"
 DEFAULT_SERVING_POLICY = {
     "max_feature_age_minutes": 1440,
@@ -226,6 +228,27 @@ class ProductionServingService:
                 feature_vector=None,
                 uncertainty=None,
                 evidence={"feature_schema": dataset.feature_names},
+                request_kind=request_kind,
+            )
+        policy_contract_error = _policy_contract_error(model_version.abstention_policy or {}, dataset)
+        if policy_contract_error:
+            return self._persist_prediction(
+                organization_id,
+                context,
+                observed_at=serving_reference_time,
+                status="unsupported",
+                code="UNMET_ABSTENTION_POLICY",
+                reason=policy_contract_error,
+                binding=binding,
+                model_version=model_version,
+                dataset=dataset,
+                feature_rows=None,
+                feature_vector=None,
+                uncertainty=None,
+                evidence={
+                    "abstention_policy": model_version.abstention_policy,
+                    "validation_group_count": dataset.validation_group_count,
+                },
                 request_kind=request_kind,
             )
 
@@ -803,6 +826,8 @@ def _feature_schema_error(model_version: MLModelVersion, dataset: MLDatasetVersi
     model_features = (model_version.provenance or {}).get("feature_names")
     model_domain = (model_version.provenance or {}).get("model_domain") or {}
     domain_features = model_domain.get("ordered_feature_names")
+    if dataset.target_name != RUL_TARGET_NAME or dataset.target_unit != RUL_TARGET_UNIT:
+        return "RUL serving requires a dataset target of RUL_hours with unit h"
     if not dataset_features:
         return "dataset version has no feature schema"
     if model_features is not None and list(model_features) != dataset_features:
@@ -887,6 +912,32 @@ def _serving_policy(policy: dict[str, Any]) -> dict[str, Any]:
             merged[key] = policy[key]
     merged["max_feature_age_minutes"] = int(merged["max_feature_age_minutes"])
     return merged
+
+
+def _policy_contract_error(policy: dict[str, Any], dataset: MLDatasetVersion) -> str | None:
+    min_validation_groups = policy.get("min_validation_groups")
+    if min_validation_groups is None:
+        return None
+    required_groups = _strict_integer_policy_value(min_validation_groups)
+    if required_groups is None:
+        return "abstention policy min_validation_groups must be an integer"
+    if required_groups < 1:
+        return "abstention policy min_validation_groups must be positive"
+    if dataset.validation_group_count < required_groups:
+        return "model validation evidence does not satisfy min_validation_groups abstention policy"
+    return None
+
+
+def _strict_integer_policy_value(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        digits = value[1:] if value.startswith("-") else value
+        if digits and all("0" <= char <= "9" for char in digits):
+            return int(value)
+    return None
 
 
 def _artifact_abstention_code(exc: Exception) -> str:
