@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import socket
 import ssl
@@ -20,6 +21,7 @@ import jwt
 from jwt import PyJWK
 from pydantic import ValidationError
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from enterprise_security.contracts import (
@@ -46,6 +48,7 @@ from enterprise_security.permissions import (
 from enterprise_security.redaction import redact_value
 from platform_core.contracts import OrganizationCreate, UserCreate
 from platform_core.models import (
+    ExternalPrincipalIdentity,
     Organization,
     OrganizationIdentityProvider,
     OrganizationMembership,
@@ -107,7 +110,7 @@ def security_settings() -> SecuritySettings:
         environment=environment,
         cors_allowed_origins=origins,
         test_auth_enabled=os.environ.get("PMS_TEST_AUTH", "0") == "1",
-        oidc_http_timeout_seconds=float(os.environ.get("PMS_OIDC_HTTP_TIMEOUT_SECONDS", "2.0")),
+        oidc_http_timeout_seconds=_oidc_http_timeout_setting(),
         docs_enabled=os.environ.get("PMS_ENABLE_DOCS", "1") == "1",
     )
     validate_security_settings(settings)
@@ -119,6 +122,8 @@ def validate_security_settings(settings: SecuritySettings) -> None:
         raise SecurityConfigurationError(f"unsupported environment: {settings.environment}")
     if settings.mode not in SUPPORTED_SECURITY_MODES:
         raise SecurityConfigurationError(f"unsupported security mode: {settings.mode}")
+    if not math.isfinite(settings.oidc_http_timeout_seconds) or settings.oidc_http_timeout_seconds <= 0:
+        raise SecurityConfigurationError("OIDC HTTP timeout must be a positive finite number")
     if settings.environment == "production":
         if "*" in settings.cors_allowed_origins:
             raise SecurityConfigurationError("wildcard CORS is not allowed in production")
@@ -128,6 +133,17 @@ def validate_security_settings(settings: SecuritySettings) -> None:
             raise SecurityConfigurationError("production enterprise security requires explicit allowed origins")
         if settings.docs_enabled:
             raise SecurityConfigurationError("OpenAPI docs must be explicitly disabled or protected in production")
+
+
+def _oidc_http_timeout_setting() -> float:
+    raw_timeout = os.environ.get("PMS_OIDC_HTTP_TIMEOUT_SECONDS", "2.0")
+    try:
+        timeout = float(raw_timeout)
+    except ValueError as exc:
+        raise SecurityConfigurationError("OIDC HTTP timeout must be a positive finite number") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise SecurityConfigurationError("OIDC HTTP timeout must be a positive finite number")
+    return timeout
 
 
 def validate_oidc_endpoint(url: str, *, allow_development_targets: bool = False) -> None:
@@ -556,6 +572,13 @@ class SecurityService:
         )
         if existing_identity is not None and existing_identity.user_id != user.id:
             raise AuthorizationError("issuer and subject are already bound to another local user")
+        self._reject_external_principal_collision(
+            issuer=request.issuer,
+            subject=request.subject,
+            expected_principal_type="user",
+            expected_identity_provider_id=request.identity_provider_id,
+            expected_user_id=user.id,
+        )
         identity = UserIdentity(
             organization_id=organization_id,
             user_id=request.user_id,
@@ -566,6 +589,14 @@ class SecurityService:
         )
         self.session.add(identity)
         self.session.flush()
+        self._create_external_principal_identity(
+            organization_id=organization_id,
+            identity_provider_id=request.identity_provider_id,
+            issuer=request.issuer,
+            subject=request.subject,
+            principal_type="user",
+            user_identity_id=identity.id,
+        )
         return identity
 
     def onboard_user_identity(
@@ -586,6 +617,13 @@ class SecurityService:
         email = request.email.lower()
         existing_identity = self.session.scalar(
             select(UserIdentity).where(UserIdentity.issuer == request.issuer, UserIdentity.subject == request.subject)
+        )
+        self._reject_external_principal_collision(
+            issuer=request.issuer,
+            subject=request.subject,
+            expected_principal_type="user",
+            expected_identity_provider_id=idp.id,
+            expected_user_id=existing_identity.user_id if existing_identity is not None else None,
         )
         user = self.session.scalar(select(User).where(User.email == email))
         if existing_identity is not None:
@@ -634,11 +672,22 @@ class SecurityService:
 
     def create_service_principal(self, organization_id: str, request: ServicePrincipalCreate) -> ServicePrincipal:
         self._require_org(organization_id)
-        self._require_active_issuer(organization_id, request.issuer)
+        idp = self.get_identity_provider(organization_id, request.identity_provider_id)
+        if idp is None or idp.status != "active":
+            raise AuthorizationError("active identity provider does not belong to this organization")
+        if idp.issuer != request.issuer:
+            raise SecurityConfigurationError("service principal issuer must match the identity provider")
         permissions = validate_service_permissions(request.permissions)
+        self._reject_external_principal_collision(
+            issuer=request.issuer,
+            subject=request.external_subject,
+            expected_principal_type="service",
+            expected_identity_provider_id=idp.id,
+        )
         principal = ServicePrincipal(
             organization_id=organization_id,
             name=request.name,
+            identity_provider_id=idp.id,
             external_subject=request.external_subject,
             issuer=request.issuer,
             permissions=permissions,
@@ -647,6 +696,14 @@ class SecurityService:
         )
         self.session.add(principal)
         self.session.flush()
+        self._create_external_principal_identity(
+            organization_id=organization_id,
+            identity_provider_id=idp.id,
+            issuer=request.issuer,
+            subject=request.external_subject,
+            principal_type="service",
+            service_principal_id=principal.id,
+        )
         return principal
 
     def update_service_principal(
@@ -715,6 +772,13 @@ class SecurityService:
         existing_identity = self.session.scalar(
             select(UserIdentity).where(UserIdentity.issuer == request.issuer, UserIdentity.subject == request.subject)
         )
+        if existing_identity is None and self.session.scalar(
+            select(ServicePrincipal).where(
+                ServicePrincipal.issuer == request.issuer,
+                ServicePrincipal.external_subject == request.subject,
+            )
+        ):
+            raise AuthorizationError("issuer and subject are already bound to a service principal")
         user = self.session.scalar(select(User).where(User.email == request.owner_email.lower()))
         if existing_identity is not None:
             if existing_identity.organization_id != org.id:
@@ -774,6 +838,10 @@ class SecurityService:
             idp.jwks_uri = request.jwks_uri
             idp.allowed_algorithms = sorted(set(request.allowed_algorithms))
             idp.status = "active"
+        if existing_identity is not None and existing_identity.identity_provider_id != idp.id:
+            raise SecurityConfigurationError(
+                "bootstrap owner identity is already bound to a different identity provider"
+            )
         identity = self.session.scalar(
             select(UserIdentity).where(
                 UserIdentity.organization_id == org.id,
@@ -810,12 +878,18 @@ class SecurityService:
             except AuthenticationError as exc:
                 last_error = exc
                 continue
-            return self.context_from_claims(
-                organization_id,
-                claims,
-                request_id=request_id,
-                identity_provider_id=idp.id,
-            )
+            try:
+                return self.context_from_claims(
+                    organization_id,
+                    claims,
+                    request_id=request_id,
+                    identity_provider_id=idp.id,
+                )
+            except AuthorizationError as exc:
+                last_error = exc
+                continue
+        if isinstance(last_error, AuthorizationError):
+            raise AuthorizationError(SAFE_FORBIDDEN_ERROR) from last_error
         raise AuthenticationError(SAFE_AUTH_ERROR) from last_error
 
     def context_from_claims(
@@ -834,9 +908,21 @@ class SecurityService:
         ]
         if identity_provider_id is not None:
             identity_filters.append(UserIdentity.identity_provider_id == identity_provider_id)
-        identity = self.session.scalar(
-            select(UserIdentity).where(*identity_filters)
-        )
+        identities = list(self.session.scalars(select(UserIdentity).where(*identity_filters)))
+        service_filters = [
+            ServicePrincipal.organization_id == organization_id,
+            ServicePrincipal.external_subject == claims.subject,
+            ServicePrincipal.issuer == claims.issuer,
+            ServicePrincipal.status == "active",
+        ]
+        if identity_provider_id is not None:
+            service_filters.append(ServicePrincipal.identity_provider_id == identity_provider_id)
+        services = list(self.session.scalars(select(ServicePrincipal).where(*service_filters)))
+        if not identities and not services:
+            raise AuthorizationError(SAFE_FORBIDDEN_ERROR)
+        if len(identities) + len(services) > 1:
+            raise AuthenticationError(SAFE_AUTH_ERROR)
+        identity = identities[0] if identities else None
         if identity is not None:
             user = self.session.get(User, identity.user_id)
             if user is None or user.lifecycle_state != "active":
@@ -856,16 +942,7 @@ class SecurityService:
                 subject=claims.subject,
                 request_id=request_id,
             )
-        service = self.session.scalar(
-            select(ServicePrincipal).where(
-                ServicePrincipal.organization_id == organization_id,
-                ServicePrincipal.external_subject == claims.subject,
-                ServicePrincipal.issuer == claims.issuer,
-                ServicePrincipal.status == "active",
-            )
-        )
-        if service is None:
-            raise AuthorizationError(SAFE_FORBIDDEN_ERROR)
+        service = services[0]
         return SecurityContext(
             principal_type="service",
             organization_id=organization_id,
@@ -981,17 +1058,72 @@ class SecurityService:
             raise AuthorizationError("organization does not exist")
         return organization
 
-    def _require_active_issuer(self, organization_id: str, issuer: str) -> OrganizationIdentityProvider:
-        idp = self.session.scalar(
-            select(OrganizationIdentityProvider).where(
-                OrganizationIdentityProvider.organization_id == organization_id,
-                OrganizationIdentityProvider.issuer == issuer,
-                OrganizationIdentityProvider.status == "active",
+    def _reject_external_principal_collision(
+        self,
+        *,
+        issuer: str,
+        subject: str,
+        expected_principal_type: str,
+        expected_identity_provider_id: str,
+        expected_user_id: str | None = None,
+    ) -> None:
+        existing_binding = self.session.scalar(
+            select(ExternalPrincipalIdentity).where(
+                ExternalPrincipalIdentity.issuer == issuer,
+                ExternalPrincipalIdentity.subject == subject,
             )
         )
-        if idp is None:
-            raise AuthorizationError("service principal issuer must match an active identity provider")
-        return idp
+        if existing_binding is not None:
+            if (
+                existing_binding.principal_type != expected_principal_type
+                or existing_binding.identity_provider_id != expected_identity_provider_id
+            ):
+                raise AuthorizationError("issuer and subject are already bound to another principal")
+        existing_service = self.session.scalar(
+            select(ServicePrincipal).where(
+                ServicePrincipal.issuer == issuer,
+                ServicePrincipal.external_subject == subject,
+            )
+        )
+        if expected_principal_type == "user" and existing_service is not None:
+            raise AuthorizationError("issuer and subject are already bound to a service principal")
+        existing_identity = self.session.scalar(
+            select(UserIdentity).where(UserIdentity.issuer == issuer, UserIdentity.subject == subject)
+        )
+        if expected_principal_type == "service" and existing_identity is not None:
+            raise AuthorizationError("issuer and subject are already bound to a human identity")
+        if (
+            expected_principal_type == "user"
+            and existing_identity is not None
+            and existing_identity.user_id != expected_user_id
+        ):
+            raise AuthorizationError("issuer and subject are already bound to another local user")
+
+    def _create_external_principal_identity(
+        self,
+        *,
+        organization_id: str,
+        identity_provider_id: str,
+        issuer: str,
+        subject: str,
+        principal_type: str,
+        user_identity_id: str | None = None,
+        service_principal_id: str | None = None,
+    ) -> None:
+        binding = ExternalPrincipalIdentity(
+            organization_id=organization_id,
+            identity_provider_id=identity_provider_id,
+            issuer=issuer,
+            subject=subject,
+            principal_type=principal_type,
+            user_identity_id=user_identity_id,
+            service_principal_id=service_principal_id,
+        )
+        self.session.add(binding)
+        try:
+            self.session.flush()
+        except IntegrityError as exc:
+            raise AuthorizationError("issuer and subject are already bound to another principal") from exc
 
     def change_membership_status(
         self,
@@ -1172,6 +1304,7 @@ def service_principal_payload(principal: ServicePrincipal) -> dict[str, Any]:
         "id": principal.id,
         "organization_id": principal.organization_id,
         "name": principal.name,
+        "identity_provider_id": principal.identity_provider_id,
         "external_subject": principal.external_subject,
         "issuer": principal.issuer,
         "status": principal.status,

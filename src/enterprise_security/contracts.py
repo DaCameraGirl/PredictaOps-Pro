@@ -55,6 +55,7 @@ class UserIdentityCreate(BaseModel):
 
 class ServicePrincipalCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
+    identity_provider_id: str
     external_subject: str = Field(min_length=1, max_length=255)
     issuer: str = Field(min_length=1, max_length=512)
     permissions: list[str] = Field(default_factory=list)

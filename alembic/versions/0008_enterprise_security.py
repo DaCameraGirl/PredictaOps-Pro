@@ -81,6 +81,7 @@ def upgrade() -> None:
         sa.Column("id", sa.String(length=36), nullable=False),
         sa.Column("organization_id", sa.String(length=36), nullable=False),
         sa.Column("name", sa.String(length=255), nullable=False),
+        sa.Column("identity_provider_id", sa.String(length=36), nullable=False),
         sa.Column("external_subject", sa.String(length=255), nullable=False),
         sa.Column("issuer", sa.String(length=512), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False),
@@ -89,7 +90,16 @@ def upgrade() -> None:
         *timestamps(),
         sa.CheckConstraint("status in ('active', 'inactive', 'archived')", name="ck_service_principal_status"),
         sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"]),
+        sa.ForeignKeyConstraint(
+            ["organization_id", "identity_provider_id"],
+            ["organization_identity_providers.organization_id", "organization_identity_providers.id"],
+        ),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "identity_provider_id",
+            "external_subject",
+            name="uq_service_principal_provider_subject",
+        ),
         sa.UniqueConstraint(
             "organization_id",
             "issuer",
@@ -98,8 +108,49 @@ def upgrade() -> None:
         ),
         sa.UniqueConstraint("organization_id", "name", name="uq_service_principal_org_name"),
     )
-    for column in ["external_subject", "issuer", "organization_id"]:
+    for column in ["external_subject", "identity_provider_id", "issuer", "organization_id"]:
         op.create_index(f"ix_service_principals_{column}", "service_principals", [column])
+
+    op.create_table(
+        "external_principal_identities",
+        sa.Column("id", sa.String(length=36), nullable=False),
+        sa.Column("organization_id", sa.String(length=36), nullable=False),
+        sa.Column("identity_provider_id", sa.String(length=36), nullable=False),
+        sa.Column("issuer", sa.String(length=512), nullable=False),
+        sa.Column("subject", sa.String(length=255), nullable=False),
+        sa.Column("principal_type", sa.String(length=32), nullable=False),
+        sa.Column("user_identity_id", sa.String(length=36), nullable=True),
+        sa.Column("service_principal_id", sa.String(length=36), nullable=True),
+        *timestamps(),
+        sa.CheckConstraint("principal_type in ('user', 'service')", name="ck_external_principal_type"),
+        sa.CheckConstraint(
+            "("
+            "principal_type = 'user' and user_identity_id is not null and service_principal_id is null"
+            ") or ("
+            "principal_type = 'service' and service_principal_id is not null and user_identity_id is null"
+            ")",
+            name="ck_external_principal_single_target",
+        ),
+        sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"]),
+        sa.ForeignKeyConstraint(
+            ["organization_id", "identity_provider_id"],
+            ["organization_identity_providers.organization_id", "organization_identity_providers.id"],
+        ),
+        sa.ForeignKeyConstraint(["service_principal_id"], ["service_principals.id"]),
+        sa.ForeignKeyConstraint(["user_identity_id"], ["user_identities.id"]),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("issuer", "subject", name="uq_external_principal_global_issuer_subject"),
+        sa.UniqueConstraint("identity_provider_id", "subject", name="uq_external_principal_provider_subject"),
+    )
+    for column in [
+        "identity_provider_id",
+        "issuer",
+        "organization_id",
+        "service_principal_id",
+        "subject",
+        "user_identity_id",
+    ]:
+        op.create_index(f"ix_external_principal_identities_{column}", "external_principal_identities", [column])
 
     op.create_table(
         "secret_references",
@@ -170,6 +221,7 @@ def downgrade() -> None:
     op.drop_index("ix_security_audit_events_org_occurred_id", table_name="security_audit_events")
     op.drop_table("security_audit_events")
     op.drop_table("secret_references")
+    op.drop_table("external_principal_identities")
     op.drop_table("service_principals")
     op.drop_table("user_identities")
     op.drop_table("organization_identity_providers")

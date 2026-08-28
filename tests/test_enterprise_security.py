@@ -16,7 +16,7 @@ from alembic.config import Config
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from sqlalchemy import inspect, select, text
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -83,6 +83,7 @@ from platform_core.contracts import (
 from platform_core.database import make_engine
 from platform_core.models import (
     Base,
+    ExternalPrincipalIdentity,
     IngestionSource,
     MaintenanceCase,
     MaintenanceNote,
@@ -92,6 +93,7 @@ from platform_core.models import (
     OrganizationMembership,
     SecretReference,
     SecurityAuditEvent,
+    ServicePrincipal,
     User,
     UserIdentity,
 )
@@ -265,6 +267,7 @@ def _seed_security(session, *, jwks_uri: str = JWKS_URI):
         org.id,
         ServicePrincipalCreate(
             name="ingestion-robot",
+            identity_provider_id=idp.id,
             external_subject="robot-sub",
             issuer=ISSUER_A,
             permissions=[INGESTION_WRITE],
@@ -274,6 +277,7 @@ def _seed_security(session, *, jwks_uri: str = JWKS_URI):
         "organization_id": org.id,
         "other_organization_id": other_org.id,
         "idp_id": idp.id,
+        "other_idp_id": other_idp.id,
         "site_id": site.id,
         "asset_id": asset.id,
         "component_id": component.id,
@@ -361,17 +365,23 @@ def test_migration_creates_enterprise_security_tables(migrated_db):
     identity_constraints = {
         constraint["name"] for constraint in inspect(engine).get_unique_constraints("user_identities")
     }
+    principal_constraints = {
+        constraint["name"] for constraint in inspect(engine).get_unique_constraints("external_principal_identities")
+    }
     audit_indexes = {index["name"] for index in inspect(engine).get_indexes("security_audit_events")}
 
     assert {
         "organization_identity_providers",
         "user_identities",
         "service_principals",
+        "external_principal_identities",
         "secret_references",
         "security_audit_events",
     }.issubset(tables)
+    assert columns["identity_provider_id"]["nullable"] is False
     assert columns["issuer"]["nullable"] is False
     assert "uq_user_identity_global_issuer_subject" in identity_constraints
+    assert "uq_external_principal_global_issuer_subject" in principal_constraints
     assert "ix_security_audit_events_org_occurred_id" in audit_indexes
 
 
@@ -637,6 +647,275 @@ def test_authentication_binds_identity_to_verifying_provider(migrated_db):
                 request_id="req-provider-b",
                 identity_provider_id=idp_b.id,
             )
+
+
+def test_service_principal_authentication_binds_to_verifying_provider(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        repo = PlatformRepository(session)
+        org = repo.create_organization(OrganizationCreate(slug="service-provider-binding", name="Service Binding"))
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        idp_a = security.create_identity_provider(
+            org.id,
+            IdentityProviderCreate(name="primary", issuer=ISSUER_A, audience="audience-a", jwks_uri=JWKS_URI),
+            allow_development_targets=True,
+        )
+        security.create_identity_provider(
+            org.id,
+            IdentityProviderCreate(name="secondary", issuer=ISSUER_A, audience="audience-b", jwks_uri=JWKS_URI),
+            allow_development_targets=True,
+        )
+        service = security.create_service_principal(
+            org.id,
+            ServicePrincipalCreate(
+                name="robot-a",
+                identity_provider_id=idp_a.id,
+                external_subject="robot-shared-sub",
+                issuer=ISSUER_A,
+                permissions=[INGESTION_WRITE],
+            ),
+        )
+        token_a = "service-a"
+        token_b = "service-b"
+        security.verifier = DeterministicTokenVerifier(
+            {
+                token_a: TokenClaims(
+                    issuer=ISSUER_A,
+                    subject="robot-shared-sub",
+                    audience="audience-a",
+                    expires_at=int((datetime.now(UTC) + timedelta(minutes=5)).timestamp()),
+                    algorithm="RS256",
+                    key_id="primary",
+                ),
+                token_b: TokenClaims(
+                    issuer=ISSUER_A,
+                    subject="robot-shared-sub",
+                    audience="audience-b",
+                    expires_at=int((datetime.now(UTC) + timedelta(minutes=5)).timestamp()),
+                    algorithm="RS256",
+                    key_id="primary",
+                ),
+            }
+        )
+
+        context = security.authenticate_bearer(org.id, token_a, request_id="req-service-a")
+        assert context.principal_type == "service"
+        assert context.service_principal_id == service.id
+
+        with pytest.raises(PermissionError):
+            security.authenticate_bearer(org.id, token_b, request_id="req-service-b")
+
+
+def test_authentication_continues_across_verified_providers_until_bound_principal(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        repo = PlatformRepository(session)
+        org = repo.create_organization(OrganizationCreate(slug="multi-provider", name="Multi Provider"))
+        user = repo.create_user(UserCreate(email="multi-provider@example.com"))
+        repo.add_membership(org.id, user.id, "viewer")
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        security.create_identity_provider(
+            org.id,
+            IdentityProviderCreate(name="first", issuer=ISSUER_A, audience="audience-a", jwks_uri=JWKS_URI),
+            allow_development_targets=True,
+        )
+        idp_b = security.create_identity_provider(
+            org.id,
+            IdentityProviderCreate(name="second", issuer=ISSUER_A, audience="audience-b", jwks_uri=JWKS_URI),
+            allow_development_targets=True,
+        )
+        security.create_user_identity(
+            org.id,
+            UserIdentityCreate(
+                user_id=user.id,
+                identity_provider_id=idp_b.id,
+                issuer=ISSUER_A,
+                subject="multi-audience-sub",
+            ),
+        )
+        token = "multi-audience-token"
+        security.verifier = DeterministicTokenVerifier(
+            {
+                token: TokenClaims(
+                    issuer=ISSUER_A,
+                    subject="multi-audience-sub",
+                    audience=["audience-a", "audience-b"],
+                    expires_at=int((datetime.now(UTC) + timedelta(minutes=5)).timestamp()),
+                    algorithm="RS256",
+                    key_id="primary",
+                )
+            }
+        )
+
+        context = security.authenticate_bearer(org.id, token, request_id="req-multi-provider")
+
+        assert context.principal_type == "user"
+        assert context.user_id == user.id
+
+
+def test_human_and_service_external_principal_collisions_are_rejected(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+
+        with pytest.raises(PermissionError):
+            security.create_service_principal(
+                fixture["organization_id"],
+                ServicePrincipalCreate(
+                    name="human-collision",
+                    identity_provider_id=fixture["idp_id"],
+                    external_subject=fixture["subjects"]["owner"],
+                    issuer=ISSUER_A,
+                    permissions=[INGESTION_WRITE],
+                ),
+            )
+
+        service = security.create_service_principal(
+            fixture["organization_id"],
+            ServicePrincipalCreate(
+                name="service-first",
+                identity_provider_id=fixture["idp_id"],
+                external_subject="service-first-sub",
+                issuer=ISSUER_A,
+                permissions=[INGESTION_WRITE],
+            ),
+        )
+        assert service.external_subject == "service-first-sub"
+
+        with pytest.raises(PermissionError):
+            security.create_user_identity(
+                fixture["organization_id"],
+                UserIdentityCreate(
+                    user_id=fixture["users"]["viewer"],
+                    identity_provider_id=fixture["idp_id"],
+                    issuer=ISSUER_A,
+                    subject="service-first-sub",
+                ),
+            )
+
+
+def test_ambiguous_legacy_human_service_mapping_fails_authentication_closed(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        session.add(
+            UserIdentity(
+                organization_id=fixture["organization_id"],
+                user_id=fixture["users"]["viewer"],
+                identity_provider_id=fixture["idp_id"],
+                issuer=ISSUER_A,
+                subject="legacy-ambiguous-sub",
+                profile={},
+            )
+        )
+        session.add(
+            ServicePrincipal(
+                organization_id=fixture["organization_id"],
+                name="legacy-ambiguous-service",
+                identity_provider_id=fixture["idp_id"],
+                external_subject="legacy-ambiguous-sub",
+                issuer=ISSUER_A,
+                permissions=[INGESTION_WRITE],
+                status="active",
+                metadata_json={},
+            )
+        )
+        session.flush()
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+
+        with pytest.raises(PermissionError):
+            security.context_from_claims(
+                fixture["organization_id"],
+                _claims("legacy-ambiguous-sub"),
+                request_id="req-ambiguous",
+                identity_provider_id=fixture["idp_id"],
+            )
+
+
+def test_postgres_serializes_concurrent_human_service_principal_collisions(migrated_db):
+    engine, session_factory = migrated_db
+    if engine.dialect.name != "postgresql":
+        pytest.skip("PostgreSQL unique-constraint race regression requires PostgreSQL")
+
+    with session_factory() as session:
+        repo = PlatformRepository(session)
+        org = repo.create_organization(OrganizationCreate(slug="principal-race", name="Principal Race"))
+        user = repo.create_user(UserCreate(email="principal-race@example.com"))
+        repo.add_membership(org.id, user.id, "viewer")
+        idp = SecurityService(session, verifier=DeterministicTokenVerifier({})).create_identity_provider(
+            org.id,
+            IdentityProviderCreate(name="primary", issuer=ISSUER_A, audience=AUDIENCE, jwks_uri=JWKS_URI),
+            allow_development_targets=True,
+        )
+        session.commit()
+
+    barrier = threading.Barrier(2)
+
+    def create_human() -> str:
+        with session_factory() as session:
+            security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+            barrier.wait(timeout=10)
+            try:
+                security.create_user_identity(
+                    org.id,
+                    UserIdentityCreate(
+                        user_id=user.id,
+                        identity_provider_id=idp.id,
+                        issuer=ISSUER_A,
+                        subject="race-sub",
+                    ),
+                )
+                time.sleep(0.2)
+                session.commit()
+                return "created-human"
+            except (IntegrityError, PermissionError):
+                session.rollback()
+                return "blocked"
+
+    def create_service() -> str:
+        with session_factory() as session:
+            security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+            barrier.wait(timeout=10)
+            try:
+                security.create_service_principal(
+                    org.id,
+                    ServicePrincipalCreate(
+                        name="race-service",
+                        identity_provider_id=idp.id,
+                        external_subject="race-sub",
+                        issuer=ISSUER_A,
+                        permissions=[INGESTION_WRITE],
+                    ),
+                )
+                time.sleep(0.2)
+                session.commit()
+                return "created-service"
+            except (IntegrityError, PermissionError):
+                session.rollback()
+                return "blocked"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(create_human), executor.submit(create_service)]
+        outcomes = sorted([future.result() for future in futures])
+
+    with session_factory() as session:
+        human_count = session.scalar(
+            select(func.count()).select_from(UserIdentity).where(UserIdentity.subject == "race-sub")
+        )
+        service_count = session.scalar(
+            select(func.count()).select_from(ServicePrincipal).where(ServicePrincipal.external_subject == "race-sub")
+        )
+        binding_count = session.scalar(
+            select(func.count()).select_from(ExternalPrincipalIdentity).where(
+                ExternalPrincipalIdentity.subject == "race-sub"
+            )
+        )
+
+    assert outcomes.count("blocked") == 1
+    assert sum(outcome.startswith("created-") for outcome in outcomes) == 1
+    assert int(human_count or 0) + int(service_count or 0) == 1
+    assert binding_count == 1
 
 
 def test_global_identity_binding_is_database_enforced(migrated_db):
@@ -1092,6 +1371,7 @@ def test_service_principal_scopes_are_machine_only(migrated_db):
                 fixture["organization_id"],
                 ServicePrincipalCreate(
                     name="bad-robot",
+                    identity_provider_id=fixture["idp_id"],
                     external_subject="bad-robot",
                     issuer=ISSUER_A,
                     permissions=[ML_MODEL_PROMOTE_PRODUCTION],
@@ -1242,6 +1522,25 @@ def test_security_configuration_rejects_dangerous_production_settings(monkeypatc
             jwks_uri=JWKS_URI,
             allowed_algorithms=["HS256"],
         )
+
+
+@pytest.mark.parametrize("timeout", ["0", "-1", "nan", "inf", "-inf", "not-a-number"])
+def test_oidc_http_timeout_settings_reject_invalid_values(monkeypatch, timeout):
+    monkeypatch.setenv("PMS_ENVIRONMENT", "development")
+    monkeypatch.setenv("PMS_SECURITY_MODE", "enterprise")
+    monkeypatch.setenv("PMS_OIDC_HTTP_TIMEOUT_SECONDS", timeout)
+
+    with pytest.raises(SecurityConfigurationError):
+        security_settings()
+
+
+@pytest.mark.parametrize("timeout", ["0.001", "2", "2.5"])
+def test_oidc_http_timeout_settings_accept_positive_finite_values(monkeypatch, timeout):
+    monkeypatch.setenv("PMS_ENVIRONMENT", "development")
+    monkeypatch.setenv("PMS_SECURITY_MODE", "enterprise")
+    monkeypatch.setenv("PMS_OIDC_HTTP_TIMEOUT_SECONDS", timeout)
+
+    assert security_settings().oidc_http_timeout_seconds == float(timeout)
 
 
 def test_oidc_resolved_address_validation_rejects_unsafe_dns_answers(monkeypatch):
@@ -1493,6 +1792,45 @@ def test_bootstrap_security_provisioning_is_idempotent_and_org_scoped(migrated_d
         assert session.query(User).count() == 2
         assert session.query(OrganizationMembership).count() == 2
         assert session.query(UserIdentity).count() == 2
+
+
+def test_bootstrap_rejects_incompatible_existing_provider_binding(migrated_db):
+    _engine, session_factory = migrated_db
+    request = BootstrapSecurityRequest(
+        organization_slug="acme",
+        organization_name="Acme",
+        owner_email="owner@example.com",
+        issuer=ISSUER_A,
+        subject="owner-sub",
+        audience="audience-a",
+        jwks_uri=JWKS_URI,
+    )
+    with session_factory() as session:
+        first = SecurityService(session).bootstrap_initial_owner(request)
+        same = SecurityService(session).bootstrap_initial_owner(request)
+        session.commit()
+
+        assert same == first
+
+        with pytest.raises(SecurityConfigurationError):
+            SecurityService(session).bootstrap_initial_owner(
+                request.model_copy(
+                    update={
+                        "audience": "audience-b",
+                        "idp_name": "secondary",
+                    }
+                )
+            )
+        session.rollback()
+
+        context = SecurityService(session).context_from_claims(
+            first["organization_id"],
+            _claims("owner-sub", audience="audience-a"),
+            request_id="req-bootstrap-provider",
+            identity_provider_id=first["identity_provider_id"],
+        )
+
+        assert context.user_id == first["user_id"]
 
 
 def test_bootstrap_rejects_inactive_existing_owner_user(migrated_db):
@@ -2100,6 +2438,7 @@ def test_service_principal_patch_unknown_and_cross_tenant_are_generic_403(
             fixture["other_organization_id"],
             ServicePrincipalCreate(
                 name="other-robot",
+                identity_provider_id=fixture["other_idp_id"],
                 external_subject="other-robot-sub",
                 issuer=ISSUER_A,
                 permissions=[INGESTION_WRITE],

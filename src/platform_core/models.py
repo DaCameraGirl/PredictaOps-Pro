@@ -175,11 +175,16 @@ class ServicePrincipal(Base, TimestampMixin):
     __tablename__ = "service_principals"
     __table_args__ = (
         UniqueConstraint("organization_id", "name", name="uq_service_principal_org_name"),
+        UniqueConstraint("identity_provider_id", "external_subject", name="uq_service_principal_provider_subject"),
         UniqueConstraint(
             "organization_id",
             "issuer",
             "external_subject",
             name="uq_service_principal_org_issuer_subject",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "identity_provider_id"],
+            ["organization_identity_providers.organization_id", "organization_identity_providers.id"],
         ),
         CheckConstraint("status in ('active', 'inactive', 'archived')", name="ck_service_principal_status"),
     )
@@ -187,11 +192,44 @@ class ServicePrincipal(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
     organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    identity_provider_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     external_subject: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     issuer: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     permissions: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     metadata_json: Mapped[dict | None] = mapped_column(JSON)
+
+
+class ExternalPrincipalIdentity(Base, TimestampMixin):
+    __tablename__ = "external_principal_identities"
+    __table_args__ = (
+        UniqueConstraint("issuer", "subject", name="uq_external_principal_global_issuer_subject"),
+        UniqueConstraint("identity_provider_id", "subject", name="uq_external_principal_provider_subject"),
+        ForeignKeyConstraint(
+            ["organization_id", "identity_provider_id"],
+            ["organization_identity_providers.organization_id", "organization_identity_providers.id"],
+        ),
+        CheckConstraint("principal_type in ('user', 'service')", name="ck_external_principal_type"),
+        CheckConstraint(
+            "("
+            "principal_type = 'user' and user_identity_id is not null and service_principal_id is null"
+            ") or ("
+            "principal_type = 'service' and service_principal_id is not null and user_identity_id is null"
+            ")",
+            name="ck_external_principal_single_target",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    identity_provider_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    issuer: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    subject: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    principal_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    user_identity_id: Mapped[str | None] = mapped_column(ForeignKey("user_identities.id"), nullable=True, index=True)
+    service_principal_id: Mapped[str | None] = mapped_column(
+        ForeignKey("service_principals.id"), nullable=True, index=True
+    )
 
 
 class SecretReference(Base, TimestampMixin):
