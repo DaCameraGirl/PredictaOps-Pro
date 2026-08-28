@@ -153,7 +153,7 @@ class UserIdentity(Base, TimestampMixin):
     __tablename__ = "user_identities"
     __table_args__ = (
         UniqueConstraint("identity_provider_id", "subject", name="uq_user_identity_provider_subject"),
-        UniqueConstraint("issuer", "subject", name="uq_user_identity_issuer_subject"),
+        UniqueConstraint("organization_id", "issuer", "subject", name="uq_user_identity_org_issuer_subject"),
         ForeignKeyConstraint(
             ["organization_id", "identity_provider_id"],
             ["organization_identity_providers.organization_id", "organization_identity_providers.id"],
@@ -174,7 +174,12 @@ class ServicePrincipal(Base, TimestampMixin):
     __tablename__ = "service_principals"
     __table_args__ = (
         UniqueConstraint("organization_id", "name", name="uq_service_principal_org_name"),
-        UniqueConstraint("organization_id", "external_subject", name="uq_service_principal_org_subject"),
+        UniqueConstraint(
+            "organization_id",
+            "issuer",
+            "external_subject",
+            name="uq_service_principal_org_issuer_subject",
+        ),
         CheckConstraint("status in ('active', 'inactive', 'archived')", name="ck_service_principal_status"),
     )
 
@@ -182,7 +187,7 @@ class ServicePrincipal(Base, TimestampMixin):
     organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     external_subject: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    issuer: Mapped[str | None] = mapped_column(String(512), index=True)
+    issuer: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     permissions: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     metadata_json: Mapped[dict | None] = mapped_column(JSON)

@@ -70,7 +70,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("identity_provider_id", "subject", name="uq_user_identity_provider_subject"),
-        sa.UniqueConstraint("issuer", "subject", name="uq_user_identity_issuer_subject"),
+        sa.UniqueConstraint("organization_id", "issuer", "subject", name="uq_user_identity_org_issuer_subject"),
     )
     for column in ["identity_provider_id", "issuer", "organization_id", "subject", "user_id"]:
         op.create_index(f"ix_user_identities_{column}", "user_identities", [column])
@@ -81,7 +81,7 @@ def upgrade() -> None:
         sa.Column("organization_id", sa.String(length=36), nullable=False),
         sa.Column("name", sa.String(length=255), nullable=False),
         sa.Column("external_subject", sa.String(length=255), nullable=False),
-        sa.Column("issuer", sa.String(length=512), nullable=True),
+        sa.Column("issuer", sa.String(length=512), nullable=False),
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("permissions", sa.JSON(), nullable=False),
         sa.Column("metadata_json", sa.JSON(), nullable=True),
@@ -89,7 +89,12 @@ def upgrade() -> None:
         sa.CheckConstraint("status in ('active', 'inactive', 'archived')", name="ck_service_principal_status"),
         sa.ForeignKeyConstraint(["organization_id"], ["organizations.id"]),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("organization_id", "external_subject", name="uq_service_principal_org_subject"),
+        sa.UniqueConstraint(
+            "organization_id",
+            "issuer",
+            "external_subject",
+            name="uq_service_principal_org_issuer_subject",
+        ),
         sa.UniqueConstraint("organization_id", "name", name="uq_service_principal_org_name"),
     )
     for column in ["external_subject", "issuer", "organization_id"]:

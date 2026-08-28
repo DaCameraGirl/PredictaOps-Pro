@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import logging
+import re
 import sys
 from pathlib import Path
 from uuid import uuid4
@@ -13,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -32,11 +33,14 @@ from bearing_profiling import feature_trend, summarize
 from degradation_signal import DegradationSignal
 from enterprise_security.contracts import (
     IdentityProviderCreate,
+    IdentityProviderUpdate,
     MembershipChange,
     MembershipStatusChange,
     SecretReferenceCreate,
+    SecretReferenceUpdate,
     ServicePrincipalCreate,
     ServicePrincipalUpdate,
+    UserIdentityOnboard,
 )
 from enterprise_security.permissions import (
     ANALYTICS_READ,
@@ -63,6 +67,7 @@ from enterprise_security.permissions import (
 from enterprise_security.service import (
     AuthenticationError,
     AuthorizationError,
+    OidcTokenVerifier,
     SecurityService,
     audit_event_payload,
     identity_provider_payload,
@@ -126,6 +131,8 @@ logger = logging.getLogger(__name__)
 
 MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 SECURITY_SETTINGS = security_settings()
+REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+OIDC_VERIFIER = OidcTokenVerifier(http_timeout_seconds=SECURITY_SETTINGS.oidc_http_timeout_seconds)
 
 app = FastAPI(
     title="Predictive Maintenance Studio",
@@ -140,14 +147,20 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(SECURITY_SETTINGS.cors_allowed_origins),
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
 
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID") or uuid4().hex
+    supplied_request_id = request.headers.get("X-Request-ID")
+    if supplied_request_id is not None and not REQUEST_ID_PATTERN.fullmatch(supplied_request_id):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "X-Request-ID must be 1-64 characters of letters, digits, '.', '_', ':', or '-'"},
+        )
+    request_id = supplied_request_id or uuid4().hex
     request.state.request_id = request_id
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
@@ -307,6 +320,10 @@ def _bearer_token(request: Request) -> str:
     return token
 
 
+def _security_service(session) -> SecurityService:
+    return SecurityService(session, verifier=OIDC_VERIFIER)
+
+
 def _authorize(
     session,
     request: Request,
@@ -319,7 +336,7 @@ def _authorize(
 ):
     if not _enterprise_security_enabled():
         return None
-    security = SecurityService(session)
+    security = _security_service(session)
     try:
         context = security.authenticate_bearer(
             organization_id,
@@ -552,7 +569,7 @@ def create_identity_provider(organization_id: str, request: IdentityProviderCrea
     with SessionLocal() as session:
         try:
             _authorize(session, http_request, organization_id, SECURITY_MANAGE, action="security.idp.create")
-            idp = SecurityService(session).create_identity_provider(organization_id, request)
+            idp = _security_service(session).create_identity_provider(organization_id, request)
             session.commit()
             return identity_provider_payload(idp)
         except ValueError as exc:
@@ -568,9 +585,82 @@ def list_identity_providers(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
             _authorize(session, request, organization_id, SECURITY_MANAGE, action="security.idp.list")
-            idps = SecurityService(session).list_identity_providers(organization_id)
+            idps = _security_service(session).list_identity_providers(organization_id)
             session.commit()
             return {"identity_providers": [identity_provider_payload(idp) for idp in idps]}
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.patch("/api/security/{organization_id}/identity-providers/{identity_provider_id}")
+def update_identity_provider(
+    organization_id: str,
+    identity_provider_id: str,
+    request: IdentityProviderUpdate,
+    http_request: Request,
+):
+    with SessionLocal() as session:
+        try:
+            _authorize(
+                session,
+                http_request,
+                organization_id,
+                SECURITY_MANAGE,
+                action="security.idp.update",
+            )
+            idp = _security_service(session).update_identity_provider(organization_id, identity_provider_id, request)
+            session.commit()
+            return identity_provider_payload(idp)
+        except AuthorizationError as exc:
+            session.commit()
+            raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.post("/api/security/{organization_id}/user-identities")
+def onboard_user_identity(organization_id: str, request: UserIdentityOnboard, http_request: Request):
+    with SessionLocal() as session:
+        try:
+            _authorize(
+                session,
+                http_request,
+                organization_id,
+                SECURITY_MANAGE,
+                action="security.user_identity.onboard",
+            )
+            result = _security_service(session).onboard_user_identity(organization_id, request)
+            session.commit()
+            user = result["user"]
+            return {
+                "user": {
+                    "id": user.id,
+                    "email": user.email,
+                    "full_name": user.full_name,
+                    "lifecycle_state": user.lifecycle_state,
+                },
+                "membership": _membership_payload(result["membership"]),
+                "identity": {
+                    "id": result["identity"].id,
+                    "organization_id": result["identity"].organization_id,
+                    "user_id": result["identity"].user_id,
+                    "identity_provider_id": result["identity"].identity_provider_id,
+                    "issuer": result["identity"].issuer,
+                    "subject": result["identity"].subject,
+                    "last_seen_at": result["identity"].last_seen_at,
+                },
+            }
+        except AuthorizationError as exc:
+            session.commit()
+            raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except SQLAlchemyError as exc:
             session.rollback()
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
@@ -579,7 +669,7 @@ def list_identity_providers(organization_id: str, request: Request):
 @app.post("/api/security/{organization_id}/memberships")
 def change_membership_role(organization_id: str, request: MembershipChange, http_request: Request):
     with SessionLocal() as session:
-        security = SecurityService(session)
+        security = _security_service(session)
         try:
             context = _authorize(
                 session,
@@ -610,7 +700,7 @@ def change_membership_status(
     http_request: Request,
 ):
     with SessionLocal() as session:
-        security = SecurityService(session)
+        security = _security_service(session)
         try:
             context = _authorize(
                 session,
@@ -644,9 +734,12 @@ def create_service_principal(organization_id: str, request: ServicePrincipalCrea
                 SECURITY_MANAGE,
                 action="security.service_principal.create",
             )
-            principal = SecurityService(session).create_service_principal(organization_id, request)
+            principal = _security_service(session).create_service_principal(organization_id, request)
             session.commit()
             return service_principal_payload(principal)
+        except AuthorizationError as exc:
+            session.commit()
+            raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
         except ValueError as exc:
             session.rollback()
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -660,7 +753,7 @@ def list_service_principals(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
             _authorize(session, request, organization_id, SECURITY_MANAGE, action="security.service_principal.list")
-            principals = SecurityService(session).list_service_principals(organization_id)
+            principals = _security_service(session).list_service_principals(organization_id)
             session.commit()
             return {"service_principals": [service_principal_payload(principal) for principal in principals]}
         except SQLAlchemyError as exc:
@@ -684,7 +777,7 @@ def update_service_principal(
                 SECURITY_MANAGE,
                 action="security.service_principal.update",
             )
-            principal = SecurityService(session).update_service_principal(organization_id, principal_id, request)
+            principal = _security_service(session).update_service_principal(organization_id, principal_id, request)
             session.commit()
             return service_principal_payload(principal)
         except ValueError as exc:
@@ -706,13 +799,16 @@ def create_secret_reference(organization_id: str, request: SecretReferenceCreate
                 SECRETS_MANAGE,
                 action="security.secret.create",
             )
-            secret = SecurityService(session).create_secret_reference(
+            secret = _security_service(session).create_secret_reference(
                 organization_id,
                 request,
                 created_by_user_id=_authenticated_user_id(context, None),
             )
             session.commit()
             return secret_reference_payload(secret)
+        except AuthorizationError as exc:
+            session.commit()
+            raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
         except ValueError as exc:
             session.rollback()
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -726,9 +822,39 @@ def list_secret_references(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
             _authorize(session, request, organization_id, SECRETS_MANAGE, action="security.secret.list")
-            secrets = SecurityService(session).list_secret_references(organization_id)
+            secrets = _security_service(session).list_secret_references(organization_id)
             session.commit()
             return {"secret_references": [secret_reference_payload(secret) for secret in secrets]}
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.patch("/api/security/{organization_id}/secret-references/{secret_id}")
+def update_secret_reference(
+    organization_id: str,
+    secret_id: str,
+    request: SecretReferenceUpdate,
+    http_request: Request,
+):
+    with SessionLocal() as session:
+        try:
+            _authorize(
+                session,
+                http_request,
+                organization_id,
+                SECRETS_MANAGE,
+                action="security.secret.update",
+            )
+            secret = _security_service(session).update_secret_reference(organization_id, secret_id, request)
+            session.commit()
+            return secret_reference_payload(secret)
+        except AuthorizationError as exc:
+            session.commit()
+            raise HTTPException(status_code=403, detail="not authorized for this organization") from exc
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except SQLAlchemyError as exc:
             session.rollback()
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
@@ -738,7 +864,7 @@ def list_secret_references(organization_id: str, request: Request):
 def list_security_audit_events(organization_id: str, request: Request, limit: int = 100, offset: int = 0):
     with SessionLocal() as session:
         try:
-            security = SecurityService(session)
+            security = _security_service(session)
             _authorize(session, request, organization_id, AUDIT_READ, action="security.audit.list")
             events = security.list_audit_events(organization_id, limit=limit, offset=offset)
             session.commit()
@@ -906,8 +1032,11 @@ def ingestion_health(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
             _authorize(session, request, organization_id, INGESTION_MANAGE, action="ingestion.health.read")
-            return IngestionService(session).health(organization_id)
+            health_payload = IngestionService(session).health(organization_id)
+            session.commit()
+            return health_payload
         except SQLAlchemyError as exc:
+            session.rollback()
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
@@ -948,8 +1077,11 @@ def analytics_health(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
             _authorize(session, request, organization_id, ANALYTICS_READ, action="analytics.health.read")
-            return AnalyticsService(session).health(organization_id)
+            health_payload = AnalyticsService(session).health(organization_id)
+            session.commit()
+            return health_payload
         except SQLAlchemyError as exc:
+            session.rollback()
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
@@ -1178,8 +1310,11 @@ def production_serving_health(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
             _authorize(session, request, organization_id, PREDICTION_READ, action="serving.health.read")
-            return ProductionServingService(session).health(organization_id)
+            health_payload = ProductionServingService(session).health(organization_id)
+            session.commit()
+            return health_payload
         except SQLAlchemyError as exc:
+            session.rollback()
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
@@ -1780,8 +1915,11 @@ def maintenance_operations_health(organization_id: str, request: Request):
     with SessionLocal() as session:
         try:
             _authorize(session, request, organization_id, MAINTENANCE_READ, action="maintenance.health.read")
-            return MaintenanceOperationsService(session).health(organization_id)
+            health_payload = MaintenanceOperationsService(session).health(organization_id)
+            session.commit()
+            return health_payload
         except SQLAlchemyError as exc:
+            session.rollback()
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 

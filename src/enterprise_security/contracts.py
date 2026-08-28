@@ -33,6 +33,16 @@ class IdentityProviderUpdate(BaseModel):
     status: Literal["active", "inactive"]
 
 
+class UserIdentityOnboard(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    full_name: str | None = Field(default=None, max_length=255)
+    identity_provider_id: str
+    issuer: str = Field(min_length=1, max_length=512)
+    subject: str = Field(min_length=1, max_length=255)
+    role: Literal["owner", "admin", "engineer", "technician", "viewer"]
+    profile: dict[str, Any] = Field(default_factory=dict)
+
+
 class UserIdentityCreate(BaseModel):
     user_id: str
     identity_provider_id: str
@@ -44,7 +54,7 @@ class UserIdentityCreate(BaseModel):
 class ServicePrincipalCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     external_subject: str = Field(min_length=1, max_length=255)
-    issuer: str | None = Field(default=None, max_length=512)
+    issuer: str = Field(min_length=1, max_length=512)
     permissions: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 

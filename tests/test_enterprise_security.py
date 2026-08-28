@@ -11,6 +11,7 @@ import pytest
 from alembic.config import Config
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import sessionmaker
 
@@ -64,10 +65,12 @@ from platform_core.models import (
     IngestionSource,
     MaintenanceCase,
     MaintenanceNote,
+    OrganizationIdentityProvider,
     OrganizationMembership,
     SecretReference,
     SecurityAuditEvent,
     User,
+    UserIdentity,
 )
 from platform_core.repositories import PlatformRepository
 
@@ -269,9 +272,23 @@ def _claims(subject: str, *, issuer: str = ISSUER_A, audience: str = AUDIENCE) -
     )
 
 
+def _enterprise_app(monkeypatch, session_factory, jwks=None):
+    monkeypatch.setenv("PMS_SECURITY_MODE", "enterprise")
+    monkeypatch.setenv("PMS_ENVIRONMENT", "development")
+    monkeypatch.setenv("PMS_CORS_ALLOWED_ORIGINS", "http://testserver,http://ui.example")
+    import app.main as app_main
+
+    app_main = importlib.reload(app_main)
+    monkeypatch.setattr(app_main, "SessionLocal", session_factory)
+    if jwks is not None:
+        monkeypatch.setattr(OidcTokenVerifier, "_load_jwks", lambda self, uri, refresh: jwks)
+    return app_main, TestClient(app_main.app)
+
+
 def test_migration_creates_enterprise_security_tables(migrated_db):
     engine, _session_factory = migrated_db
     tables = set(inspect(engine).get_table_names())
+    columns = {column["name"]: column for column in inspect(engine).get_columns("service_principals")}
 
     assert {
         "organization_identity_providers",
@@ -280,6 +297,7 @@ def test_migration_creates_enterprise_security_tables(migrated_db):
         "secret_references",
         "security_audit_events",
     }.issubset(tables)
+    assert columns["issuer"]["nullable"] is False
 
 
 def test_oidc_verifier_accepts_valid_signed_token_and_rejects_bad_tokens(migrated_db, rsa_keys, jwks):
@@ -394,6 +412,22 @@ def test_membership_and_tenant_authorization_fail_closed(migrated_db):
                 _claims(fixture["subjects"]["viewer"]),
                 request_id="req",
             )
+        actual_membership.lifecycle_state = "active"
+        inactive_user = session.get(User, viewer.user_id)
+        inactive_user.lifecycle_state = "inactive"
+        with pytest.raises(PermissionError):
+            security.context_from_claims(
+                fixture["organization_id"],
+                _claims(fixture["subjects"]["viewer"]),
+                request_id="req-inactive-user",
+            )
+        inactive_user.lifecycle_state = "archived"
+        with pytest.raises(PermissionError):
+            security.context_from_claims(
+                fixture["organization_id"],
+                _claims(fixture["subjects"]["viewer"]),
+                request_id="req-archived-user",
+            )
         with pytest.raises(PermissionError):
             security.context_from_claims(
                 fixture["other_organization_id"],
@@ -434,6 +468,13 @@ def test_role_policy_and_owner_protection_rules(migrated_db):
         original_owner = session.query(OrganizationMembership).filter_by(user_id=fixture["users"]["owner"]).one()
         promoted.lifecycle_state = "inactive"
         with pytest.raises(PermissionError):
+            security.change_membership_role(
+                fixture["organization_id"],
+                MembershipChange(user_id=fixture["users"]["owner"], role="admin"),
+                actor=owner,
+            )
+        assert original_owner.role == "owner"
+        with pytest.raises(PermissionError):
             security.change_membership_status(
                 fixture["organization_id"],
                 fixture["users"]["owner"],
@@ -448,6 +489,16 @@ def test_service_principal_scopes_are_machine_only(migrated_db):
     with session_factory() as session:
         fixture = _seed_security(session)
         security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        security.create_identity_provider(
+            fixture["organization_id"],
+            IdentityProviderCreate(
+                name="secondary",
+                issuer=ISSUER_B,
+                audience=AUDIENCE,
+                jwks_uri="https://issuer-b.example/jwks",
+            ),
+            allow_development_targets=True,
+        )
         service = security.context_from_claims(
             fixture["organization_id"],
             _claims("robot-sub"),
@@ -458,12 +509,25 @@ def test_service_principal_scopes_are_machine_only(migrated_db):
         security.require_permission(service, INGESTION_WRITE, action="ingestion.write")
         with pytest.raises(PermissionError):
             security.require_permission(service, MAINTENANCE_MANAGE, action="maintenance.note.add")
+        with pytest.raises(PermissionError):
+            security.context_from_claims(
+                fixture["organization_id"],
+                _claims("robot-sub", issuer=ISSUER_B),
+                request_id="req-wrong-issuer",
+            )
+        with pytest.raises(ValidationError):
+            ServicePrincipalCreate(
+                name="unbound-robot",
+                external_subject="unbound-robot",
+                permissions=[INGESTION_WRITE],
+            )
         with pytest.raises(ValueError):
             security.create_service_principal(
                 fixture["organization_id"],
                 ServicePrincipalCreate(
                     name="bad-robot",
                     external_subject="bad-robot",
+                    issuer=ISSUER_A,
                     permissions=[ML_MODEL_PROMOTE_PRODUCTION],
                 ),
             )
@@ -530,11 +594,16 @@ def test_security_configuration_rejects_dangerous_production_settings(monkeypatc
     monkeypatch.setenv("PMS_TEST_AUTH", "1")
     with pytest.raises(SecurityConfigurationError):
         security_settings()
+    monkeypatch.setenv("PMS_ENVIRONMENT", "development")
+    monkeypatch.setenv("PMS_TEST_AUTH", "0")
+    monkeypatch.setenv("PMS_SECURITY_MODE", "enterprize")
+    with pytest.raises(SecurityConfigurationError):
+        security_settings()
     with pytest.raises(SecurityConfigurationError):
         validate_oidc_endpoint("http://127.0.0.1/jwks")
 
 
-def test_bootstrap_security_provisioning_is_idempotent(migrated_db):
+def test_bootstrap_security_provisioning_is_idempotent_and_org_scoped(migrated_db):
     _engine, session_factory = migrated_db
     request = BootstrapSecurityRequest(
         organization_slug="acme",
@@ -553,6 +622,37 @@ def test_bootstrap_security_provisioning_is_idempotent(migrated_db):
         assert first == second
         assert session.query(User).count() == 1
         assert session.query(OrganizationMembership).count() == 1
+
+        second_org = SecurityService(session).bootstrap_initial_owner(
+            request.model_copy(update={"organization_slug": "globex", "organization_name": "Globex"})
+        )
+        context = SecurityService(session).context_from_claims(
+            second_org["organization_id"],
+            _claims("owner-sub"),
+            request_id="req-second-org",
+        )
+
+        assert context.user_id == first["user_id"]
+        assert session.query(User).count() == 1
+        assert session.query(OrganizationMembership).count() == 2
+        assert session.query(UserIdentity).count() == 2
+
+
+def test_bootstrap_rejects_unsafe_oidc_endpoint_in_production(migrated_db, monkeypatch):
+    _engine, session_factory = migrated_db
+    monkeypatch.setenv("PMS_ENVIRONMENT", "production")
+    request = BootstrapSecurityRequest(
+        organization_slug="acme",
+        organization_name="Acme",
+        owner_email="owner@example.com",
+        issuer=ISSUER_A,
+        subject="owner-sub",
+        audience=AUDIENCE,
+        jwks_uri="http://127.0.0.1/jwks",
+    )
+    with session_factory() as session:
+        with pytest.raises(SecurityConfigurationError):
+            SecurityService(session).bootstrap_initial_owner(request)
 
 
 def test_authenticated_api_enforces_tenant_permissions_and_blocks_actor_spoofing(
@@ -644,6 +744,187 @@ def test_authenticated_api_enforces_tenant_permissions_and_blocks_actor_spoofing
     assert source.organization_id == org_id
     assert case.opened_by_user_id == fixture["users"]["technician"]
     assert any(event.required_permission == "ingestion.manage" for event in denied_events)
+
+
+def test_enterprise_app_reuses_oidc_verifier_jwks_cache(migrated_db, monkeypatch, rsa_keys, jwks):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        session.commit()
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return jwks
+
+    class FakeClient:
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def get(self, uri):
+            assert uri == JWKS_URI
+            FakeClient.calls += 1
+            return FakeResponse()
+
+    monkeypatch.setattr("enterprise_security.service.httpx.Client", FakeClient)
+    _app_main, client = _enterprise_app(monkeypatch, session_factory)
+    headers = {"Authorization": f"Bearer {_token(rsa_keys['primary'], subject='owner-sub')}"}
+
+    first = client.get(f"/api/security/{fixture['organization_id']}/me", headers=headers)
+    second = client.get(f"/api/security/{fixture['organization_id']}/me", headers=headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert FakeClient.calls == 1
+
+
+def test_cors_allows_patch_and_request_ids_are_bounded(migrated_db, monkeypatch):
+    _engine, session_factory = migrated_db
+    _app_main, client = _enterprise_app(monkeypatch, session_factory)
+
+    preflight = client.options(
+        "/api/security/org-id/memberships/user-id",
+        headers={
+            "Origin": "http://ui.example",
+            "Access-Control-Request-Method": "PATCH",
+            "Access-Control-Request-Headers": "Authorization,X-Request-ID",
+        },
+    )
+    too_long_request_id = client.get("/api/health", headers={"X-Request-ID": "x" * 65})
+    malformed_request_id = client.get("/api/health", headers={"X-Request-ID": "bad request id"})
+
+    assert preflight.status_code == 200
+    assert "PATCH" in preflight.headers["access-control-allow-methods"]
+    assert too_long_request_id.status_code == 400
+    assert malformed_request_id.status_code == 400
+
+
+def test_health_endpoints_commit_successful_authorization_audits(migrated_db, monkeypatch, rsa_keys, jwks):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        session.commit()
+
+    _app_main, client = _enterprise_app(monkeypatch, session_factory, jwks=jwks)
+    headers = {"Authorization": f"Bearer {_token(rsa_keys['primary'], subject='owner-sub')}"}
+    org_id = fixture["organization_id"]
+    paths = [
+        f"/api/ingestion/{org_id}/health",
+        f"/api/analytics/{org_id}/health",
+        f"/api/serving/{org_id}/health",
+        f"/api/maintenance/{org_id}/health",
+    ]
+
+    for path in paths:
+        response = client.get(path, headers=headers)
+        assert response.status_code == 200
+
+    with session_factory() as session:
+        actions = {
+            event.action
+            for event in session.query(SecurityAuditEvent).filter_by(
+                organization_id=org_id,
+                outcome="allowed",
+            )
+        }
+
+    assert {
+        "ingestion.health.read",
+        "analytics.health.read",
+        "serving.health.read",
+        "maintenance.health.read",
+    }.issubset(actions)
+
+
+def test_security_admin_api_onboards_users_updates_idps_and_rotates_secrets(
+    migrated_db,
+    monkeypatch,
+    rsa_keys,
+    jwks,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        session.commit()
+
+    _app_main, client = _enterprise_app(monkeypatch, session_factory, jwks=jwks)
+
+    def auth(subject: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {_token(rsa_keys['primary'], subject=subject)}"}
+
+    org_id = fixture["organization_id"]
+    owner_headers = auth("owner-sub")
+    onboarded = client.post(
+        f"/api/security/{org_id}/user-identities",
+        headers=owner_headers,
+        json={
+            "email": "new.viewer@example.com",
+            "full_name": "New Viewer",
+            "identity_provider_id": fixture["idp_id"],
+            "issuer": ISSUER_A,
+            "subject": "new-viewer-sub",
+            "role": "viewer",
+            "profile": {"api_key": "should-redact"},
+        },
+    )
+    assert onboarded.status_code == 200
+    assert onboarded.json()["membership"]["role"] == "viewer"
+
+    new_viewer = client.get(f"/api/security/{org_id}/me", headers=auth("new-viewer-sub"))
+    assert new_viewer.status_code == 200
+    assert new_viewer.json()["role"] == "viewer"
+
+    created_secret = client.post(
+        f"/api/security/{org_id}/secret-references",
+        headers=owner_headers,
+        json={
+            "name": "rotating-abb-token",
+            "purpose": "abb_api_token",
+            "provider": "env",
+            "locator": "ABB_TOKEN",
+            "rotation_metadata": {"ticket": "SEC-1"},
+        },
+    )
+    assert created_secret.status_code == 200
+    rotated_secret = client.patch(
+        f"/api/security/{org_id}/secret-references/{created_secret.json()['id']}",
+        headers=owner_headers,
+        json={
+            "status": "rotating",
+            "rotation_metadata": {"new_token": "plaintext-token"},
+            "last_rotated_at": "2026-08-28T17:00:00Z",
+        },
+    )
+    assert rotated_secret.status_code == 200
+    assert rotated_secret.json()["status"] == "rotating"
+    assert rotated_secret.json()["rotation_metadata"]["new_token"] == "[REDACTED]"
+    assert "plaintext-token" not in str(rotated_secret.json())
+
+    updated_idp = client.patch(
+        f"/api/security/{org_id}/identity-providers/{fixture['idp_id']}",
+        headers=owner_headers,
+        json={"status": "inactive"},
+    )
+    assert updated_idp.status_code == 200
+    assert updated_idp.json()["status"] == "inactive"
+
+    with session_factory() as session:
+        idp = session.get(OrganizationIdentityProvider, fixture["idp_id"])
+        secret = session.get(SecretReference, created_secret.json()["id"])
+
+    assert idp.status == "inactive"
+    assert secret.status == "rotating"
+    assert secret.rotation_metadata["new_token"] == "[REDACTED]"
 
 
 def test_service_principal_cannot_create_human_note_via_api(migrated_db, monkeypatch, rsa_keys, jwks):

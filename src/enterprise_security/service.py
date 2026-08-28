@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from enterprise_security.contracts import (
     BootstrapSecurityRequest,
     IdentityProviderCreate,
+    IdentityProviderUpdate,
     MembershipChange,
     MembershipStatusChange,
     SecretReferenceCreate,
@@ -28,6 +29,7 @@ from enterprise_security.contracts import (
     ServicePrincipalUpdate,
     TokenClaims,
     UserIdentityCreate,
+    UserIdentityOnboard,
 )
 from enterprise_security.permissions import (
     OWNERS_MANAGE,
@@ -50,6 +52,7 @@ from platform_core.repositories import PlatformRepository
 
 SAFE_AUTH_ERROR = "invalid or missing authentication"
 SAFE_FORBIDDEN_ERROR = "not authorized for this organization"
+SUPPORTED_SECURITY_MODES = {"disabled", "enterprise", "test"}
 
 
 class AuthenticationError(PermissionError):
@@ -99,6 +102,8 @@ def security_settings() -> SecuritySettings:
 
 
 def validate_security_settings(settings: SecuritySettings) -> None:
+    if settings.mode not in SUPPORTED_SECURITY_MODES:
+        raise SecurityConfigurationError(f"unsupported security mode: {settings.mode}")
     if settings.environment == "production":
         if "*" in settings.cors_allowed_origins:
             raise SecurityConfigurationError("wildcard CORS is not allowed in production")
@@ -295,14 +300,37 @@ class SecurityService:
         self.session.flush()
         return idp
 
+    def update_identity_provider(
+        self,
+        organization_id: str,
+        identity_provider_id: str,
+        request: IdentityProviderUpdate,
+    ) -> OrganizationIdentityProvider:
+        idp = self.get_identity_provider(organization_id, identity_provider_id)
+        if idp is None:
+            raise AuthorizationError("identity provider does not belong to this organization")
+        idp.status = request.status
+        self.session.flush()
+        return idp
+
     def create_user_identity(self, organization_id: str, request: UserIdentityCreate) -> UserIdentity:
         idp = self.get_identity_provider(organization_id, request.identity_provider_id)
         if idp is None:
             raise AuthorizationError("identity provider does not belong to this organization")
         if idp.issuer != request.issuer:
             raise SecurityConfigurationError("identity issuer must match the identity provider")
-        if self.session.get(User, request.user_id) is None:
+        user = self.session.get(User, request.user_id)
+        if user is None:
             raise AuthorizationError("user does not exist")
+        if user.lifecycle_state != "active":
+            raise AuthorizationError("user is not active")
+        if self.repo.get_active_membership(organization_id, user.id) is None:
+            raise AuthorizationError("user identity requires an active organization membership")
+        existing_identity = self.session.scalar(
+            select(UserIdentity).where(UserIdentity.issuer == request.issuer, UserIdentity.subject == request.subject)
+        )
+        if existing_identity is not None and existing_identity.user_id != user.id:
+            raise AuthorizationError("issuer and subject are already bound to another local user")
         identity = UserIdentity(
             organization_id=organization_id,
             user_id=request.user_id,
@@ -315,8 +343,67 @@ class SecurityService:
         self.session.flush()
         return identity
 
+    def onboard_user_identity(self, organization_id: str, request: UserIdentityOnboard) -> dict[str, Any]:
+        self._require_org(organization_id)
+        idp = self.get_identity_provider(organization_id, request.identity_provider_id)
+        if idp is None or idp.status != "active":
+            raise AuthorizationError("active identity provider does not belong to this organization")
+        if idp.issuer != request.issuer:
+            raise SecurityConfigurationError("identity issuer must match the identity provider")
+
+        email = request.email.lower()
+        existing_identity = self.session.scalar(
+            select(UserIdentity).where(UserIdentity.issuer == request.issuer, UserIdentity.subject == request.subject)
+        )
+        user = self.session.scalar(select(User).where(User.email == email))
+        if existing_identity is not None:
+            existing_user = self.session.get(User, existing_identity.user_id)
+            if user is not None and user.id != existing_identity.user_id:
+                raise AuthorizationError("issuer and subject are already bound to another local user")
+            user = existing_user
+        if user is None:
+            user = self.repo.create_user(UserCreate(email=request.email, full_name=request.full_name))
+        if user.lifecycle_state != "active":
+            raise AuthorizationError("user is not active")
+
+        membership = self.session.scalar(
+            select(OrganizationMembership).where(
+                OrganizationMembership.organization_id == organization_id,
+                OrganizationMembership.user_id == user.id,
+            )
+        )
+        if membership is None:
+            membership = self.repo.add_membership(organization_id, user.id, request.role)
+        else:
+            membership.role = request.role
+            membership.lifecycle_state = "active"
+
+        identity = self.session.scalar(
+            select(UserIdentity).where(
+                UserIdentity.organization_id == organization_id,
+                UserIdentity.issuer == request.issuer,
+                UserIdentity.subject == request.subject,
+            )
+        )
+        if identity is None:
+            identity = self.create_user_identity(
+                organization_id,
+                UserIdentityCreate(
+                    user_id=user.id,
+                    identity_provider_id=idp.id,
+                    issuer=request.issuer,
+                    subject=request.subject,
+                    profile=request.profile,
+                ),
+            )
+        elif identity.user_id != user.id or identity.identity_provider_id != idp.id:
+            raise AuthorizationError("issuer and subject are already bound to another identity")
+        self.session.flush()
+        return {"user": user, "membership": membership, "identity": identity}
+
     def create_service_principal(self, organization_id: str, request: ServicePrincipalCreate) -> ServicePrincipal:
         self._require_org(organization_id)
+        self._require_active_issuer(organization_id, request.issuer)
         permissions = validate_service_permissions(request.permissions)
         principal = ServicePrincipal(
             organization_id=organization_id,
@@ -389,10 +476,20 @@ class SecurityService:
         return secret
 
     def bootstrap_initial_owner(self, request: BootstrapSecurityRequest) -> dict[str, str]:
+        allow_development_targets = os.environ.get("PMS_ENVIRONMENT", "development").lower() != "production"
+        validate_oidc_endpoint(request.jwks_uri, allow_development_targets=allow_development_targets)
         org = self.repo.get_or_create_organization(
             OrganizationCreate(slug=request.organization_slug, name=request.organization_name)
         )
+        existing_identity = self.session.scalar(
+            select(UserIdentity).where(UserIdentity.issuer == request.issuer, UserIdentity.subject == request.subject)
+        )
         user = self.session.scalar(select(User).where(User.email == request.owner_email.lower()))
+        if existing_identity is not None:
+            existing_user = self.session.get(User, existing_identity.user_id)
+            if user is not None and user.id != existing_identity.user_id:
+                raise AuthorizationError("issuer and subject are already bound to another local user")
+            user = existing_user
         if user is None:
             user = self.repo.create_user(
                 UserCreate(
@@ -435,10 +532,14 @@ class SecurityService:
                     jwks_uri=request.jwks_uri,
                     allowed_algorithms=request.allowed_algorithms,
                 ),
-                allow_development_targets=True,
+                allow_development_targets=allow_development_targets,
             )
         identity = self.session.scalar(
-            select(UserIdentity).where(UserIdentity.issuer == request.issuer, UserIdentity.subject == request.subject)
+            select(UserIdentity).where(
+                UserIdentity.organization_id == org.id,
+                UserIdentity.issuer == request.issuer,
+                UserIdentity.subject == request.subject,
+            )
         )
         if identity is None:
             identity = self.create_user_identity(
@@ -473,10 +574,15 @@ class SecurityService:
 
     def context_from_claims(self, organization_id: str, claims: TokenClaims, *, request_id: str) -> SecurityContext:
         identity = self.session.scalar(
-            select(UserIdentity).where(UserIdentity.issuer == claims.issuer, UserIdentity.subject == claims.subject)
+            select(UserIdentity).where(
+                UserIdentity.organization_id == organization_id,
+                UserIdentity.issuer == claims.issuer,
+                UserIdentity.subject == claims.subject,
+            )
         )
         if identity is not None:
-            if identity.organization_id != organization_id:
+            user = self.session.get(User, identity.user_id)
+            if user is None or user.lifecycle_state != "active":
                 raise AuthorizationError(SAFE_FORBIDDEN_ERROR)
             membership = self.repo.get_active_membership(organization_id, identity.user_id)
             if membership is None:
@@ -497,10 +603,11 @@ class SecurityService:
             select(ServicePrincipal).where(
                 ServicePrincipal.organization_id == organization_id,
                 ServicePrincipal.external_subject == claims.subject,
+                ServicePrincipal.issuer == claims.issuer,
                 ServicePrincipal.status == "active",
             )
         )
-        if service is None or (service.issuer is not None and service.issuer != claims.issuer):
+        if service is None:
             raise AuthorizationError(SAFE_FORBIDDEN_ERROR)
         return SecurityContext(
             principal_type="service",
@@ -574,10 +681,36 @@ class SecurityService:
         elif membership.role == "owner" and request.role != "owner" and OWNERS_MANAGE not in actor.permissions:
             raise AuthorizationError("only owners may demote owners")
         else:
+            if membership.role == "owner" and membership.lifecycle_state == "active" and request.role != "owner":
+                active_owner_count = self._active_owner_count(organization_id)
+                if active_owner_count <= 1:
+                    raise AuthorizationError("cannot demote the final active owner")
             membership.role = request.role
             membership.lifecycle_state = "active"
         self.session.flush()
         return membership
+
+    def _active_owner_count(self, organization_id: str) -> int:
+        count = self.session.scalar(
+            select(func.count()).select_from(OrganizationMembership).where(
+                OrganizationMembership.organization_id == organization_id,
+                OrganizationMembership.role == "owner",
+                OrganizationMembership.lifecycle_state == "active",
+            )
+        )
+        return int(count or 0)
+
+    def _require_active_issuer(self, organization_id: str, issuer: str) -> OrganizationIdentityProvider:
+        idp = self.session.scalar(
+            select(OrganizationIdentityProvider).where(
+                OrganizationIdentityProvider.organization_id == organization_id,
+                OrganizationIdentityProvider.issuer == issuer,
+                OrganizationIdentityProvider.status == "active",
+            )
+        )
+        if idp is None:
+            raise AuthorizationError("service principal issuer must match an active identity provider")
+        return idp
 
     def change_membership_status(
         self,
