@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, field_validator
 
 PrincipalType = Literal["user", "service", "system", "anonymous"]
 AuditOutcome = Literal["allowed", "denied", "failed"]
+ASYMMETRIC_OIDC_ALGORITHMS = {"RS256", "RS384", "RS512", "ES256", "ES384", "ES512", "PS256", "PS384", "PS512"}
 
 
 class IdentityProviderCreate(BaseModel):
@@ -22,10 +23,11 @@ class IdentityProviderCreate(BaseModel):
 
     @field_validator("allowed_algorithms")
     @classmethod
-    def reject_none_algorithm(cls, value: list[str]) -> list[str]:
+    def require_asymmetric_jwks_algorithms(cls, value: list[str]) -> list[str]:
         algorithms = sorted(set(value))
-        if "none" in {algorithm.lower() for algorithm in algorithms}:
-            raise ValueError("OIDC alg=none is not supported")
+        unsupported = sorted(set(algorithms) - ASYMMETRIC_OIDC_ALGORITHMS)
+        if unsupported:
+            raise ValueError("OIDC JWKS providers support only asymmetric signing algorithms")
         return algorithms
 
 
@@ -98,6 +100,15 @@ class BootstrapSecurityRequest(BaseModel):
     jwks_uri: str = Field(min_length=1, max_length=1024)
     idp_name: str = Field(default="primary-oidc", min_length=1, max_length=255)
     allowed_algorithms: list[str] = Field(default_factory=lambda: ["RS256"], min_length=1)
+
+    @field_validator("allowed_algorithms")
+    @classmethod
+    def require_asymmetric_jwks_algorithms(cls, value: list[str]) -> list[str]:
+        algorithms = sorted(set(value))
+        unsupported = sorted(set(algorithms) - ASYMMETRIC_OIDC_ALGORITHMS)
+        if unsupported:
+            raise ValueError("OIDC JWKS providers support only asymmetric signing algorithms")
+        return algorithms
 
 
 class TokenClaims(BaseModel):

@@ -21,6 +21,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from enterprise_security.contracts import (
+    ASYMMETRIC_OIDC_ALGORITHMS,
     BootstrapSecurityRequest,
     IdentityProviderCreate,
     IdentityProviderUpdate,
@@ -57,7 +58,9 @@ from platform_core.repositories import PlatformRepository
 SAFE_AUTH_ERROR = "invalid or missing authentication"
 SAFE_FORBIDDEN_ERROR = "not authorized for this organization"
 SUPPORTED_SECURITY_MODES = {"disabled", "enterprise", "test"}
+SUPPORTED_ENVIRONMENTS = {"development", "test", "production"}
 DEFAULT_HTTPS_PORT = 443
+DEFAULT_JWKS_CACHE_TTL_SECONDS = 300.0
 MAX_AUDIT_HTTP_PATH_LENGTH = 1024
 
 
@@ -108,6 +111,8 @@ def security_settings() -> SecuritySettings:
 
 
 def validate_security_settings(settings: SecuritySettings) -> None:
+    if settings.environment not in SUPPORTED_ENVIRONMENTS:
+        raise SecurityConfigurationError(f"unsupported environment: {settings.environment}")
     if settings.mode not in SUPPORTED_SECURITY_MODES:
         raise SecurityConfigurationError(f"unsupported security mode: {settings.mode}")
     if settings.environment == "production":
@@ -176,9 +181,15 @@ def _unsafe_oidc_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address)
 
 
 class OidcTokenVerifier:
-    def __init__(self, *, http_timeout_seconds: float = 2.0):
+    def __init__(
+        self,
+        *,
+        http_timeout_seconds: float = 2.0,
+        jwks_cache_ttl_seconds: float = DEFAULT_JWKS_CACHE_TTL_SECONDS,
+    ):
         self.http_timeout_seconds = http_timeout_seconds
-        self._jwks_cache: dict[str, dict[str, Any]] = {}
+        self.jwks_cache_ttl_seconds = jwks_cache_ttl_seconds
+        self._jwks_cache: dict[str, tuple[dict[str, Any], datetime]] = {}
 
     def verify(self, token: str, idp: OrganizationIdentityProvider) -> TokenClaims:
         try:
@@ -186,7 +197,7 @@ class OidcTokenVerifier:
         except jwt.PyJWTError as exc:
             raise AuthenticationError(SAFE_AUTH_ERROR) from exc
         algorithm = str(header.get("alg") or "")
-        if algorithm.lower() == "none" or algorithm not in set(idp.allowed_algorithms or []):
+        if algorithm not in ASYMMETRIC_OIDC_ALGORITHMS or algorithm not in set(idp.allowed_algorithms or []):
             raise AuthenticationError(SAFE_AUTH_ERROR)
         key_id = header.get("kid")
         key = self._key_for_token(idp.jwks_uri, key_id)
@@ -234,9 +245,13 @@ class OidcTokenVerifier:
             raise AuthenticationError(SAFE_AUTH_ERROR) from exc
 
     def _load_jwks(self, jwks_uri: str, *, refresh: bool) -> dict[str, Any]:
-        if not refresh and jwks_uri in self._jwks_cache:
-            return self._jwks_cache[jwks_uri]
-        allow_development_targets = os.environ.get("PMS_ENVIRONMENT") != "production"
+        cached = self._jwks_cache.get(jwks_uri)
+        if not refresh and cached is not None:
+            jwks, cached_at = cached
+            if (datetime.now(UTC) - cached_at).total_seconds() <= self.jwks_cache_ttl_seconds:
+                return jwks
+            self._jwks_cache.pop(jwks_uri, None)
+        allow_development_targets = os.environ.get("PMS_ENVIRONMENT", "development").lower() != "production"
         validate_oidc_endpoint(jwks_uri, allow_development_targets=allow_development_targets)
         try:
             if allow_development_targets:
@@ -251,7 +266,7 @@ class OidcTokenVerifier:
         if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
             raise AuthenticationError(SAFE_AUTH_ERROR)
         _validated_jwk_entries(jwks["keys"])
-        self._jwks_cache[jwks_uri] = jwks
+        self._jwks_cache[jwks_uri] = (jwks, datetime.now(UTC))
         return jwks
 
 
@@ -360,6 +375,8 @@ class DeterministicTokenVerifier:
             raise AuthenticationError(SAFE_AUTH_ERROR)
         if claims.algorithm not in set(idp.allowed_algorithms or []):
             raise AuthenticationError(SAFE_AUTH_ERROR)
+        if claims.algorithm not in ASYMMETRIC_OIDC_ALGORITHMS:
+            raise AuthenticationError(SAFE_AUTH_ERROR)
         return claims
 
 
@@ -374,6 +391,12 @@ def _select_jwk(jwks: dict[str, Any], key_id: str | None) -> dict[str, Any] | No
 def _validated_jwk_entries(keys: list[Any]) -> None:
     if any(not isinstance(key, Mapping) for key in keys):
         raise AuthenticationError(SAFE_AUTH_ERROR)
+
+
+def _require_asymmetric_oidc_algorithms(algorithms: list[str]) -> None:
+    unsupported = sorted(set(algorithms) - ASYMMETRIC_OIDC_ALGORITHMS)
+    if unsupported:
+        raise SecurityConfigurationError("OIDC JWKS providers support only asymmetric signing algorithms")
 
 
 class SecretResolver:
@@ -428,11 +451,10 @@ class SecurityService:
         allow_development_targets: bool = False,
     ) -> OrganizationIdentityProvider:
         self._require_org(organization_id)
+        _require_asymmetric_oidc_algorithms(request.allowed_algorithms)
         validate_oidc_endpoint(request.jwks_uri, allow_development_targets=allow_development_targets)
         if request.discovery_url:
             validate_oidc_endpoint(request.discovery_url, allow_development_targets=allow_development_targets)
-        if "none" in {algorithm.lower() for algorithm in request.allowed_algorithms}:
-            raise SecurityConfigurationError("OIDC alg=none is not supported")
         idp = OrganizationIdentityProvider(
             organization_id=organization_id,
             name=request.name,
@@ -457,6 +479,10 @@ class SecurityService:
         idp = self.get_identity_provider(organization_id, identity_provider_id)
         if idp is None:
             raise AuthorizationError("identity provider does not belong to this organization")
+        if idp.status == "active" and request.status != "active" and self._active_identity_provider_count(
+            organization_id
+        ) <= 1:
+            raise AuthorizationError("cannot deactivate the final active identity provider")
         idp.status = request.status
         self.session.flush()
         return idp
@@ -504,6 +530,7 @@ class SecurityService:
             raise AuthorizationError("active identity provider does not belong to this organization")
         if idp.issuer != request.issuer:
             raise SecurityConfigurationError("identity issuer must match the identity provider")
+        self._authorize_membership_role_assignment(actor, request.role)
 
         email = request.email.lower()
         existing_identity = self.session.scalar(
@@ -643,7 +670,6 @@ class SecurityService:
                 UserCreate(
                     email=request.owner_email,
                     full_name=request.owner_full_name,
-                    external_subject=f"{request.issuer}#{request.subject}",
                 )
             )
         membership = self.repo.get_active_membership(org.id, user.id)
@@ -682,6 +708,12 @@ class SecurityService:
                 ),
                 allow_development_targets=allow_development_targets,
             )
+        else:
+            _require_asymmetric_oidc_algorithms(request.allowed_algorithms)
+            idp.name = request.idp_name
+            idp.jwks_uri = request.jwks_uri
+            idp.allowed_algorithms = sorted(set(request.allowed_algorithms))
+            idp.status = "active"
         identity = self.session.scalar(
             select(UserIdentity).where(
                 UserIdentity.organization_id == org.id,
@@ -814,11 +846,7 @@ class SecurityService:
         actor: SecurityContext,
     ) -> OrganizationMembership:
         self._lock_organization_for_owner_transition(organization_id)
-        self.require_permission(
-            actor,
-            OWNERS_MANAGE if request.role == "owner" else "members.manage",
-            action="members.role",
-        )
+        self._authorize_membership_role_assignment(actor, request.role)
         membership = self.session.scalar(
             select(OrganizationMembership).where(
                 OrganizationMembership.organization_id == organization_id,
@@ -848,6 +876,22 @@ class SecurityService:
             )
         )
         return int(count or 0)
+
+    def _active_identity_provider_count(self, organization_id: str) -> int:
+        count = self.session.scalar(
+            select(func.count()).select_from(OrganizationIdentityProvider).where(
+                OrganizationIdentityProvider.organization_id == organization_id,
+                OrganizationIdentityProvider.status == "active",
+            )
+        )
+        return int(count or 0)
+
+    def _authorize_membership_role_assignment(self, actor: SecurityContext, role: str) -> None:
+        self.require_permission(
+            actor,
+            OWNERS_MANAGE if role == "owner" else "members.manage",
+            action="members.role",
+        )
 
     def _lock_organization_for_owner_transition(self, organization_id: str) -> Organization:
         organization = self.session.scalar(

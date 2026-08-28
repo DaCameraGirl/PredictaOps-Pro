@@ -338,6 +338,11 @@ def _authorize(
     resource_id: str | None = None,
 ):
     if not _enterprise_security_enabled():
+        if action.startswith("security.") and action != "security.me":
+            raise HTTPException(
+                status_code=403,
+                detail="enterprise security administration requires enterprise security mode",
+            )
         return None
     security = _security_service(session)
     try:
@@ -572,7 +577,11 @@ def create_identity_provider(organization_id: str, request: IdentityProviderCrea
     with SessionLocal() as session:
         try:
             _authorize(session, http_request, organization_id, SECURITY_MANAGE, action="security.idp.create")
-            idp = _security_service(session).create_identity_provider(organization_id, request)
+            idp = _security_service(session).create_identity_provider(
+                organization_id,
+                request,
+                allow_development_targets=SECURITY_SETTINGS.environment != "production",
+            )
             session.commit()
             return identity_provider_payload(idp)
         except ValueError as exc:
@@ -611,6 +620,8 @@ def update_identity_provider(
                 organization_id,
                 SECURITY_MANAGE,
                 action="security.idp.update",
+                resource_type="identity_provider",
+                resource_id=identity_provider_id,
             )
             idp = _security_service(session).update_identity_provider(organization_id, identity_provider_id, request)
             session.commit()
@@ -680,6 +691,8 @@ def change_membership_role(organization_id: str, request: MembershipChange, http
                 organization_id,
                 PLATFORM_READ,
                 action="security.membership.auth",
+                resource_type="membership",
+                resource_id=request.user_id,
             )
             membership = security.change_membership_role(organization_id, request, actor=context)
             session.commit()
@@ -711,6 +724,8 @@ def change_membership_status(
                 organization_id,
                 PLATFORM_READ,
                 action="security.membership.auth",
+                resource_type="membership",
+                resource_id=user_id,
             )
             membership = security.change_membership_status(organization_id, user_id, request, actor=context)
             session.commit()
@@ -779,6 +794,8 @@ def update_service_principal(
                 organization_id,
                 SECURITY_MANAGE,
                 action="security.service_principal.update",
+                resource_type="service_principal",
+                resource_id=principal_id,
             )
             principal = _security_service(session).update_service_principal(organization_id, principal_id, request)
             session.commit()
@@ -851,6 +868,8 @@ def update_secret_reference(
                 organization_id,
                 SECRETS_MANAGE,
                 action="security.secret.update",
+                resource_type="secret_reference",
+                resource_id=secret_id,
             )
             secret = _security_service(session).update_secret_reference(organization_id, secret_id, request)
             session.commit()

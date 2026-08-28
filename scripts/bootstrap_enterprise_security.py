@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audience", required=True)
     parser.add_argument("--jwks-uri", required=True)
     parser.add_argument("--idp-name", default="primary-oidc")
-    parser.add_argument("--allowed-algorithm", action="append", default=["RS256"])
+    parser.add_argument("--allowed-algorithm", action="append", default=None)
     return parser.parse_args()
 
 
@@ -44,7 +44,7 @@ def main() -> int:
         audience=args.audience,
         jwks_uri=args.jwks_uri,
         idp_name=args.idp_name,
-        allowed_algorithms=args.allowed_algorithm,
+        allowed_algorithms=args.allowed_algorithm or ["RS256"],
     )
     with session_scope() as session:
         result = SecurityService(session).bootstrap_initial_owner(request)
