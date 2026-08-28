@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 from pathlib import Path
 from typing import Any
@@ -42,18 +43,30 @@ class ModelArtifactStore:
         return path.as_posix(), digest
 
     def verify_artifact(self, *, organization_id: str, artifact_uri: str, expected_sha256: str) -> str:
-        path = self._trusted_artifact_path(organization_id=organization_id, artifact_uri=artifact_uri)
-        actual_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
-        if actual_sha256 != expected_sha256:
-            raise ValueError("model artifact SHA-256 does not match registry metadata")
-        return actual_sha256
-
-    def load_verified_model(self, *, organization_id: str, artifact_uri: str, expected_sha256: str) -> Any:
-        self.verify_artifact(
+        artifact = self._verified_artifact_bytes(
             organization_id=organization_id,
             artifact_uri=artifact_uri,
             expected_sha256=expected_sha256,
         )
+        actual_sha256 = hashlib.sha256(artifact).hexdigest()
+        return actual_sha256
+
+    def _verified_artifact_bytes(self, *, organization_id: str, artifact_uri: str, expected_sha256: str) -> bytes:
         path = self._trusted_artifact_path(organization_id=organization_id, artifact_uri=artifact_uri)
-        return joblib.load(path)
+        artifact = path.read_bytes()
+        actual_sha256 = hashlib.sha256(artifact).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValueError("model artifact SHA-256 does not match registry metadata")
+        return artifact
+
+    def load_verified_model(self, *, organization_id: str, artifact_uri: str, expected_sha256: str) -> Any:
+        artifact = self._verified_artifact_bytes(
+            organization_id=organization_id,
+            artifact_uri=artifact_uri,
+            expected_sha256=expected_sha256,
+        )
+        try:
+            return joblib.load(io.BytesIO(artifact))
+        except Exception as exc:
+            raise ValueError("model artifact passed checksum but could not be deserialized") from exc
 
