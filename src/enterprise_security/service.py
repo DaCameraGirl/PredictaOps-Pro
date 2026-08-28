@@ -41,6 +41,7 @@ from enterprise_security.contracts import (
     UserIdentityOnboard,
 )
 from enterprise_security.permissions import (
+    MEMBERS_MANAGE,
     OWNERS_MANAGE,
     permissions_for_role,
     validate_service_permissions,
@@ -66,6 +67,7 @@ SUPPORTED_SECURITY_MODES = {"disabled", "enterprise", "test"}
 SUPPORTED_ENVIRONMENTS = {"development", "test", "production"}
 DEFAULT_HTTPS_PORT = 443
 DEFAULT_JWKS_CACHE_TTL_SECONDS = 300.0
+DEFAULT_UNKNOWN_KID_REFRESH_COOLDOWN_SECONDS = 60.0
 MAX_JWKS_RESPONSE_BYTES = 65_536
 MAX_AUDIT_HTTP_PATH_LENGTH = 1024
 MAX_AUDIT_RESOURCE_ID_LENGTH = 255
@@ -197,10 +199,13 @@ class OidcTokenVerifier:
         *,
         http_timeout_seconds: float = 2.0,
         jwks_cache_ttl_seconds: float = DEFAULT_JWKS_CACHE_TTL_SECONDS,
+        unknown_kid_refresh_cooldown_seconds: float = DEFAULT_UNKNOWN_KID_REFRESH_COOLDOWN_SECONDS,
     ):
         self.http_timeout_seconds = http_timeout_seconds
         self.jwks_cache_ttl_seconds = jwks_cache_ttl_seconds
+        self.unknown_kid_refresh_cooldown_seconds = unknown_kid_refresh_cooldown_seconds
         self._jwks_cache: dict[str, tuple[dict[str, Any], datetime]] = {}
+        self._unknown_kid_cache: dict[tuple[str, str, str], datetime] = {}
 
     def verify(self, token: str, idp: OrganizationIdentityProvider) -> TokenClaims:
         try:
@@ -254,14 +259,31 @@ class OidcTokenVerifier:
         jwks = self._load_jwks(jwks_uri, refresh=False)
         key = _select_jwk(jwks, key_id, algorithm)
         if key is None:
+            if key_id and self._unknown_kid_refresh_is_in_cooldown(jwks_uri, str(key_id), algorithm):
+                raise AuthenticationError(SAFE_AUTH_ERROR)
             jwks = self._load_jwks(jwks_uri, refresh=True)
             key = _select_jwk(jwks, key_id, algorithm)
         if key is None:
+            if key_id:
+                self._unknown_kid_cache[(jwks_uri, str(key_id), algorithm)] = datetime.now(UTC)
             raise AuthenticationError(SAFE_AUTH_ERROR)
+        if key_id:
+            self._unknown_kid_cache.pop((jwks_uri, str(key_id), algorithm), None)
         try:
             return PyJWK.from_dict(key).key
         except Exception as exc:
             raise AuthenticationError(SAFE_AUTH_ERROR) from exc
+
+    def _unknown_kid_refresh_is_in_cooldown(self, jwks_uri: str, key_id: str, algorithm: str) -> bool:
+        cache_key = (jwks_uri, key_id, algorithm)
+        cached_at = self._unknown_kid_cache.get(cache_key)
+        if cached_at is None:
+            return False
+        age_seconds = (datetime.now(UTC) - cached_at).total_seconds()
+        if age_seconds <= self.unknown_kid_refresh_cooldown_seconds:
+            return True
+        self._unknown_kid_cache.pop(cache_key, None)
+        return False
 
     def _load_jwks(self, jwks_uri: str, *, refresh: bool) -> dict[str, Any]:
         cached = self._jwks_cache.get(jwks_uri)
@@ -299,7 +321,8 @@ def _fetch_jwks_with_pinned_address(jwks_uri: str, *, timeout_seconds: float) ->
     path = parsed.path or "/"
     if parsed.query:
         path = f"{path}?{parsed.query}"
-    host_header = host if port == DEFAULT_HTTPS_PORT else f"{host}:{port}"
+    host_header_name = _http_host_header_name(host)
+    host_header = host_header_name if port == DEFAULT_HTTPS_PORT else f"{host_header_name}:{port}"
     request = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {host_header}\r\n"
@@ -423,6 +446,16 @@ def _select_jwk(jwks: dict[str, Any], key_id: str | None, algorithm: str) -> dic
 def _validated_jwk_entries(keys: list[Any]) -> None:
     if any(not isinstance(key, Mapping) for key in keys):
         raise AuthenticationError(SAFE_AUTH_ERROR)
+
+
+def _http_host_header_name(host: str) -> str:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if isinstance(address, ipaddress.IPv6Address):
+        return f"[{host}]"
+    return host
 
 
 def _jwk_allows_signing(key: Mapping[str, Any], algorithm: str) -> bool:
@@ -643,12 +676,6 @@ class SecurityService:
         if user.lifecycle_state != "active":
             raise AuthorizationError("user is not active")
 
-        membership = self.change_membership_role(
-            organization_id,
-            MembershipChange(user_id=user.id, role=request.role),
-            actor=actor,
-        )
-
         identity = self.session.scalar(
             select(UserIdentity).where(
                 UserIdentity.organization_id == organization_id,
@@ -656,6 +683,36 @@ class SecurityService:
                 UserIdentity.subject == request.subject,
             )
         )
+        if request.role == "owner" and identity is None:
+            bootstrap_membership = self.session.scalar(
+                select(OrganizationMembership).where(
+                    OrganizationMembership.organization_id == organization_id,
+                    OrganizationMembership.user_id == user.id,
+                )
+            )
+            if bootstrap_membership is None:
+                self.repo.add_membership(organization_id, user.id, "viewer")
+            elif bootstrap_membership.lifecycle_state != "active":
+                bootstrap_membership.lifecycle_state = "active"
+                bootstrap_membership.role = "viewer"
+                self.session.flush()
+            identity = self.create_user_identity(
+                organization_id,
+                UserIdentityCreate(
+                    user_id=user.id,
+                    identity_provider_id=idp.id,
+                    issuer=request.issuer,
+                    subject=request.subject,
+                    profile=request.profile,
+                ),
+            )
+
+        membership = self.change_membership_role(
+            organization_id,
+            MembershipChange(user_id=user.id, role=request.role),
+            actor=actor,
+        )
+
         if identity is None:
             identity = self.create_user_identity(
                 organization_id,
@@ -1011,40 +1068,76 @@ class SecurityService:
         actor: SecurityContext,
     ) -> OrganizationMembership:
         self._lock_organization_for_owner_transition(organization_id)
-        self._authorize_membership_role_assignment(actor, request.role, audit_allowed=False)
         membership = self.session.scalar(
             select(OrganizationMembership).where(
                 OrganizationMembership.organization_id == organization_id,
                 OrganizationMembership.user_id == request.user_id,
             )
         )
+        self.require_permission(
+            actor,
+            self._membership_role_change_permission_for_membership(membership, request.role),
+            action="members.role",
+            audit_allowed=False,
+        )
         if membership is None:
             user = self.session.get(User, request.user_id)
             if user is None:
                 raise AuthorizationError("user does not exist")
+            if user.lifecycle_state != "active":
+                raise AuthorizationError("user is not active")
+            if request.role == "owner" and not self._user_has_active_local_identity(organization_id, request.user_id):
+                raise AuthorizationError("owner membership requires an active local identity")
             membership = self.repo.add_membership(organization_id, request.user_id, request.role)
         elif membership.role == "owner" and request.role != "owner" and OWNERS_MANAGE not in actor.permissions:
             raise AuthorizationError("only owners may demote owners")
         else:
             if membership.role == "owner" and membership.lifecycle_state == "active" and request.role != "owner":
                 self.session.flush()
-                active_owner_count = self._active_owner_count(organization_id)
-                if active_owner_count <= 1:
-                    raise AuthorizationError("cannot demote the final active owner")
+                if (
+                    self._user_is_reachable_active_owner(organization_id, request.user_id)
+                    and self._reachable_active_owner_count(organization_id) <= 1
+                ):
+                    raise AuthorizationError("cannot demote the final reachable active owner")
+            if request.role == "owner" and not self._user_has_active_local_identity(organization_id, request.user_id):
+                raise AuthorizationError("owner membership requires an active local identity")
             membership.role = request.role
             membership.lifecycle_state = "active"
         self.session.flush()
         return membership
 
-    def _active_owner_count(self, organization_id: str) -> int:
+    def _reachable_active_owner_count(self, organization_id: str) -> int:
         count = self.session.scalar(
-            select(func.count()).select_from(OrganizationMembership).where(
-                OrganizationMembership.organization_id == organization_id,
-                OrganizationMembership.role == "owner",
-                OrganizationMembership.lifecycle_state == "active",
-            )
+            self._reachable_active_owner_count_statement(organization_id)
         )
         return int(count or 0)
+
+    def _user_is_reachable_active_owner(self, organization_id: str, user_id: str) -> bool:
+        count = self.session.scalar(
+            self._reachable_active_owner_count_statement(organization_id).where(
+                OrganizationMembership.user_id == user_id
+            )
+        )
+        return int(count or 0) > 0
+
+    def _user_has_active_local_identity(self, organization_id: str, user_id: str) -> bool:
+        count = self.session.scalar(
+            select(func.count())
+            .select_from(UserIdentity)
+            .join(User, User.id == UserIdentity.user_id)
+            .join(
+                OrganizationIdentityProvider,
+                OrganizationIdentityProvider.id == UserIdentity.identity_provider_id,
+            )
+            .where(
+                UserIdentity.organization_id == organization_id,
+                UserIdentity.user_id == user_id,
+                User.lifecycle_state == "active",
+                OrganizationIdentityProvider.organization_id == organization_id,
+                OrganizationIdentityProvider.status == "active",
+            )
+        )
+        return int(count or 0) > 0
 
     def _active_identity_provider_count(self, organization_id: str) -> int:
         count = self.session.scalar(
@@ -1057,6 +1150,14 @@ class SecurityService:
 
     def _reachable_active_owner_count_excluding_idp(self, organization_id: str, excluded_idp_id: str) -> int:
         count = self.session.scalar(
+            self._reachable_active_owner_count_statement(organization_id).where(
+                OrganizationIdentityProvider.id != excluded_idp_id
+            )
+        )
+        return int(count or 0)
+
+    def _reachable_active_owner_count_statement(self, organization_id: str):
+        return (
             select(func.count(func.distinct(OrganizationMembership.user_id)))
             .select_from(OrganizationMembership)
             .join(User, User.id == OrganizationMembership.user_id)
@@ -1076,10 +1177,8 @@ class SecurityService:
                 UserIdentity.organization_id == organization_id,
                 OrganizationIdentityProvider.organization_id == organization_id,
                 OrganizationIdentityProvider.status == "active",
-                OrganizationIdentityProvider.id != excluded_idp_id,
             )
         )
-        return int(count or 0)
 
     def _authorize_membership_role_assignment(
         self,
@@ -1090,10 +1189,47 @@ class SecurityService:
     ) -> None:
         self.require_permission(
             actor,
-            OWNERS_MANAGE if role == "owner" else "members.manage",
+            self.membership_role_assignment_permission(role),
             action="members.role",
             audit_allowed=audit_allowed,
         )
+
+    @staticmethod
+    def membership_role_assignment_permission(role: str) -> str:
+        return OWNERS_MANAGE if role == "owner" else MEMBERS_MANAGE
+
+    def membership_role_change_permission(self, organization_id: str, user_id: str, role: str) -> str:
+        membership = self.session.scalar(
+            select(OrganizationMembership).where(
+                OrganizationMembership.organization_id == organization_id,
+                OrganizationMembership.user_id == user_id,
+            )
+        )
+        return self._membership_role_change_permission_for_membership(membership, role)
+
+    @staticmethod
+    def _membership_role_change_permission_for_membership(
+        membership: OrganizationMembership | None,
+        target_role: str,
+    ) -> str:
+        if target_role == "owner" or (membership is not None and membership.role == "owner" and target_role != "owner"):
+            return OWNERS_MANAGE
+        return MEMBERS_MANAGE
+
+    def membership_status_change_permission(self, organization_id: str, user_id: str) -> str:
+        membership = self.session.scalar(
+            select(OrganizationMembership).where(
+                OrganizationMembership.organization_id == organization_id,
+                OrganizationMembership.user_id == user_id,
+            )
+        )
+        if membership is None:
+            return MEMBERS_MANAGE
+        return self.membership_status_permission(membership.role)
+
+    @staticmethod
+    def membership_status_permission(role: str) -> str:
+        return OWNERS_MANAGE if role == "owner" else MEMBERS_MANAGE
 
     def _lock_organization_for_owner_transition(self, organization_id: str) -> Organization:
         organization = self.session.scalar(
@@ -1184,12 +1320,15 @@ class SecurityService:
         )
         if membership is None:
             raise AuthorizationError("membership does not exist")
-        permission = OWNERS_MANAGE if membership.role == "owner" else "members.manage"
+        permission = self.membership_status_permission(membership.role)
         self.require_permission(actor, permission, action="members.status", audit_allowed=False)
         if membership.role == "owner" and request.lifecycle_state != "active":
             self.session.flush()
-            if self._active_owner_count(organization_id) <= 1:
-                raise AuthorizationError("cannot deactivate the final active owner")
+            if (
+                self._user_is_reachable_active_owner(organization_id, user_id)
+                and self._reachable_active_owner_count(organization_id) <= 1
+            ):
+                raise AuthorizationError("cannot deactivate the final reachable active owner")
         membership.lifecycle_state = request.lifecycle_state
         self.session.flush()
         return membership

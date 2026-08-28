@@ -36,7 +36,10 @@ from enterprise_security.contracts import (
 from enterprise_security.permissions import (
     INGESTION_WRITE,
     MAINTENANCE_MANAGE,
+    MEMBERS_MANAGE,
     ML_MODEL_PROMOTE_PRODUCTION,
+    OWNERS_MANAGE,
+    SECRETS_MANAGE,
     SECURITY_MANAGE,
     SERVICE_ALLOWED_PERMISSIONS,
     SERVING_PREDICT,
@@ -413,23 +416,42 @@ def test_oidc_verifier_accepts_valid_signed_token_and_rejects_bad_tokens(migrate
                 verifier.verify(token, idp)
 
 
-def test_unknown_kid_refreshes_jwks_once_then_fails_closed(migrated_db, rsa_keys):
+def test_unknown_kid_refresh_is_rate_limited_but_allows_later_rotation(migrated_db, rsa_keys):
     _engine, session_factory = migrated_db
     with session_factory() as session:
         fixture = _seed_security(session)
         idp = SecurityService(session).get_identity_provider(fixture["organization_id"], fixture["idp_id"])
-        verifier = OidcTokenVerifier()
+        verifier = OidcTokenVerifier(unknown_kid_refresh_cooldown_seconds=60.0)
         calls = []
+        allow_rotation = False
 
         def fake_load_jwks(_jwks_uri, *, refresh):
             calls.append(refresh)
+            if refresh and allow_rotation:
+                return {"keys": [_jwk_from_public_key(rsa_keys["alternate"].public_key(), kid="rotated")]}
             return {"keys": [_jwk_from_public_key(rsa_keys["primary"].public_key(), kid="primary")]}
 
         verifier._load_jwks = fake_load_jwks
         with pytest.raises(AuthenticationError):
             verifier.verify(_token(rsa_keys["primary"], subject="owner-sub", kid="rotated"), idp)
+        with pytest.raises(AuthenticationError):
+            verifier.verify(_token(rsa_keys["primary"], subject="owner-sub", kid="rotated"), idp)
 
-        assert calls == [False, True]
+        assert calls == [False, True, False]
+        assert verifier.verify(_token(rsa_keys["primary"], subject="owner-sub"), idp).subject == "owner-sub"
+        assert calls == [False, True, False, False]
+
+        cache_key = (idp.jwks_uri, "rotated", "RS256")
+        verifier._unknown_kid_cache[cache_key] = datetime.now(UTC) - timedelta(seconds=61)
+        allow_rotation = True
+        assert (
+            verifier.verify(
+                _token(rsa_keys["alternate"], subject="owner-sub", kid="rotated"),
+                idp,
+            ).key_id
+            == "rotated"
+        )
+        assert calls == [False, True, False, False, False, True]
 
 
 def test_oidc_verifier_expires_cached_jwks(monkeypatch):
@@ -1029,6 +1051,7 @@ def test_role_policy_and_owner_protection_rules(migrated_db):
     _engine, session_factory = migrated_db
     with session_factory() as session:
         fixture = _seed_security(session)
+        repo = PlatformRepository(session)
         security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
         admin = security.context_from_claims(
             fixture["organization_id"],
@@ -1047,6 +1070,31 @@ def test_role_policy_and_owner_protection_rules(migrated_db):
                 MembershipChange(user_id=fixture["users"]["admin"], role="owner"),
                 actor=admin,
             )
+        unreachable_user = repo.create_user(UserCreate(email="unreachable-owner@example.com"))
+        repo.add_membership(fixture["organization_id"], unreachable_user.id, "viewer")
+        with pytest.raises(PermissionError):
+            security.change_membership_role(
+                fixture["organization_id"],
+                MembershipChange(user_id=unreachable_user.id, role="owner"),
+                actor=owner,
+            )
+        security.create_user_identity(
+            fixture["organization_id"],
+            UserIdentityCreate(
+                user_id=unreachable_user.id,
+                identity_provider_id=fixture["idp_id"],
+                issuer=ISSUER_A,
+                subject="reachable-new-owner-sub",
+            ),
+        )
+        reachable_promoted = security.change_membership_role(
+            fixture["organization_id"],
+            MembershipChange(user_id=unreachable_user.id, role="owner"),
+            actor=owner,
+        )
+        assert reachable_promoted.role == "owner"
+        reachable_promoted.role = "viewer"
+        session.flush()
         promoted = security.change_membership_role(
             fixture["organization_id"],
             MembershipChange(user_id=fixture["users"]["admin"], role="owner"),
@@ -1056,6 +1104,9 @@ def test_role_policy_and_owner_protection_rules(migrated_db):
 
         original_owner = session.query(OrganizationMembership).filter_by(user_id=fixture["users"]["owner"]).one()
         promoted.lifecycle_state = "inactive"
+        legacy_unreachable = repo.create_user(UserCreate(email="legacy-unreachable-owner@example.com"))
+        repo.add_membership(fixture["organization_id"], legacy_unreachable.id, "owner")
+        session.flush()
         with pytest.raises(PermissionError):
             security.change_membership_role(
                 fixture["organization_id"],
@@ -1433,6 +1484,34 @@ def test_secret_references_do_not_expose_values_and_plaintext_source_config_is_r
         for invalid_reference in [{}, {"name": "hunter2"}, {"secret_reference_id": ""}]:
             with pytest.raises(ValueError):
                 assert_no_plaintext_secrets({"auth": {"password": invalid_reference}})
+        secret_reference = {"secret_reference_id": secret.id}
+        for key in [
+            "private_key",
+            "private-key",
+            "passphrase",
+            "dsn",
+            "database_dsn",
+            "credential_url",
+            "connection_string",
+        ]:
+            with pytest.raises(ValueError):
+                assert_no_plaintext_secrets({"connector": {key: "plaintext"}})
+            assert_no_plaintext_secrets({"connector": {key: secret_reference}})
+        for value in [
+            "https://user:password@vendor.example/api",
+            "postgresql://user:password@db.example:5432/pms",
+            "https://vendor.example/api?token=plaintext",
+            "https://vendor.example/api?client_secret=plaintext",
+        ]:
+            with pytest.raises(ValueError):
+                assert_no_plaintext_secrets({"endpoint": value})
+        assert_no_plaintext_secrets(
+            {
+                "endpoint_url": "https://vendor.example/api",
+                "callback": "https://vendor.example/callback?mode=health",
+                "retry": {"timeout_seconds": 10},
+            }
+        )
         IngestionService(session).register_source(
             SourceRegistration(
                 organization_id=fixture["organization_id"],
@@ -1654,6 +1733,93 @@ def test_oidc_jwks_fetch_pins_validated_connection_destination(monkeypatch):
     }
     assert resolver_calls == [("issuer.example", 443)]
     assert connected_addresses == [("93.184.216.34", 443)]
+
+
+@pytest.mark.parametrize(
+    ("uri", "host", "address", "port", "expected_host_header"),
+    [
+        (
+            "https://[2606:4700:4700::1111]/jwks",
+            "2606:4700:4700::1111",
+            "2606:4700:4700::1111",
+            443,
+            b"Host: [2606:4700:4700::1111]\r\n",
+        ),
+        (
+            "https://[2606:4700:4700::1111]:8443/jwks",
+            "2606:4700:4700::1111",
+            "2606:4700:4700::1111",
+            8443,
+            b"Host: [2606:4700:4700::1111]:8443\r\n",
+        ),
+        ("https://93.184.216.34/jwks", "93.184.216.34", "93.184.216.34", 443, b"Host: 93.184.216.34\r\n"),
+        ("https://issuer.example/jwks", "issuer.example", "93.184.216.34", 443, b"Host: issuer.example\r\n"),
+    ],
+)
+def test_oidc_jwks_fetch_formats_host_header_for_literals_and_hostnames(
+    monkeypatch,
+    uri,
+    host,
+    address,
+    port,
+    expected_host_header,
+):
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: 11\r\n"
+        b"\r\n"
+        b'{"keys":[]}'
+    )
+
+    def fake_getaddrinfo(resolved_host, resolved_port, *args, **kwargs):
+        assert resolved_host == host
+        assert resolved_port == port
+        family = socket.AF_INET6 if ":" in address else socket.AF_INET
+        return [(family, socket.SOCK_STREAM, 6, "", (address, port))]
+
+    class FakeRawSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeTlsSocket:
+        def __init__(self):
+            self._chunks = [response, b""]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def settimeout(self, _timeout):
+            return None
+
+        def sendall(self, request):
+            assert expected_host_header in request
+
+        def recv(self, _size):
+            return self._chunks.pop(0)
+
+    class FakeSslContext:
+        def wrap_socket(self, raw_socket, *, server_hostname):
+            assert isinstance(raw_socket, FakeRawSocket)
+            assert server_hostname == host
+            return FakeTlsSocket()
+
+    def fake_create_connection(destination, *, timeout):
+        assert destination == (address, port)
+        assert timeout == 2.0
+        return FakeRawSocket()
+
+    monkeypatch.setattr("enterprise_security.service.socket.getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr("enterprise_security.service.socket.create_connection", fake_create_connection)
+    monkeypatch.setattr("enterprise_security.service.ssl.create_default_context", lambda: FakeSslContext())
+
+    assert _fetch_jwks_with_pinned_address(uri, timeout_seconds=2.0) == {"keys": []}
 
 
 def test_oidc_jwks_fetch_bounds_response_size_and_overall_deadline(monkeypatch):
@@ -2771,6 +2937,11 @@ def test_security_mutation_audits_record_target_resource_ids(migrated_db, monkey
         headers=headers,
         json={"lifecycle_state": "inactive"},
     )
+    owner_role = client.post(
+        f"/api/security/{org_id}/memberships",
+        headers=headers,
+        json={"user_id": fixture["users"]["admin"], "role": "owner"},
+    )
     service_principal = client.patch(
         f"/api/security/{org_id}/service-principals/{fixture['service_principal_id']}",
         headers=headers,
@@ -2790,24 +2961,28 @@ def test_security_mutation_audits_record_target_resource_ids(migrated_db, monkey
     assert idp_update.status_code == 200
     assert membership_role.status_code == 200
     assert membership_status.status_code == 200
+    assert owner_role.status_code == 200
     assert service_principal.status_code == 200
     assert secret.status_code == 200
     assert secret_update.status_code == 200
 
     with session_factory() as session:
         audit_targets = {
-            (event.action, event.resource_type, event.resource_id)
+            (event.action, event.required_permission, event.resource_type, event.resource_id)
             for event in session.query(SecurityAuditEvent).filter_by(organization_id=org_id, outcome="allowed")
         }
 
-    assert ("security.idp.update", "identity_provider", second_idp.id) in audit_targets
-    assert ("security.membership.auth", "membership", fixture["users"]["bob"]) in audit_targets
+    assert ("security.idp.update", SECURITY_MANAGE, "identity_provider", second_idp.id) in audit_targets
+    assert ("members.role", MEMBERS_MANAGE, "membership", fixture["users"]["bob"]) in audit_targets
+    assert ("members.status", MEMBERS_MANAGE, "membership", fixture["users"]["bob"]) in audit_targets
+    assert ("members.role", OWNERS_MANAGE, "membership", fixture["users"]["admin"]) in audit_targets
     assert (
         "security.service_principal.update",
+        SECURITY_MANAGE,
         "service_principal",
         fixture["service_principal_id"],
     ) in audit_targets
-    assert ("security.secret.update", "secret_reference", secret.json()["id"]) in audit_targets
+    assert ("security.secret.update", SECRETS_MANAGE, "secret_reference", secret.json()["id"]) in audit_targets
 
 
 def test_rejected_security_mutations_are_not_audited_as_allowed(migrated_db, monkeypatch, rsa_keys, jwks):
@@ -2854,10 +3029,9 @@ def test_rejected_security_mutations_are_not_audited_as_allowed(migrated_db, mon
                     & (SecurityAuditEvent.resource_id == fixture["idp_id"])
                 )
                 | (
-                    (SecurityAuditEvent.action == "security.membership.auth")
+                    (SecurityAuditEvent.action == "members.status")
                     & (SecurityAuditEvent.resource_id == owner_user_id)
                 )
-                | (SecurityAuditEvent.action == "members.status")
             ),
         ).count()
         denied_targets = {
@@ -2875,7 +3049,7 @@ def test_rejected_security_mutations_are_not_audited_as_allowed(migrated_db, mon
         "operation_rejected",
     ) in denied_targets
     assert (
-        "security.membership.auth",
+        "members.status",
         "membership",
         owner_user_id,
         "denied",

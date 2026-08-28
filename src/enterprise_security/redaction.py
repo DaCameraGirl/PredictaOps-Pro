@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 SECRET_KEY_PARTS = {
     "api_key",
@@ -11,9 +12,14 @@ SECRET_KEY_PARTS = {
     "authorization",
     "bearer",
     "client_secret",
+    "connection_string",
     "credential",
     "credentials",
+    "dsn",
+    "passphrase",
     "password",
+    "private_key",
+    "privatekey",
     "secret",
     "token",
     "access_token",
@@ -23,6 +29,18 @@ SECRET_KEY_PARTS = {
 def is_secret_key(key: str) -> bool:
     normalized = key.lower().replace("-", "_")
     return any(part in normalized for part in SECRET_KEY_PARTS)
+
+
+def _looks_like_credential_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if not parsed.scheme or not parsed.netloc:
+        return False
+    if parsed.username or parsed.password:
+        return True
+    return any(is_secret_key(key) for key, _value in parse_qsl(parsed.query, keep_blank_values=True))
 
 
 def redact_value(value: Any) -> Any:
@@ -53,3 +71,5 @@ def assert_no_plaintext_secrets(value: Any, *, path: str = "config") -> None:
     elif isinstance(value, list):
         for index, item in enumerate(value):
             assert_no_plaintext_secrets(item, path=f"{path}[{index}]")
+    elif isinstance(value, str) and _looks_like_credential_url(value):
+        raise ValueError(f"{path} must not contain credential-bearing URLs")

@@ -52,6 +52,7 @@ from enterprise_security.permissions import (
     MAINTENANCE_MANAGE,
     MAINTENANCE_READ,
     MAINTENANCE_WORK_ORDER_APPROVE,
+    MEMBERS_MANAGE,
     ML_EXPERIMENT_RUN,
     ML_MODEL_PROMOTE_PRODUCTION,
     ML_MODEL_PROMOTE_VALIDATED,
@@ -834,6 +835,8 @@ def change_membership_role(organization_id: str, request: MembershipChange, http
     with SessionLocal() as session:
         security = _security_service(session)
         context = None
+        required_permission = MEMBERS_MANAGE
+        action = "members.role"
         try:
             context = _authorize(
                 session,
@@ -845,13 +848,18 @@ def change_membership_role(organization_id: str, request: MembershipChange, http
                 resource_id=request.user_id,
                 audit_allowed=False,
             )
+            required_permission = security.membership_role_change_permission(
+                organization_id,
+                request.user_id,
+                request.role,
+            )
             membership = security.change_membership_role(organization_id, request, actor=context)
             _record_security_mutation_audit(
                 session,
                 http_request,
                 context,
-                action="security.membership.auth",
-                required_permission=PLATFORM_READ,
+                action=action,
+                required_permission=required_permission,
                 resource_type="membership",
                 resource_id=request.user_id,
                 outcome="allowed",
@@ -868,8 +876,8 @@ def change_membership_role(organization_id: str, request: MembershipChange, http
                     session,
                     http_request,
                     context,
-                    action="security.membership.auth",
-                    required_permission=PLATFORM_READ,
+                    action=action,
+                    required_permission=required_permission,
                     resource_type="membership",
                     resource_id=request.user_id,
                     outcome="denied",
@@ -895,6 +903,8 @@ def change_membership_status(
     with SessionLocal() as session:
         security = _security_service(session)
         context = None
+        required_permission = MEMBERS_MANAGE
+        action = "members.status"
         try:
             context = _authorize(
                 session,
@@ -906,13 +916,14 @@ def change_membership_status(
                 resource_id=user_id,
                 audit_allowed=False,
             )
+            required_permission = security.membership_status_change_permission(organization_id, user_id)
             membership = security.change_membership_status(organization_id, user_id, request, actor=context)
             _record_security_mutation_audit(
                 session,
                 http_request,
                 context,
-                action="security.membership.auth",
-                required_permission=PLATFORM_READ,
+                action=action,
+                required_permission=required_permission,
                 resource_type="membership",
                 resource_id=user_id,
                 outcome="allowed",
@@ -929,8 +940,8 @@ def change_membership_status(
                     session,
                     http_request,
                     context,
-                    action="security.membership.auth",
-                    required_permission=PLATFORM_READ,
+                    action=action,
+                    required_permission=required_permission,
                     resource_type="membership",
                     resource_id=user_id,
                     outcome="denied",
