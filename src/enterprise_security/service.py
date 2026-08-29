@@ -63,7 +63,7 @@ from platform_core.repositories import PlatformRepository
 
 SAFE_AUTH_ERROR = "invalid or missing authentication"
 SAFE_FORBIDDEN_ERROR = "not authorized for this organization"
-SUPPORTED_SECURITY_MODES = {"disabled", "enterprise", "test"}
+SUPPORTED_SECURITY_MODES = {"disabled", "enterprise"}
 SUPPORTED_ENVIRONMENTS = {"development", "test", "production"}
 DEFAULT_HTTPS_PORT = 443
 DEFAULT_JWKS_CACHE_TTL_SECONDS = 300.0
@@ -321,9 +321,9 @@ class OidcTokenVerifier:
             if (datetime.now(UTC) - cached_at).total_seconds() <= self.jwks_cache_ttl_seconds:
                 return jwks
             self._jwks_cache.pop(jwks_uri, None)
-        allow_development_targets = os.environ.get("PMS_ENVIRONMENT", "development").lower() != "production"
-        validate_oidc_endpoint(jwks_uri, allow_development_targets=allow_development_targets)
         try:
+            allow_development_targets = os.environ.get("PMS_ENVIRONMENT", "development").lower() != "production"
+            validate_oidc_endpoint(jwks_uri, allow_development_targets=allow_development_targets)
             if allow_development_targets:
                 with httpx.Client(timeout=self.http_timeout_seconds, follow_redirects=False) as client:
                     response = client.get(jwks_uri)
@@ -361,13 +361,16 @@ def _fetch_jwks_with_pinned_address(jwks_uri: str, *, timeout_seconds: float) ->
         "\r\n"
     ).encode("ascii")
     last_error: Exception | None = None
+    deadline = time.monotonic() + timeout_seconds
     for address in addresses:
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            break
         try:
-            deadline = time.monotonic() + timeout_seconds
-            with socket.create_connection((address, port), timeout=timeout_seconds) as raw_socket:
+            with socket.create_connection((address, port), timeout=remaining_seconds) as raw_socket:
                 context = ssl.create_default_context()
                 with context.wrap_socket(raw_socket, server_hostname=host) as tls_socket:
-                    tls_socket.settimeout(timeout_seconds)
+                    tls_socket.settimeout(max(0.001, deadline - time.monotonic()))
                     tls_socket.sendall(request)
                     chunks = []
                     total_bytes = 0
@@ -1355,6 +1358,10 @@ class SecurityService:
             raise AuthorizationError("membership does not exist")
         permission = self.membership_status_permission(membership.role)
         self.require_permission(actor, permission, action="members.status", audit_allowed=False)
+        if request.lifecycle_state == "active":
+            user = self.session.get(User, user_id)
+            if user is None or user.lifecycle_state != "active":
+                raise AuthorizationError("user is not active")
         if membership.role == "owner" and request.lifecycle_state != "active":
             self.session.flush()
             if (

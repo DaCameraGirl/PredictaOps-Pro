@@ -1254,7 +1254,7 @@ def list_security_audit_events(organization_id: str, request: Request, limit: in
     with SessionLocal() as session:
         try:
             security = _security_service(session)
-            _authorize(session, request, organization_id, AUDIT_READ, action="security.audit.list")
+            _authorize(session, request, organization_id, AUDIT_READ, action="security.audit.list", audit_allowed=False)
             events = security.list_audit_events(organization_id, limit=limit, offset=offset)
             session.commit()
             return {"audit_events": [audit_event_payload(event) for event in events]}

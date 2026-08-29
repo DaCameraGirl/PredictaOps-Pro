@@ -1428,10 +1428,13 @@ class PlatformRepository:
 
     def get_active_membership(self, organization_id: str, user_id: str) -> OrganizationMembership | None:
         return self.session.scalar(
-            select(OrganizationMembership).where(
+            select(OrganizationMembership)
+            .join(User, User.id == OrganizationMembership.user_id)
+            .where(
                 OrganizationMembership.organization_id == organization_id,
                 OrganizationMembership.user_id == user_id,
                 OrganizationMembership.lifecycle_state == "active",
+                User.lifecycle_state == "active",
             )
         )
 

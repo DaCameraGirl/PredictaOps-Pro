@@ -420,7 +420,8 @@ def test_unknown_kid_refresh_is_rate_limited_but_allows_later_rotation(migrated_
     _engine, session_factory = migrated_db
     with session_factory() as session:
         fixture = _seed_security(session)
-        idp = SecurityService(session).get_identity_provider(fixture["organization_id"], fixture["idp_id"])
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        idp = security.get_identity_provider(fixture["organization_id"], fixture["idp_id"])
         verifier = OidcTokenVerifier(unknown_kid_refresh_cooldown_seconds=60.0)
         calls = []
         allow_rotation = False
@@ -505,7 +506,8 @@ def test_malformed_jwks_entries_fail_closed_as_authentication_errors(migrated_db
     _engine, session_factory = migrated_db
     with session_factory() as session:
         fixture = _seed_security(session)
-        idp = SecurityService(session).get_identity_provider(fixture["organization_id"], fixture["idp_id"])
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        idp = security.get_identity_provider(fixture["organization_id"], fixture["idp_id"])
         verifier = OidcTokenVerifier()
         valid_token = _token(rsa_keys["primary"], subject="owner-sub")
 
@@ -523,6 +525,43 @@ def test_malformed_jwks_entries_fail_closed_as_authentication_errors(migrated_db
         )
         with pytest.raises(AuthenticationError):
             verifier.verify(valid_token, idp)
+
+
+@pytest.mark.parametrize(
+    ("jwks_uri", "resolved_addresses", "resolver_error"),
+    [
+        ("https://issuer.example/.well-known/jwks.json", [], OSError("no dns")),
+        ("https://issuer.example/.well-known/jwks.json", ["10.0.0.5"], None),
+        ("https://user:pass@issuer.example/.well-known/jwks.json", None, None),
+    ],
+)
+def test_oidc_endpoint_revalidation_failures_are_authentication_errors(
+    migrated_db,
+    monkeypatch,
+    rsa_keys,
+    jwks_uri,
+    resolved_addresses,
+    resolver_error,
+):
+    monkeypatch.setenv("PMS_ENVIRONMENT", "production")
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        idp = security.get_identity_provider(fixture["organization_id"], fixture["idp_id"])
+        idp.jwks_uri = jwks_uri
+        verifier = OidcTokenVerifier()
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            if resolver_error is not None:
+                raise resolver_error
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port)) for address in resolved_addresses]
+
+        if resolved_addresses is not None or resolver_error is not None:
+            monkeypatch.setattr("enterprise_security.service.socket.getaddrinfo", fake_getaddrinfo)
+
+        with pytest.raises(AuthenticationError, match="invalid or missing authentication"):
+            verifier.verify(_token(rsa_keys["primary"], subject="owner-sub"), idp)
 
 
 def test_oidc_verifier_enforces_jwk_signing_restrictions_and_normalizes_numeric_dates(
@@ -1127,6 +1166,36 @@ def test_role_policy_and_owner_protection_rules(migrated_db):
         )
         assert original_owner.lifecycle_state == "active"
 
+        bob_membership = session.query(OrganizationMembership).filter_by(user_id=fixture["users"]["bob"]).one()
+        bob_user = session.get(User, fixture["users"]["bob"])
+        bob_membership.lifecycle_state = "inactive"
+        bob_user.lifecycle_state = "inactive"
+        session.flush()
+        with pytest.raises(PermissionError):
+            security.change_membership_status(
+                fixture["organization_id"],
+                fixture["users"]["bob"],
+                MembershipStatusChange(lifecycle_state="active"),
+                actor=owner,
+            )
+        bob_user.lifecycle_state = "archived"
+        session.flush()
+        with pytest.raises(PermissionError):
+            security.change_membership_status(
+                fixture["organization_id"],
+                fixture["users"]["bob"],
+                MembershipStatusChange(lifecycle_state="active"),
+                actor=owner,
+            )
+        bob_user.lifecycle_state = "active"
+        reactivated = security.change_membership_status(
+            fixture["organization_id"],
+            fixture["users"]["bob"],
+            MembershipStatusChange(lifecycle_state="active"),
+            actor=owner,
+        )
+        assert reactivated.lifecycle_state == "active"
+
 
 def test_onboarding_uses_centralized_owner_role_policy(migrated_db):
     _engine, session_factory = migrated_db
@@ -1637,6 +1706,9 @@ def test_security_configuration_rejects_dangerous_production_settings(monkeypatc
     monkeypatch.setenv("PMS_SECURITY_MODE", "enterprize")
     with pytest.raises(SecurityConfigurationError):
         security_settings()
+    monkeypatch.setenv("PMS_SECURITY_MODE", "test")
+    with pytest.raises(SecurityConfigurationError):
+        security_settings()
     monkeypatch.setenv("PMS_SECURITY_MODE", "enterprise")
     monkeypatch.setenv("PMS_ENVIRONMENT", "prod")
     with pytest.raises(SecurityConfigurationError):
@@ -1783,7 +1855,7 @@ def test_oidc_jwks_fetch_pins_validated_connection_destination(monkeypatch):
 
     def fake_create_connection(address, *, timeout):
         connected_addresses.append(address)
-        assert timeout == 2.0
+        assert 0 < timeout <= 2.0
         return FakeRawSocket()
 
     monkeypatch.setattr("enterprise_security.service.socket.getaddrinfo", fake_getaddrinfo)
@@ -1874,7 +1946,7 @@ def test_oidc_jwks_fetch_formats_host_header_for_literals_and_hostnames(
 
     def fake_create_connection(destination, *, timeout):
         assert destination == (address, port)
-        assert timeout == 2.0
+        assert 0 < timeout <= 2.0
         return FakeRawSocket()
 
     monkeypatch.setattr("enterprise_security.service.socket.getaddrinfo", fake_getaddrinfo)
@@ -1965,6 +2037,39 @@ def test_oidc_jwks_fetch_bounds_response_size_and_overall_deadline(monkeypatch):
     monkeypatch.setattr("enterprise_security.service.time.monotonic", fake_monotonic)
     with pytest.raises(AuthenticationError):
         _fetch_jwks_with_pinned_address("https://issuer.example/.well-known/jwks.json", timeout_seconds=1.0)
+
+
+def test_oidc_jwks_fetch_uses_one_deadline_across_unreachable_addresses(monkeypatch):
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        assert host == "issuer.example"
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.35", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.36", port)),
+        ]
+
+    monotonic_now = {"value": 0.0}
+    attempted_timeouts = []
+
+    def fake_monotonic():
+        return monotonic_now["value"]
+
+    def fake_create_connection(destination, *, timeout):
+        attempted_timeouts.append((destination, timeout))
+        monotonic_now["value"] += min(timeout, 0.7)
+        raise OSError("unreachable")
+
+    monkeypatch.setattr("enterprise_security.service.socket.getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr("enterprise_security.service.socket.create_connection", fake_create_connection)
+    monkeypatch.setattr("enterprise_security.service.time.monotonic", fake_monotonic)
+
+    with pytest.raises(AuthenticationError):
+        _fetch_jwks_with_pinned_address("https://issuer.example/.well-known/jwks.json", timeout_seconds=1.0)
+
+    assert monotonic_now["value"] == pytest.approx(1.0)
+    assert len(attempted_timeouts) == 2
+    assert attempted_timeouts[0][1] == pytest.approx(1.0)
+    assert attempted_timeouts[1][1] == pytest.approx(0.3)
 
 
 def test_bootstrap_cli_algorithm_override_replaces_default(monkeypatch):
@@ -3247,3 +3352,63 @@ def test_audit_payload_is_sanitized_and_append_only_through_api(migrated_db):
         assert payload["request_metadata"]["Authorization"] == "[REDACTED]"
         assert "abc" not in str(payload)
         assert session.query(SecretReference).count() == 0
+
+
+def test_audit_list_pagination_is_stable_while_listing(migrated_db, monkeypatch, rsa_keys, jwks):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        context = security.context_from_claims(
+            fixture["organization_id"],
+            _claims(fixture["subjects"]["owner"]),
+            request_id="req-audit-pages",
+        )
+        base_time = datetime(2026, 1, 1, tzinfo=UTC)
+        expected_ids = []
+        for index in range(6):
+            event = security.record_audit_event(
+                context=context,
+                action=f"seed.audit.{index}",
+                required_permission=SECURITY_MANAGE,
+                resource_type="audit_seed",
+                resource_id=f"seed-{index}",
+                outcome="allowed",
+                reason_code="seeded",
+            )
+            event.occurred_at = base_time + timedelta(seconds=index)
+            expected_ids.append(event.id)
+        session.commit()
+
+    _app_main, client = _enterprise_app(monkeypatch, session_factory, jwks=jwks)
+    headers = {"Authorization": f"Bearer {_token(rsa_keys['primary'], subject='owner-sub')}"}
+    org_id = fixture["organization_id"]
+
+    first_page = client.get(f"/api/security/{org_id}/audit-events?limit=2&offset=0", headers=headers)
+    second_page = client.get(f"/api/security/{org_id}/audit-events?limit=2&offset=2", headers=headers)
+    third_page = client.get(f"/api/security/{org_id}/audit-events?limit=2&offset=4", headers=headers)
+    first_page_again = client.get(f"/api/security/{org_id}/audit-events?limit=2&offset=0", headers=headers)
+
+    assert first_page.status_code == 200
+    assert second_page.status_code == 200
+    assert third_page.status_code == 200
+    assert first_page_again.status_code == 200
+    page_ids = [
+        [event["id"] for event in response.json()["audit_events"]]
+        for response in [first_page, second_page, third_page]
+    ]
+    expected_descending_ids = list(reversed(expected_ids))
+    assert page_ids == [
+        expected_descending_ids[0:2],
+        expected_descending_ids[2:4],
+        expected_descending_ids[4:6],
+    ]
+    assert first_page_again.json()["audit_events"] == first_page.json()["audit_events"]
+    assert len({event_id for page in page_ids for event_id in page}) == 6
+    with session_factory() as session:
+        assert (
+            session.query(SecurityAuditEvent)
+            .filter_by(organization_id=org_id, action="security.audit.list")
+            .count()
+            == 0
+        )
