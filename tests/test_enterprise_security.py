@@ -1532,6 +1532,35 @@ def test_secret_references_do_not_expose_values_and_plaintext_source_config_is_r
             ),
             created_by_user_id=fixture["users"]["owner"],
         )
+        for name, provider, locator in [
+            ("bad-userinfo", "vault", "https://user:password@vault.example/secret"),
+            ("bad-dsn", "vault", "postgresql://user:password@db.example:5432/pms"),
+            ("bad-token-query", "vault", "https://vault.example/secret?token=plaintext"),
+            ("bad-key-query", "vault", "https://vault.example/secret?key=plaintext"),
+            ("bad-client-secret-query", "vault", "https://vault.example/secret?client_secret=plaintext"),
+            ("bad-env-url", "env", "https://vault.example/secret"),
+        ]:
+            with pytest.raises(SecurityConfigurationError):
+                security.create_secret_reference(
+                    fixture["organization_id"],
+                    SecretReferenceCreate(
+                        name=name,
+                        purpose="abb_api_token",
+                        provider=provider,
+                        locator=locator,
+                    ),
+                    created_by_user_id=fixture["users"]["owner"],
+                )
+        security.create_secret_reference(
+            fixture["organization_id"],
+            SecretReferenceCreate(
+                name="vault-reference",
+                purpose="abb_api_token",
+                provider="vault",
+                locator="https://vault.example/secrets/abb-token?version=2026-08",
+            ),
+            created_by_user_id=fixture["users"]["owner"],
+        )
         monkeypatch.setenv("ABB_TOKEN", "super-secret-value")
         memory_resolver = InMemorySecretResolver({"ABB_TOKEN": "super-secret-value"})
         environment_resolver = EnvironmentSecretResolver()
@@ -1701,8 +1730,16 @@ def test_security_configuration_rejects_dangerous_production_settings(monkeypatc
     monkeypatch.setenv("PMS_TEST_AUTH", "1")
     with pytest.raises(SecurityConfigurationError):
         security_settings()
+    monkeypatch.setenv("PMS_TEST_AUTH", "0")
+    monkeypatch.delenv("PMS_CORS_ALLOWED_ORIGINS", raising=False)
+    with pytest.raises(SecurityConfigurationError):
+        security_settings()
+    monkeypatch.setenv("PMS_CORS_ALLOWED_ORIGINS", "https://studio.example")
+    assert security_settings().cors_allowed_origins == ("https://studio.example",)
     monkeypatch.setenv("PMS_ENVIRONMENT", "development")
     monkeypatch.setenv("PMS_TEST_AUTH", "0")
+    monkeypatch.delenv("PMS_CORS_ALLOWED_ORIGINS", raising=False)
+    assert security_settings().cors_allowed_origins == ("http://localhost:8000",)
     monkeypatch.setenv("PMS_SECURITY_MODE", "enterprize")
     with pytest.raises(SecurityConfigurationError):
         security_settings()

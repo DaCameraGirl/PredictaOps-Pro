@@ -7,6 +7,7 @@ import ipaddress
 import json
 import math
 import os
+import re
 import socket
 import ssl
 import time
@@ -74,6 +75,7 @@ OIDC_ENDPOINT_CREDENTIAL_QUERY_KEYS = {"key"}
 MAX_JWKS_RESPONSE_BYTES = 65_536
 MAX_AUDIT_HTTP_PATH_LENGTH = 1024
 MAX_AUDIT_RESOURCE_ID_LENGTH = 255
+ENV_SECRET_LOCATOR_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class AuthenticationError(PermissionError):
@@ -109,9 +111,12 @@ class SecuritySettings:
 def security_settings() -> SecuritySettings:
     environment = os.environ.get("PMS_ENVIRONMENT", "development").lower()
     mode = os.environ.get("PMS_SECURITY_MODE", "disabled").lower()
+    raw_origins = os.environ.get("PMS_CORS_ALLOWED_ORIGINS")
+    if raw_origins is None:
+        raw_origins = "" if environment == "production" else "http://localhost:8000"
     origins = tuple(
         origin.strip()
-        for origin in os.environ.get("PMS_CORS_ALLOWED_ORIGINS", "http://localhost:8000").split(",")
+        for origin in raw_origins.split(",")
         if origin.strip()
     )
     settings = SecuritySettings(
@@ -205,6 +210,26 @@ def _validated_oidc_addresses(host: str, port: int) -> tuple[str, ...]:
 
 def _unsafe_oidc_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return not address.is_global
+
+
+def validate_secret_locator(provider: str, locator: str) -> None:
+    if provider == "env":
+        if not ENV_SECRET_LOCATOR_PATTERN.fullmatch(locator):
+            raise SecurityConfigurationError("env secret locators must be environment variable names")
+        return
+    try:
+        parsed = urlparse(locator)
+    except ValueError as exc:
+        raise SecurityConfigurationError("secret locator is malformed") from exc
+    if parsed.scheme and parsed.netloc:
+        if parsed.username or parsed.password:
+            raise SecurityConfigurationError("secret locator must not include embedded credentials")
+        query_keys = {key for key, _value in parse_qsl(parsed.query, keep_blank_values=True)}
+        normalized_query_keys = {key.lower().replace("-", "_") for key in query_keys}
+        if any(is_secret_key(key) for key in query_keys) or (
+            normalized_query_keys & OIDC_ENDPOINT_CREDENTIAL_QUERY_KEYS
+        ):
+            raise SecurityConfigurationError("secret locator query parameters must not contain credentials")
 
 
 class OidcTokenVerifier:
@@ -826,6 +851,7 @@ class SecurityService:
     ) -> SecretReference:
         if self.repo.get_active_membership(organization_id, created_by_user_id) is None:
             raise AuthorizationError("secret reference creator must be an active organization member")
+        validate_secret_locator(request.provider, request.locator)
         secret = SecretReference(
             organization_id=organization_id,
             name=request.name,
