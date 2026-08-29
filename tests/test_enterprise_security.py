@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import func, inspect, select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from alembic import command
@@ -432,17 +432,21 @@ def test_unknown_kid_refresh_is_rate_limited_but_allows_later_rotation(migrated_
             return {"keys": [_jwk_from_public_key(rsa_keys["primary"].public_key(), kid="primary")]}
 
         verifier._load_jwks = fake_load_jwks
-        with pytest.raises(AuthenticationError):
-            verifier.verify(_token(rsa_keys["primary"], subject="owner-sub", kid="rotated"), idp)
-        with pytest.raises(AuthenticationError):
-            verifier.verify(_token(rsa_keys["primary"], subject="owner-sub", kid="rotated"), idp)
+        for index in range(20):
+            with pytest.raises(AuthenticationError):
+                verifier.verify(_token(rsa_keys["primary"], subject="owner-sub", kid=f"rotated-{index}"), idp)
 
-        assert calls == [False, True, False]
+        assert calls == [False, True, *([False] * 19)]
+        assert calls.count(True) == 1
+        assert len(verifier._unknown_kid_cache) == 20
         assert verifier.verify(_token(rsa_keys["primary"], subject="owner-sub"), idp).subject == "owner-sub"
-        assert calls == [False, True, False, False]
+        assert calls == [False, True, *([False] * 20)]
 
-        cache_key = (idp.jwks_uri, "rotated", "RS256")
-        verifier._unknown_kid_cache[cache_key] = datetime.now(UTC) - timedelta(seconds=61)
+        for index in range(600):
+            verifier._record_unknown_kid(idp.jwks_uri, f"extra-{index}", "RS256")
+        assert len(verifier._unknown_kid_cache) <= 512
+
+        verifier._jwks_unknown_kid_refresh_cache[idp.jwks_uri] = datetime.now(UTC) - timedelta(seconds=61)
         allow_rotation = True
         assert (
             verifier.verify(
@@ -451,7 +455,7 @@ def test_unknown_kid_refresh_is_rate_limited_but_allows_later_rotation(migrated_
             ).key_id
             == "rotated"
         )
-        assert calls == [False, True, False, False, False, True]
+        assert calls == [False, True, *([False] * 20), False, True]
 
 
 def test_oidc_verifier_expires_cached_jwks(monkeypatch):
@@ -1501,6 +1505,7 @@ def test_secret_references_do_not_expose_values_and_plaintext_source_config_is_r
             "https://user:password@vendor.example/api",
             "postgresql://user:password@db.example:5432/pms",
             "https://vendor.example/api?token=plaintext",
+            "https://vendor.example/api?key=plaintext",
             "https://vendor.example/api?client_secret=plaintext",
         ]:
             with pytest.raises(ValueError):
@@ -1568,6 +1573,51 @@ def test_enterprise_ingestion_source_registration_omits_legacy_plaintext_config(
     assert "legacy-plaintext-token" not in response.text
 
 
+@pytest.mark.parametrize(
+    ("path", "body", "headers"),
+    [
+        ("/api/ingestion/{org_id}/rest", {"records": []}, {}),
+        ("/api/ingestion/{org_id}/mqtt", b"{}", {}),
+        ("/api/ingestion/{org_id}/opcua", {"records": []}, {}),
+        ("/api/ingestion/{org_id}/abb", {"records": []}, {}),
+        ("/api/ingestion/{org_id}/files/csv", b"timestamp,sensor_path,value,unit\n", {}),
+        ("/api/ingestion/{org_id}/files/parquet", b"PAR1", {}),
+    ],
+)
+def test_ingestion_authorization_database_failures_are_translated(
+    migrated_db,
+    monkeypatch,
+    rsa_keys,
+    jwks,
+    path,
+    body,
+    headers,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        session.commit()
+
+    app_main, client = _enterprise_app(monkeypatch, session_factory, jwks=jwks)
+
+    def failing_authorize(*args, **kwargs):
+        raise SQLAlchemyError("audit flush failed")
+
+    monkeypatch.setattr(app_main, "_authorize", failing_authorize)
+    request_headers = {
+        "Authorization": f"Bearer {_token(rsa_keys['primary'], subject='engineer-sub')}",
+        **headers,
+    }
+    url = path.format(org_id=fixture["organization_id"])
+    if isinstance(body, bytes):
+        response = client.post(url, headers=request_headers, content=body)
+    else:
+        response = client.post(url, headers=request_headers, json=body)
+
+    assert response.status_code == 503
+    assert response.json()["detail"].startswith("platform database unavailable")
+
+
 def test_security_configuration_rejects_dangerous_production_settings(monkeypatch):
     monkeypatch.setenv("PMS_ENVIRONMENT", "production")
     monkeypatch.setenv("PMS_SECURITY_MODE", "enterprise")
@@ -1593,6 +1643,18 @@ def test_security_configuration_rejects_dangerous_production_settings(monkeypatc
         security_settings()
     with pytest.raises(SecurityConfigurationError):
         validate_oidc_endpoint("http://127.0.0.1/jwks")
+    for unsafe_url in [
+        "https://user:pass@issuer.example/jwks",
+        "https://issuer.example/jwks?token=plaintext",
+        "https://issuer.example/jwks?key=plaintext",
+        "https://issuer.example/jwks?secret=plaintext",
+        "https://issuer.example/jwks?password=plaintext",
+        "https://issuer.example/jwks?tenant=acme",
+    ]:
+        with pytest.raises(SecurityConfigurationError):
+            validate_oidc_endpoint(unsafe_url, allow_development_targets=True)
+    validate_oidc_endpoint("https://issuer.example/jwks", allow_development_targets=True)
+    validate_oidc_endpoint("https://issuer.example/jwks?version=2026-08", allow_development_targets=True)
     with pytest.raises(ValidationError):
         IdentityProviderCreate(
             name="symmetric",
@@ -2294,6 +2356,28 @@ def test_bootstrap_rejects_unsafe_oidc_endpoint_in_production(migrated_db, monke
             SecurityService(session).bootstrap_initial_owner(request)
 
 
+def test_bootstrap_rejects_credential_bearing_oidc_endpoint_without_persisting_it(migrated_db, monkeypatch):
+    _engine, session_factory = migrated_db
+    monkeypatch.setenv("PMS_ENVIRONMENT", "development")
+    with session_factory() as session:
+        with pytest.raises(SecurityConfigurationError):
+            SecurityService(session).bootstrap_initial_owner(
+                BootstrapSecurityRequest(
+                    organization_slug="credential-jwks",
+                    organization_name="Credential JWKS",
+                    owner_email="owner-credential-jwks@example.com",
+                    issuer=ISSUER_A,
+                    subject="credential-owner-sub",
+                    audience=AUDIENCE,
+                    jwks_uri="https://user:pass@issuer.example/jwks",
+                )
+            )
+        assert session.query(OrganizationIdentityProvider).count() == 0
+        assert session.query(OrganizationIdentityProvider).filter(
+            OrganizationIdentityProvider.jwks_uri.like("%user:pass%")
+        ).count() == 0
+
+
 def test_authenticated_api_enforces_tenant_permissions_and_blocks_actor_spoofing(
     migrated_db,
     monkeypatch,
@@ -2900,6 +2984,49 @@ def test_duplicate_identity_provider_creation_returns_stable_conflict(
             reason_code="resource_conflict",
         )
         assert failures.count() == 2
+
+
+def test_duplicate_secret_reference_creation_returns_stable_conflict(
+    migrated_db,
+    monkeypatch,
+    rsa_keys,
+    jwks,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        session.commit()
+
+    _app_main, client = _enterprise_app(monkeypatch, session_factory, jwks=jwks)
+    headers = {"Authorization": f"Bearer {_token(rsa_keys['primary'], subject='owner-sub')}"}
+    org_id = fixture["organization_id"]
+    payload = {
+        "name": "duplicate-secret",
+        "purpose": "abb_api_token",
+        "provider": "env",
+        "locator": "ABB_TOKEN",
+    }
+
+    created = client.post(f"/api/security/{org_id}/secret-references", headers=headers, json=payload)
+    duplicate = client.post(
+        f"/api/security/{org_id}/secret-references",
+        headers=headers,
+        json={**payload, "locator": "OTHER_TOKEN"},
+    )
+
+    assert created.status_code == 200
+    assert duplicate.status_code == 409
+    assert duplicate.json() == {"detail": "resource conflict"}
+    with session_factory() as session:
+        assert session.query(SecretReference).filter_by(organization_id=org_id, name="duplicate-secret").count() == 1
+        assert session.scalar(select(func.count()).select_from(SecretReference)) is not None
+        failures = session.query(SecurityAuditEvent).filter_by(
+            organization_id=org_id,
+            action="security.secret.create",
+            outcome="failed",
+            reason_code="resource_conflict",
+        )
+        assert failures.count() == 1
 
 
 def test_security_mutation_audits_record_target_resource_ids(migrated_db, monkeypatch, rsa_keys, jwks):

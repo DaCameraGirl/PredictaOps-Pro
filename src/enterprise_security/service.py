@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 import httpx
 import jwt
@@ -46,7 +46,7 @@ from enterprise_security.permissions import (
     permissions_for_role,
     validate_service_permissions,
 )
-from enterprise_security.redaction import redact_value
+from enterprise_security.redaction import is_secret_key, redact_value
 from platform_core.contracts import OrganizationCreate, UserCreate
 from platform_core.models import (
     ExternalPrincipalIdentity,
@@ -68,6 +68,9 @@ SUPPORTED_ENVIRONMENTS = {"development", "test", "production"}
 DEFAULT_HTTPS_PORT = 443
 DEFAULT_JWKS_CACHE_TTL_SECONDS = 300.0
 DEFAULT_UNKNOWN_KID_REFRESH_COOLDOWN_SECONDS = 60.0
+MAX_UNKNOWN_KID_CACHE_SIZE = 512
+OIDC_ENDPOINT_ALLOWED_QUERY_PARAMETERS = {"version"}
+OIDC_ENDPOINT_CREDENTIAL_QUERY_KEYS = {"key"}
 MAX_JWKS_RESPONSE_BYTES = 65_536
 MAX_AUDIT_HTTP_PATH_LENGTH = 1024
 MAX_AUDIT_RESOURCE_ID_LENGTH = 255
@@ -159,6 +162,17 @@ def validate_oidc_endpoint(url: str, *, allow_development_targets: bool = False)
     host = parsed.hostname
     if not host:
         raise SecurityConfigurationError("OIDC endpoint must include a host")
+    if parsed.username or parsed.password:
+        raise SecurityConfigurationError("OIDC endpoint must not include embedded credentials")
+    if parsed.query:
+        query_keys = {key for key, _value in parse_qsl(parsed.query, keep_blank_values=True)}
+        normalized_query_keys = {key.lower().replace("-", "_") for key in query_keys}
+        if not query_keys or any(is_secret_key(key) for key in query_keys) or (
+            normalized_query_keys & OIDC_ENDPOINT_CREDENTIAL_QUERY_KEYS
+        ):
+            raise SecurityConfigurationError("OIDC endpoint query parameters must not contain credentials")
+        if query_keys - OIDC_ENDPOINT_ALLOWED_QUERY_PARAMETERS:
+            raise SecurityConfigurationError("OIDC endpoint query parameters are not allowed")
     if host in {"localhost", "127.0.0.1", "::1"} and not allow_development_targets:
         raise SecurityConfigurationError("OIDC endpoint must not target loopback hosts outside development/test mode")
     try:
@@ -206,6 +220,7 @@ class OidcTokenVerifier:
         self.unknown_kid_refresh_cooldown_seconds = unknown_kid_refresh_cooldown_seconds
         self._jwks_cache: dict[str, tuple[dict[str, Any], datetime]] = {}
         self._unknown_kid_cache: dict[tuple[str, str, str], datetime] = {}
+        self._jwks_unknown_kid_refresh_cache: dict[str, datetime] = {}
 
     def verify(self, token: str, idp: OrganizationIdentityProvider) -> TokenClaims:
         try:
@@ -259,31 +274,45 @@ class OidcTokenVerifier:
         jwks = self._load_jwks(jwks_uri, refresh=False)
         key = _select_jwk(jwks, key_id, algorithm)
         if key is None:
-            if key_id and self._unknown_kid_refresh_is_in_cooldown(jwks_uri, str(key_id), algorithm):
+            if key_id and self._jwks_uri_refresh_is_in_cooldown(jwks_uri):
+                self._record_unknown_kid(jwks_uri, str(key_id), algorithm)
                 raise AuthenticationError(SAFE_AUTH_ERROR)
             jwks = self._load_jwks(jwks_uri, refresh=True)
             key = _select_jwk(jwks, key_id, algorithm)
         if key is None:
             if key_id:
-                self._unknown_kid_cache[(jwks_uri, str(key_id), algorithm)] = datetime.now(UTC)
+                self._record_unknown_kid(jwks_uri, str(key_id), algorithm)
+                self._jwks_unknown_kid_refresh_cache[jwks_uri] = datetime.now(UTC)
             raise AuthenticationError(SAFE_AUTH_ERROR)
         if key_id:
             self._unknown_kid_cache.pop((jwks_uri, str(key_id), algorithm), None)
+            self._jwks_unknown_kid_refresh_cache.pop(jwks_uri, None)
         try:
             return PyJWK.from_dict(key).key
         except Exception as exc:
             raise AuthenticationError(SAFE_AUTH_ERROR) from exc
 
-    def _unknown_kid_refresh_is_in_cooldown(self, jwks_uri: str, key_id: str, algorithm: str) -> bool:
-        cache_key = (jwks_uri, key_id, algorithm)
-        cached_at = self._unknown_kid_cache.get(cache_key)
+    def _jwks_uri_refresh_is_in_cooldown(self, jwks_uri: str) -> bool:
+        cached_at = self._jwks_unknown_kid_refresh_cache.get(jwks_uri)
         if cached_at is None:
             return False
         age_seconds = (datetime.now(UTC) - cached_at).total_seconds()
         if age_seconds <= self.unknown_kid_refresh_cooldown_seconds:
             return True
-        self._unknown_kid_cache.pop(cache_key, None)
+        self._jwks_unknown_kid_refresh_cache.pop(jwks_uri, None)
         return False
+
+    def _record_unknown_kid(self, jwks_uri: str, key_id: str, algorithm: str) -> None:
+        self._prune_unknown_kid_cache()
+        self._unknown_kid_cache[(jwks_uri, key_id, algorithm)] = datetime.now(UTC)
+        self._prune_unknown_kid_cache()
+
+    def _prune_unknown_kid_cache(self) -> None:
+        if len(self._unknown_kid_cache) <= MAX_UNKNOWN_KID_CACHE_SIZE:
+            return
+        sorted_entries = sorted(self._unknown_kid_cache.items(), key=lambda item: item[1])
+        for cache_key, _cached_at in sorted_entries[: len(self._unknown_kid_cache) - MAX_UNKNOWN_KID_CACHE_SIZE]:
+            self._unknown_kid_cache.pop(cache_key, None)
 
     def _load_jwks(self, jwks_uri: str, *, refresh: bool) -> dict[str, Any]:
         cached = self._jwks_cache.get(jwks_uri)
@@ -804,8 +833,12 @@ class SecurityService:
             created_by_user_id=created_by_user_id,
             rotation_metadata=redact_value(request.rotation_metadata),
         )
-        self.session.add(secret)
-        self.session.flush()
+        try:
+            with self.session.begin_nested():
+                self.session.add(secret)
+                self.session.flush()
+        except IntegrityError as exc:
+            raise ConflictError("secret reference already exists") from exc
         return secret
 
     def update_secret_reference(

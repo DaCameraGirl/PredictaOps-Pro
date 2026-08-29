@@ -400,6 +400,16 @@ def _record_security_mutation_audit(
     )
 
 
+def _authorize_ingestion_request(request: Request, organization_id: str, *, action: str) -> None:
+    with SessionLocal() as session:
+        try:
+            _authorize(session, request, organization_id, INGESTION_WRITE, action=action)
+            session.commit()
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
 def _authenticated_user_id(context, fallback_user_id: str | None) -> str:
     if not _enterprise_security_enabled():
         if fallback_user_id is None:
@@ -1127,6 +1137,20 @@ def create_secret_reference(organization_id: str, request: SecretReferenceCreate
             )
             session.commit()
             return secret_reference_payload(secret)
+        except ConflictError as exc:
+            session.rollback()
+            _record_security_mutation_audit(
+                session,
+                http_request,
+                context,
+                action="security.secret.create",
+                required_permission=SECRETS_MANAGE,
+                resource_type="secret_reference",
+                outcome="failed",
+                reason_code="resource_conflict",
+            )
+            session.commit()
+            raise HTTPException(status_code=409, detail="resource conflict") from exc
         except AuthorizationError as exc:
             if context is None:
                 session.commit()
@@ -1314,9 +1338,7 @@ async def _json_body(request: Request):
 
 @app.post("/api/ingestion/{organization_id}/rest")
 async def ingest_rest(organization_id: str, request: Request, source_name: str = "REST Push"):
-    with SessionLocal() as session:
-        _authorize(session, request, organization_id, INGESTION_WRITE, action="ingestion.rest.write")
-        session.commit()
+    _authorize_ingestion_request(request, organization_id, action="ingestion.rest.write")
     return _ingest_payload(organization_id, "rest", await _json_body(request), source_name)
 
 
@@ -1327,25 +1349,19 @@ async def ingest_mqtt(
     source_name: str = "MQTT Bridge",
     topic: str | None = None,
 ):
-    with SessionLocal() as session:
-        _authorize(session, request, organization_id, INGESTION_WRITE, action="ingestion.mqtt.write")
-        session.commit()
+    _authorize_ingestion_request(request, organization_id, action="ingestion.mqtt.write")
     return _ingest_payload(organization_id, "mqtt", await request.body(), source_name, topic=topic)
 
 
 @app.post("/api/ingestion/{organization_id}/opcua")
 async def ingest_opcua(organization_id: str, request: Request, source_name: str = "OPC-UA Bridge"):
-    with SessionLocal() as session:
-        _authorize(session, request, organization_id, INGESTION_WRITE, action="ingestion.opcua.write")
-        session.commit()
+    _authorize_ingestion_request(request, organization_id, action="ingestion.opcua.write")
     return _ingest_payload(organization_id, "opcua", await _json_body(request), source_name)
 
 
 @app.post("/api/ingestion/{organization_id}/abb")
 async def ingest_abb(organization_id: str, request: Request, source_name: str = "ABB Adapter"):
-    with SessionLocal() as session:
-        _authorize(session, request, organization_id, INGESTION_WRITE, action="ingestion.abb.write")
-        session.commit()
+    _authorize_ingestion_request(request, organization_id, action="ingestion.abb.write")
     return _ingest_payload(organization_id, "abb", await _json_body(request), source_name)
 
 
@@ -1356,9 +1372,7 @@ async def ingest_csv_file(
     source_name: str = "CSV File",
     source_uri: str | None = None,
 ):
-    with SessionLocal() as session:
-        _authorize(session, request, organization_id, INGESTION_WRITE, action="ingestion.csv.write")
-        session.commit()
+    _authorize_ingestion_request(request, organization_id, action="ingestion.csv.write")
     return _ingest_payload(organization_id, "csv", await request.body(), source_name, source_uri=source_uri)
 
 
@@ -1369,9 +1383,7 @@ async def ingest_parquet_file(
     source_name: str = "Parquet File",
     source_uri: str | None = None,
 ):
-    with SessionLocal() as session:
-        _authorize(session, request, organization_id, INGESTION_WRITE, action="ingestion.parquet.write")
-        session.commit()
+    _authorize_ingestion_request(request, organization_id, action="ingestion.parquet.write")
     return _ingest_payload(organization_id, "parquet", await request.body(), source_name, source_uri=source_uri)
 
 

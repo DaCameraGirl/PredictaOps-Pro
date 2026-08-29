@@ -24,6 +24,7 @@ SECRET_KEY_PARTS = {
     "token",
     "access_token",
 }
+SECRET_QUERY_KEYS = {"key"}
 
 
 def is_secret_key(key: str) -> bool:
@@ -40,7 +41,8 @@ def _looks_like_credential_url(value: str) -> bool:
         return False
     if parsed.username or parsed.password:
         return True
-    return any(is_secret_key(key) for key, _value in parse_qsl(parsed.query, keep_blank_values=True))
+    query_keys = {key.lower().replace("-", "_") for key, _value in parse_qsl(parsed.query, keep_blank_values=True)}
+    return any(is_secret_key(key) for key in query_keys) or bool(query_keys & SECRET_QUERY_KEYS)
 
 
 def redact_value(value: Any) -> Any:
