@@ -1,8 +1,76 @@
-# Predictive Maintenance Studio
+<p align="center">
+  <img src="docs/assets/predictaops-hero.svg" width="100%" alt="PredictaOps Pro monitoring a conveyor line and warning about bearing degradation before an unplanned line stop" />
+</p>
 
-ABB Accelerator 2026 — Theme 1: Agentic Predictive Maintenance Studio.
+<h1 align="center">PredictaOps Pro</h1>
 
-A vibration-based predictive-maintenance studio built on the NASA/IMS bearing test-to-failure experiments. The current served model predicts remaining useful life (RUL) on IMS Test 2, explains predictions with SHAP when available, and exposes the evidence through a FastAPI dashboard. The data layer now also has verified run definitions for IMS Tests 1 and 3 so the project can move to leakage-safe cross-run validation without inventing failure labels.
+<p align="center"><strong>Know what's breaking before it breaks.</strong></p>
+
+<p align="center">
+Machine health and downtime-prevention software for maintenance, reliability, warehouse, packaging, and manufacturing operations.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-95.9%25-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 95.9%" />
+  <img src="https://img.shields.io/badge/HTML-3.9%25-E34F26?style=for-the-badge&logo=html5&logoColor=white" alt="HTML 3.9%" />
+  <img src="https://img.shields.io/badge/Other-0.2%25-475569?style=for-the-badge" alt="Other 0.2%" />
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/FastAPI-005571?style=flat-square&logo=fastapi" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/XGBoost-FF6600?style=flat-square" alt="XGBoost" />
+  <img src="https://img.shields.io/badge/SHAP-Explainability-7C3AED?style=flat-square" alt="SHAP Explainability" />
+  <img src="https://img.shields.io/badge/PostgreSQL-4169E1?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL" />
+  <img src="https://img.shields.io/badge/SQLAlchemy-D71F00?style=flat-square" alt="SQLAlchemy" />
+  <img src="https://img.shields.io/badge/Alembic-Migrations-0F766E?style=flat-square" alt="Alembic" />
+  <img src="https://img.shields.io/badge/Docker-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker" />
+  <img src="https://img.shields.io/badge/GitHub_Actions-2088FF?style=flat-square&logo=githubactions&logoColor=white" alt="GitHub Actions" />
+</p>
+
+## Keep the line moving
+
+A failing bearing is rarely just a bearing problem. On a conveyor, packaging, processing, or production line, one machine failure can stop upstream and downstream work, leave operators waiting on repairs, delay orders, and put time-sensitive product at risk.
+
+**PredictaOps Pro is built around one operational question: _what needs attention before it becomes downtime?_**
+
+| Before the failure | Before the line stops | Before the disruption spreads |
+| --- | --- | --- |
+| Detect vibration and degradation changes | Estimate remaining useful life only when the model has enough evidence | Turn supported evidence into alerts, cases, inspections, and work orders |
+| Preserve sensor and machine provenance | Abstain when the model is outside its validated domain | Keep human approval in the maintenance loop |
+| Surface waveform, FFT, feature trends, and anomalies | Explain model evidence when SHAP is available | Preserve traceable maintenance outcomes and CMMS sync history |
+
+> [!IMPORTANT]
+> PredictaOps Pro does **not** invent confidence just to produce a number. When an asset is outside the validated RUL domain or there is not enough evidence, the serving contract returns `unsupported` or `insufficient_evidence` instead of presenting a weak prediction as fact.
+
+### From sensor signal to maintenance action
+
+```text
+Machine / conveyor sensor
+        ↓
+Canonical ingestion + provenance
+        ↓
+Waveform + vibration analytics
+        ↓
+Degradation / anomaly evidence
+        ↓
+Supported RUL prediction OR explicit abstention
+        ↓
+Alert → maintenance case → inspection → work order → CMMS sync
+```
+
+### Built for the people who lose time when equipment stops
+
+- **Maintenance teams** that need earlier evidence instead of another emergency repair.
+- **Reliability engineers** who need traceable machine-health signals and defensible model behavior.
+- **Warehouse and distribution operations** where conveyors, motors, bearings, and sortation equipment can become throughput bottlenecks.
+- **Manufacturing and packaging lines** where one failed component can idle an entire section of production.
+- **Operations leaders** who care less about an ML score than whether the line keeps moving safely and predictably.
+
+The current validation foundation uses the NASA/IMS bearing test-to-failure experiments. The broader platform architecture is intentionally industrial and maps data through organization → site → asset → component → sensor rather than treating the lab dataset as the product boundary.
+
+### Challenge context
+
+Originally developed for **ABB Accelerator 2026 — Theme 1: Agentic Predictive Maintenance Studio**. PredictaOps Pro is an independent project and is not presented as an ABB-owned or ABB-endorsed product.
 
 ## Current technical status
 
