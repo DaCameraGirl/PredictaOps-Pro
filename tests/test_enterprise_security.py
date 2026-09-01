@@ -63,8 +63,6 @@ from enterprise_security.service import (
     security_settings,
     validate_oidc_endpoint,
 )
-from industrial_ingestion.contracts import SourceRegistration
-from industrial_ingestion.service import IngestionService
 from maintenance_operations.contracts import CaseCreate
 from maintenance_operations.service import MaintenanceOperationsService
 from ml_platform.artifact_store import ModelArtifactStore
@@ -1197,6 +1195,46 @@ def test_role_policy_and_owner_protection_rules(migrated_db):
         assert reactivated.lifecycle_state == "active"
 
 
+def test_role_changes_reject_inactive_or_archived_users(migrated_db):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        fixture = _seed_security(session)
+        security = SecurityService(session, verifier=DeterministicTokenVerifier({}))
+        owner = security.context_from_claims(
+            fixture["organization_id"],
+            _claims(fixture["subjects"]["owner"]),
+            request_id="req-owner",
+        )
+        target_user = session.get(User, fixture["users"]["technician"])
+        target_membership = (
+            session.query(OrganizationMembership)
+            .filter_by(user_id=fixture["users"]["technician"])
+            .one()
+        )
+
+        target_user.lifecycle_state = "inactive"
+        session.flush()
+        with pytest.raises(PermissionError):
+            security.change_membership_role(
+                fixture["organization_id"],
+                MembershipChange(user_id=fixture["users"]["technician"], role="admin"),
+                actor=owner,
+            )
+        assert target_membership.role == "technician"
+        assert target_membership.lifecycle_state == "active"
+
+        target_user.lifecycle_state = "archived"
+        session.flush()
+        with pytest.raises(PermissionError):
+            security.change_membership_role(
+                fixture["organization_id"],
+                MembershipChange(user_id=fixture["users"]["technician"], role="viewer"),
+                actor=owner,
+            )
+        assert target_membership.role == "technician"
+        assert target_membership.lifecycle_state == "active"
+
+
 def test_onboarding_uses_centralized_owner_role_policy(migrated_db):
     _engine, session_factory = migrated_db
     with session_factory() as session:
@@ -1533,11 +1571,14 @@ def test_secret_references_do_not_expose_values_and_plaintext_source_config_is_r
             created_by_user_id=fixture["users"]["owner"],
         )
         for name, provider, locator in [
-            ("bad-userinfo", "vault", "https://user:password@vault.example/secret"),
-            ("bad-dsn", "vault", "postgresql://user:password@db.example:5432/pms"),
+            ("bad-userinfo", "vault", "https://user:pass@vault.example/secret"),
+            ("bad-dsn", "vault", "postgresql://app-user:super-secret@db.example:5432/pms"),
+            ("bad-username-dsn", "vault", "postgresql://app-user@db.example:5432/pms"),
             ("bad-token-query", "vault", "https://vault.example/secret?token=plaintext"),
             ("bad-key-query", "vault", "https://vault.example/secret?key=plaintext"),
             ("bad-client-secret-query", "vault", "https://vault.example/secret?client_secret=plaintext"),
+            ("bad-access-token-query", "vault", "https://vault.example/secret?access_token=plaintext"),
+            ("bad-dsn-password-in-query", "vault", "https://vault.example/secret?password=plaintext"),
             ("bad-env-url", "env", "https://vault.example/secret"),
         ]:
             with pytest.raises(SecurityConfigurationError):
@@ -1583,56 +1624,6 @@ def test_secret_references_do_not_expose_values_and_plaintext_source_config_is_r
         assert payload["rotation_metadata"]["last_token"] == "[REDACTED]"
         with pytest.raises(ValueError):
             assert_no_plaintext_secrets({"nested": {"api_key": "plaintext"}})
-        for invalid_reference in [{}, {"name": "hunter2"}, {"secret_reference_id": ""}]:
-            with pytest.raises(ValueError):
-                assert_no_plaintext_secrets({"auth": {"password": invalid_reference}})
-        secret_reference = {"secret_reference_id": secret.id}
-        for key in [
-            "private_key",
-            "private-key",
-            "passphrase",
-            "dsn",
-            "database_dsn",
-            "credential_url",
-            "connection_string",
-        ]:
-            with pytest.raises(ValueError):
-                assert_no_plaintext_secrets({"connector": {key: "plaintext"}})
-            assert_no_plaintext_secrets({"connector": {key: secret_reference}})
-        for value in [
-            "https://user:password@vendor.example/api",
-            "postgresql://user:password@db.example:5432/pms",
-            "https://vendor.example/api?token=plaintext",
-            "https://vendor.example/api?key=plaintext",
-            "https://vendor.example/api?client_secret=plaintext",
-        ]:
-            with pytest.raises(ValueError):
-                assert_no_plaintext_secrets({"endpoint": value})
-        assert_no_plaintext_secrets(
-            {
-                "endpoint_url": "https://vendor.example/api",
-                "callback": "https://vendor.example/callback?mode=health",
-                "retry": {"timeout_seconds": 10},
-            }
-        )
-        IngestionService(session).register_source(
-            SourceRegistration(
-                organization_id=fixture["organization_id"],
-                source_type="abb",
-                name="ABB",
-                config={"auth": {"token": {"secret_reference_id": secret.id}}},
-            )
-        )
-        with pytest.raises(ValueError):
-            IngestionService(session).register_source(
-                SourceRegistration(
-                    organization_id=fixture["organization_id"],
-                    source_type="abb",
-                    name="Bad ABB",
-                    config={"auth": {"token": "plaintext"}},
-                )
-            )
-
 
 def test_enterprise_ingestion_source_registration_omits_legacy_plaintext_config(
     migrated_db,

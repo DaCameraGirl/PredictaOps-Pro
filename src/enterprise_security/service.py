@@ -221,6 +221,8 @@ def validate_secret_locator(provider: str, locator: str) -> None:
         parsed = urlparse(locator)
     except ValueError as exc:
         raise SecurityConfigurationError("secret locator is malformed") from exc
+    if re.match(r"^(?:[A-Za-z0-9._~%+\-]+(?::[^@/?#]+)?@)", locator):
+        raise SecurityConfigurationError("secret locator must not include embedded credentials")
     if parsed.scheme and parsed.netloc:
         if parsed.username or parsed.password:
             raise SecurityConfigurationError("secret locator must not include embedded credentials")
@@ -1142,12 +1144,12 @@ class SecurityService:
             action="members.role",
             audit_allowed=False,
         )
+        user = self.session.get(User, request.user_id)
+        if user is None:
+            raise AuthorizationError("user does not exist")
+        if user.lifecycle_state != "active":
+            raise AuthorizationError("user account is inactive")
         if membership is None:
-            user = self.session.get(User, request.user_id)
-            if user is None:
-                raise AuthorizationError("user does not exist")
-            if user.lifecycle_state != "active":
-                raise AuthorizationError("user is not active")
             if request.role == "owner" and not self._user_has_active_local_identity(organization_id, request.user_id):
                 raise AuthorizationError("owner membership requires an active local identity")
             membership = self.repo.add_membership(organization_id, request.user_id, request.role)
