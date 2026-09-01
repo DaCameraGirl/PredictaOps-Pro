@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
 
+from enterprise_security.redaction import assert_no_plaintext_secrets
 from industrial_ingestion.adapters import ADAPTERS
 from industrial_ingestion.contracts import (
     AdapterBatch,
@@ -42,6 +43,8 @@ class IngestionService:
     def register_source(self, registration: SourceRegistration):
         if self.repo.session.get(Organization, registration.organization_id) is None:
             raise IngestionError("organization does not exist")
+        if registration.config is not None:
+            assert_no_plaintext_secrets(registration.config)
         return self.repo.get_or_create_ingestion_source(
             registration.organization_id,
             name=registration.name,

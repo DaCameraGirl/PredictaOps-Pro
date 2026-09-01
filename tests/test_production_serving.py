@@ -668,7 +668,11 @@ def test_missing_stale_or_non_good_features_abstain_as_insufficient_evidence(
             )
         suspect = ProductionServingService(session, ModelArtifactStore(tmp_path / "models")).predict_rul(
             serving_fixture["organization_id"],
-            PredictionRequest(sensor_id=serving_fixture["sensor_a_id"], registry_id=registry.id),
+            PredictionRequest(
+                sensor_id=serving_fixture["sensor_a_id"],
+                registry_id=registry.id,
+                observed_at=quality_observed_at,
+            ),
         )
         session.commit()
 
