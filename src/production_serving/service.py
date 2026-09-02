@@ -264,6 +264,18 @@ class ProductionServingService:
             observed_at=prediction_time,
         )
         missing = [name for name in dataset.feature_names if name not in feature_rows]
+        if missing and latest_feature_time is not None:
+            fallback_rows = self.repo.list_latest_analytics_features_for_sensor(
+                organization_id,
+                sensor_id=context.sensor.id,
+                algorithm_version=dataset.source_algorithm_version,
+                feature_names=dataset.feature_names,
+                observed_at=latest_feature_time,
+            )
+            if all(name in fallback_rows for name in dataset.feature_names):
+                feature_rows = fallback_rows
+                missing = []
+
         if missing:
             self._persist_feature_quality_monitors(
                 organization_id,
@@ -917,7 +929,9 @@ def _stale_features(
     normalized_observed_at = _aware_utc(observed_at)
     stale = []
     for name, row in features.items():
-        age_minutes = (_aware_utc(normalized_observed_at) - _aware_utc(row.observed_at)).total_seconds() / 60.0
+        age_minutes = abs(
+            (_aware_utc(normalized_observed_at) - _aware_utc(row.observed_at)).total_seconds() / 60.0
+        )
         if age_minutes > max_feature_age_minutes:
             stale.append(
                 {

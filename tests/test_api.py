@@ -123,6 +123,31 @@ def test_snapshot_and_bearing_detail_report_the_same_predicted_rul(client):
     assert detail_resp["predicted_rul"] == list_value
 
 
+def test_studio_overview_exposes_hierarchy_and_health_summary(client):
+    resp = client.get("/api/studio/overview")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["organization"]["slug"] == "nasa-ims"
+    assert payload["fleet_summary"]["site_count"] >= 1
+    assert payload["fleet_summary"]["asset_count"] >= 1
+    assert payload["fleet_summary"]["component_count"] >= 1
+    assert payload["fleet_summary"]["sensor_count"] >= 1
+    assert set(payload).issuperset(
+        {
+            "organization",
+            "sites",
+            "assets",
+            "components",
+            "sensors",
+            "health",
+            "alerts",
+            "cases",
+            "work_orders",
+            "fleet_summary",
+        }
+    )
+
+
 def test_api_starts_when_shap_initialization_fails(monkeypatch):
     import main
 

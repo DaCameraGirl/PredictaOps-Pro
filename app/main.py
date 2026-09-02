@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import inspect
+from sqlalchemy import inspect, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from analytics_pipeline.service import AnalyticsService
@@ -73,7 +73,15 @@ from ml_platform.contracts import (
 from ml_platform.service import MLPlatformService
 from platform_core.config import database_settings, safe_database_label
 from platform_core.database import SessionLocal, check_database
-from platform_core.models import Base
+from platform_core.models import (
+    Asset,
+    Base,
+    Component,
+    MaintenanceWorkOrder,
+    Organization,
+    Sensor,
+    Site,
+)
 from platform_core.services import PlatformService, get_platform_inventory
 from production_serving.contracts import PredictionRequest, ServingBindingCreate
 from production_serving.service import ProductionServingService
@@ -297,6 +305,165 @@ def platform_inventory():
             return get_platform_inventory(session)
         except SQLAlchemyError as exc:
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.get("/api/studio/overview")
+def studio_overview_default():
+    with SessionLocal() as session:
+        try:
+            organization = session.scalar(select(Organization).where(Organization.slug == "nasa-ims"))
+            if organization is None:
+                PlatformService(session).bootstrap_ims_registry()
+                session.commit()
+                organization = session.scalar(select(Organization).where(Organization.slug == "nasa-ims"))
+            if organization is None:
+                raise HTTPException(status_code=404, detail="default organization not found")
+            return _studio_overview_payload(session, organization.id)
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.get("/api/studio/{organization_id}/overview")
+def studio_overview(organization_id: str):
+    with SessionLocal() as session:
+        try:
+            organization = session.get(Organization, organization_id)
+            if organization is None:
+                raise HTTPException(status_code=404, detail="organization not found")
+            return _studio_overview_payload(session, organization_id)
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+def _studio_overview_payload(session, organization_id: str) -> dict:
+    organization = session.get(Organization, organization_id)
+    if organization is None:
+        raise HTTPException(status_code=404, detail="organization not found")
+    sites = list(
+        session.scalars(
+            select(Site)
+            .where(Site.organization_id == organization_id)
+            .order_by(Site.slug)
+        )
+    )
+    assets = list(
+        session.scalars(
+            select(Asset)
+            .where(Asset.organization_id == organization_id)
+            .order_by(Asset.slug)
+        )
+    )
+    components = list(
+        session.scalars(
+            select(Component)
+            .where(Component.organization_id == organization_id)
+            .order_by(Component.slug)
+        )
+    )
+    sensors = list(
+        session.scalars(
+            select(Sensor)
+            .where(Sensor.organization_id == organization_id)
+            .order_by(Sensor.slug)
+        )
+    )
+    site_by_id = {site.id: site for site in sites}
+    asset_by_id = {asset.id: asset for asset in assets}
+    component_ids_by_asset = {
+        asset_id: {component.id for component in components if component.asset_id == asset_id}
+        for asset_id in {asset.id for asset in assets}
+    }
+    alerts = MaintenanceOperationsService(session).list_alerts(organization_id)
+    cases = MaintenanceOperationsService(session).list_cases(organization_id)
+    work_orders = [
+        work_order_payload(row)
+        for row in session.scalars(
+            select(MaintenanceWorkOrder)
+            .where(MaintenanceWorkOrder.organization_id == organization_id)
+            .order_by(MaintenanceWorkOrder.created_at.desc())
+        ).all()
+    ]
+    return {
+        "organization": {"id": organization.id, "slug": organization.slug, "name": organization.name},
+        "sites": [
+            {
+                "id": site.id,
+                "slug": site.slug,
+                "name": site.name,
+                "timezone": site.timezone,
+                "asset_count": sum(1 for asset in assets if asset.site_id == site.id),
+            }
+            for site in sites
+        ],
+        "assets": [
+            {
+                "id": asset.id,
+                "site_id": asset.site_id,
+                "slug": asset.slug,
+                "name": asset.name,
+                "asset_type": asset.asset_type,
+                "site_name": site_by_id.get(asset.site_id).name if asset.site_id in site_by_id else None,
+                "component_count": len(component_ids_by_asset.get(asset.id, set())),
+                "sensor_count": sum(
+                    1
+                    for sensor in sensors
+                    if any(
+                        sensor.component_id == component_id
+                        for component_id in component_ids_by_asset.get(asset.id, set())
+                    )
+                ),
+            }
+            for asset in assets
+        ],
+        "components": [
+            {
+                "id": component.id,
+                "asset_id": component.asset_id,
+                "slug": component.slug,
+                "name": component.name,
+                "component_type": component.component_type,
+                "asset_name": asset_by_id.get(component.asset_id).name if component.asset_id in asset_by_id else None,
+                "sensor_count": sum(1 for sensor in sensors if sensor.component_id == component.id),
+            }
+            for component in components
+        ],
+        "sensors": [
+            {
+                "id": sensor.id,
+                "component_id": sensor.component_id,
+                "slug": sensor.slug,
+                "name": sensor.name,
+                "sensor_type": sensor.sensor_type,
+                "unit": sensor.unit,
+                "sampling_rate_hz": sensor.sampling_rate_hz,
+                "channel_name": sensor.channel_name,
+                "axis": sensor.axis,
+                "manufacturer": sensor.manufacturer,
+                "model": sensor.model,
+            }
+            for sensor in sensors
+        ],
+        "health": {
+            "ingestion": IngestionService(session).health(organization_id),
+            "analytics": AnalyticsService(session).health(organization_id),
+            "serving": ProductionServingService(session).health(organization_id),
+            "maintenance": MaintenanceOperationsService(session).health(organization_id),
+        },
+        "alerts": alerts,
+        "cases": cases,
+        "work_orders": work_orders,
+        "fleet_summary": {
+            "site_count": len(sites),
+            "asset_count": len(assets),
+            "component_count": len(components),
+            "sensor_count": len(sensors),
+            "alert_count": len(alerts),
+            "case_count": len(cases),
+            "work_order_count": len(work_orders),
+        },
+    }
 
 
 @app.post("/api/ingestion/sources")
