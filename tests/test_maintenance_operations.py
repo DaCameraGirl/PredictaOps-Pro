@@ -56,6 +56,7 @@ from platform_core.models import (
     MaintenanceCase,
     MaintenanceResolution,
     PredictionRecord,
+    User,
 )
 from platform_core.repositories import PlatformRepository
 from production_serving.contracts import PredictionRequest, ServingBindingCreate
@@ -765,6 +766,18 @@ def test_manual_case_requires_active_human_opener(migrated_db, maintenance_fixtu
                 CaseCreate(
                     title="Manual case",
                     opened_by_user_id=maintenance_fixture["outsider_id"],
+                ),
+            )
+
+        technician = session.get(User, maintenance_fixture["technician_id"])
+        technician.lifecycle_state = "inactive"
+        session.flush()
+        with pytest.raises(ValueError, match="active member"):
+            service.open_case(
+                maintenance_fixture["organization_id"],
+                CaseCreate(
+                    title="Inactive technician case",
+                    opened_by_user_id=maintenance_fixture["technician_id"],
                 ),
             )
 

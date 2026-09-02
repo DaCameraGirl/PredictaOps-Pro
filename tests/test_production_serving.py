@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import os
 from datetime import UTC, datetime, timedelta
@@ -9,6 +10,7 @@ import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import func, inspect, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from alembic import command
@@ -32,6 +34,7 @@ from platform_core.contracts import (
 from platform_core.database import make_engine
 from platform_core.models import (
     Base,
+    ModelServingBinding,
     ModelServingMonitor,
     PredictionRecord,
     ProductionModelResolution,
@@ -149,6 +152,7 @@ def _seed_feature_rows(
     feature_names: list[str] | None = None,
     base_time: datetime | None = None,
     feature_units: dict[str, str | None] | None = None,
+    include_sparse_validation_group: bool = False,
 ) -> None:
     feature_names = feature_names or ["scalar.rms"]
     feature_units = feature_units or {}
@@ -168,10 +172,20 @@ def _seed_feature_rows(
         provenance={"test": "production-serving"},
     )
     base_time = base_time or datetime.now(UTC)
-    for sensor_id, run_id, group, offset in [
+    validation_groups = [
         (fixture["sensor_a_id"], run.id, "bearing-a", 0.0),
         (fixture["sensor_b_id"], run_b.id, "bearing-b", 10.0),
-    ]:
+    ]
+    if include_sparse_validation_group:
+        run_sparse = repo.create_analytics_run(
+            fixture["organization_id"],
+            run_kind="sensor",
+            sensor_id=fixture["sensor_sparse_id"],
+            algorithm_version="analytics-v1",
+            provenance={"test": "production-serving"},
+        )
+        validation_groups.append((fixture["sensor_sparse_id"], run_sparse.id, "bearing-c", 20.0))
+    for sensor_id, run_id, group, offset in validation_groups:
         for index in range(4):
             for feature_name in feature_names:
                 value = float(index + offset)
@@ -206,17 +220,33 @@ def _production_model(
     base_time: datetime | None = None,
     feature_units: dict[str, str | None] | None = None,
     abstention_policy: dict | None = None,
+    include_sparse_validation_group: bool = False,
     registry_name: str = "bearing-rul",
     registry_task: str = "rul_regression",
+    target_name: str = "RUL_hours",
+    target_unit: str | None = "h",
     dataset_version: str = "v1",
     model_version_label: str = "1.0.0",
 ):
     feature_names = feature_names or ["scalar.rms"]
-    _seed_feature_rows(session, fixture, feature_names=feature_names, base_time=base_time, feature_units=feature_units)
+    _seed_feature_rows(
+        session,
+        fixture,
+        feature_names=feature_names,
+        base_time=base_time,
+        feature_units=feature_units,
+        include_sparse_validation_group=include_sparse_validation_group,
+    )
     ml_service = MLPlatformService(session, ModelArtifactStore(tmp_path / "models"))
     dataset = ml_service.create_dataset_version(
         fixture["organization_id"],
-        DatasetVersionCreate(name=f"{registry_name}-features", version=dataset_version, feature_names=feature_names),
+        DatasetVersionCreate(
+            name=f"{registry_name}-features",
+            version=dataset_version,
+            feature_names=feature_names,
+            target_name=target_name,
+            target_unit=target_unit,
+        ),
     )
     experiment = ml_service.run_experiment(
         fixture["organization_id"],
@@ -289,6 +319,11 @@ def test_migration_creates_production_serving_tables(migrated_db):
         "model_serving_monitors",
         "retraining_triggers",
     }.issubset(tables)
+    indexes = {index["name"] for index in inspect(engine).get_indexes("model_serving_bindings")}
+    assert {
+        "uq_active_model_serving_binding_scope_id",
+        "uq_active_model_serving_binding_org_scope",
+    }.issubset(indexes)
 
 
 def test_supported_prediction_verifies_artifact_schema_and_persists_full_provenance(
@@ -453,6 +488,49 @@ def test_missing_artifact_abstains_without_prediction(migrated_db, serving_fixtu
         assert "model artifact does not exist" in prediction.abstention_reason
 
 
+def test_verified_artifact_deserializes_the_same_bytes_that_were_hashed(tmp_path, monkeypatch):
+    store = ModelArtifactStore(tmp_path / "models")
+    org_id = "org-1"
+    directory = tmp_path / "models" / org_id
+    directory.mkdir(parents=True)
+    path = directory / "model.joblib"
+    original = b"verified model bytes"
+    path.write_bytes(original)
+    digest = hashlib.sha256(original).hexdigest()
+
+    def fake_load(handle):
+        path.write_bytes(b"unverified replacement")
+        return handle.read()
+
+    monkeypatch.setattr("ml_platform.artifact_store.joblib.load", fake_load)
+
+    assert store.load_verified_model(
+        organization_id=org_id,
+        artifact_uri=path.as_posix(),
+        expected_sha256=digest,
+    ) == original
+
+
+def test_checksum_valid_but_undeserializable_artifact_abstains(migrated_db, serving_fixture, tmp_path):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        registry, model_version, _dataset = _production_model(session, serving_fixture, tmp_path)
+        _bind_sensor(session, serving_fixture, registry, model_version)
+        artifact = Path(model_version.artifact_uri)
+        artifact.write_bytes(b"not a joblib payload")
+        model_version.artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+        prediction = ProductionServingService(session, ModelArtifactStore(tmp_path / "models")).predict_rul(
+            serving_fixture["organization_id"],
+            PredictionRequest(sensor_id=serving_fixture["sensor_a_id"], registry_id=registry.id),
+        )
+        session.commit()
+
+        assert prediction.prediction_status == "unsupported"
+        assert prediction.abstention_code == "ARTIFACT_LOAD_FAILED"
+        assert "could not be deserialized" in prediction.abstention_reason
+
+
 def test_artifact_outside_registry_root_abstains_even_with_valid_checksum(
     migrated_db,
     serving_fixture,
@@ -511,11 +589,13 @@ def test_missing_stale_or_non_good_features_abstain_as_insufficient_evidence(
 ):
     _engine, session_factory = migrated_db
     with session_factory() as session:
+        base_time = datetime(2026, 8, 27, 13, tzinfo=UTC)
         registry, model_version, _dataset = _production_model(
             session,
             serving_fixture,
             tmp_path,
             feature_names=["scalar.rms", "scalar.std"],
+            base_time=base_time,
         )
         _bind_sensor(session, serving_fixture, registry, model_version)
         ProductionServingService(session).bind_model(
@@ -569,6 +649,7 @@ def test_missing_stale_or_non_good_features_abstain_as_insufficient_evidence(
             sensor_id=serving_fixture["sensor_a_id"],
             algorithm_version="analytics-v1",
         )
+        quality_observed_at = datetime(2026, 8, 28, 13, tzinfo=UTC)
         for feature_name, quality in [("scalar.rms", "suspect"), ("scalar.std", "good")]:
             repo.create_analytics_feature(
                 serving_fixture["organization_id"],
@@ -577,7 +658,7 @@ def test_missing_stale_or_non_good_features_abstain_as_insufficient_evidence(
                 batch_id=None,
                 source_kind="scalar",
                 source_record_id="suspect-live",
-                observed_at=datetime.now(UTC),
+                observed_at=quality_observed_at,
                 feature_name=feature_name,
                 value=1.0,
                 unit="g",
@@ -587,7 +668,11 @@ def test_missing_stale_or_non_good_features_abstain_as_insufficient_evidence(
             )
         suspect = ProductionServingService(session, ModelArtifactStore(tmp_path / "models")).predict_rul(
             serving_fixture["organization_id"],
-            PredictionRequest(sensor_id=serving_fixture["sensor_a_id"], registry_id=registry.id),
+            PredictionRequest(
+                sensor_id=serving_fixture["sensor_a_id"],
+                registry_id=registry.id,
+                observed_at=quality_observed_at,
+            ),
         )
         session.commit()
 
@@ -619,6 +704,59 @@ def test_live_prediction_uses_request_time_for_freshness_when_observed_at_is_omi
         assert prediction.prediction_status == "insufficient_evidence"
         assert prediction.abstention_code == "STALE_FEATURES"
         assert prediction.request_kind == "live"
+
+
+def test_prediction_uses_latest_complete_feature_snapshot(
+    migrated_db,
+    serving_fixture,
+    tmp_path,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        base_time = datetime.now(UTC) - timedelta(minutes=30)
+        registry, model_version, _dataset = _production_model(
+            session,
+            serving_fixture,
+            tmp_path,
+            feature_names=["scalar.rms", "scalar.std"],
+            base_time=base_time,
+        )
+        _bind_sensor(session, serving_fixture, registry, model_version)
+        repo = PlatformRepository(session)
+        partial_run = repo.create_analytics_run(
+            serving_fixture["organization_id"],
+            run_kind="sensor",
+            sensor_id=serving_fixture["sensor_a_id"],
+            algorithm_version="analytics-v1",
+        )
+        repo.create_analytics_feature(
+            serving_fixture["organization_id"],
+            run_id=partial_run.id,
+            sensor_id=serving_fixture["sensor_a_id"],
+            batch_id=None,
+            source_kind="scalar",
+            source_record_id="newer-partial",
+            observed_at=base_time + timedelta(minutes=20),
+            feature_name="scalar.rms",
+            value=999.0,
+            unit="g",
+            quality="good",
+            algorithm_version="analytics-v1",
+            provenance={},
+        )
+
+        prediction = ProductionServingService(session, ModelArtifactStore(tmp_path / "models")).predict_rul(
+            serving_fixture["organization_id"],
+            PredictionRequest(
+                sensor_id=serving_fixture["sensor_a_id"],
+                registry_id=registry.id,
+                max_feature_age_minutes=60,
+            ),
+        )
+        session.commit()
+
+        assert prediction.prediction_status == "supported"
+        assert prediction.feature_vector == {"scalar.rms": 3.0, "scalar.std": 3.5}
 
 
 def test_request_max_feature_age_can_tighten_but_not_weaken_policy(
@@ -653,6 +791,102 @@ def test_request_max_feature_age_can_tighten_but_not_weaken_policy(
         assert prediction.model_resolution["evidence"]["max_feature_age_minutes"] == 60
         assert prediction.model_resolution["evidence"]["request_max_feature_age_minutes"] == 525600
         assert prediction.model_resolution["evidence"]["policy_max_feature_age_minutes"] == 60
+
+
+def test_prediction_rejects_non_rul_dataset_target(migrated_db, serving_fixture, tmp_path):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        registry, model_version, _dataset = _production_model(
+            session,
+            serving_fixture,
+            tmp_path,
+            target_name="temperature",
+            target_unit="C",
+        )
+        _bind_sensor(session, serving_fixture, registry, model_version)
+
+        prediction = ProductionServingService(session, ModelArtifactStore(tmp_path / "models")).predict_rul(
+            serving_fixture["organization_id"],
+            PredictionRequest(sensor_id=serving_fixture["sensor_a_id"], registry_id=registry.id),
+        )
+        session.commit()
+
+        assert prediction.prediction_status == "unsupported"
+        assert prediction.abstention_code == "FEATURE_SCHEMA_MISMATCH"
+        assert "RUL_hours" in prediction.abstention_reason
+
+
+def test_prediction_rejects_unmet_min_validation_groups_policy(migrated_db, serving_fixture, tmp_path):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        registry, model_version, _dataset = _production_model(
+            session,
+            serving_fixture,
+            tmp_path,
+            abstention_policy={"min_validation_groups": 3},
+        )
+        _bind_sensor(session, serving_fixture, registry, model_version)
+
+        prediction = ProductionServingService(session, ModelArtifactStore(tmp_path / "models")).predict_rul(
+            serving_fixture["organization_id"],
+            PredictionRequest(sensor_id=serving_fixture["sensor_a_id"], registry_id=registry.id),
+        )
+        session.commit()
+
+        assert prediction.prediction_status == "unsupported"
+        assert prediction.abstention_code == "UNMET_ABSTENTION_POLICY"
+        assert prediction.model_resolution["evidence"]["validation_group_count"] == 2
+
+
+def test_prediction_accepts_integer_min_validation_groups_policy(migrated_db, serving_fixture, tmp_path):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        registry, model_version, dataset = _production_model(
+            session,
+            serving_fixture,
+            tmp_path,
+            abstention_policy={"min_validation_groups": 3},
+            include_sparse_validation_group=True,
+        )
+        _bind_sensor(session, serving_fixture, registry, model_version)
+
+        prediction = ProductionServingService(session, ModelArtifactStore(tmp_path / "models")).predict_rul(
+            serving_fixture["organization_id"],
+            PredictionRequest(sensor_id=serving_fixture["sensor_a_id"], registry_id=registry.id),
+        )
+        session.commit()
+
+        assert dataset.validation_group_count == 3
+        assert prediction.prediction_status == "supported"
+        assert prediction.abstention_code is None
+
+
+@pytest.mark.parametrize("policy_value", [2.5, True, "not-an-integer", 0, -1])
+def test_prediction_rejects_invalid_min_validation_groups_policy(
+    migrated_db,
+    serving_fixture,
+    tmp_path,
+    policy_value,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        registry, model_version, _dataset = _production_model(
+            session,
+            serving_fixture,
+            tmp_path,
+            abstention_policy={"min_validation_groups": policy_value},
+        )
+        _bind_sensor(session, serving_fixture, registry, model_version)
+
+        prediction = ProductionServingService(session, ModelArtifactStore(tmp_path / "models")).predict_rul(
+            serving_fixture["organization_id"],
+            PredictionRequest(sensor_id=serving_fixture["sensor_a_id"], registry_id=registry.id),
+        )
+        session.commit()
+
+        assert prediction.prediction_status == "unsupported"
+        assert prediction.abstention_code == "UNMET_ABSTENTION_POLICY"
+        assert "min_validation_groups" in prediction.abstention_reason
 
 
 def test_historical_prediction_uses_explicit_observed_at_as_as_of_time(
@@ -824,6 +1058,66 @@ def test_ambiguous_rul_bindings_fail_closed_without_registry_selector(
         assert ambiguous.prediction_status == "unsupported"
         assert ambiguous.abstention_code == "AMBIGUOUS_BINDING"
         assert explicit.prediction_status == "supported"
+
+
+def test_database_enforces_one_active_binding_per_registry_scope(
+    migrated_db,
+    serving_fixture,
+    tmp_path,
+):
+    _engine, session_factory = migrated_db
+    with session_factory() as session:
+        registry, model_version, _dataset = _production_model(session, serving_fixture, tmp_path)
+        session.commit()
+
+        first = ModelServingBinding(
+            organization_id=serving_fixture["organization_id"],
+            registry_id=registry.id,
+            model_version_id=model_version.id,
+            scope_type="sensor",
+            scope_id=serving_fixture["sensor_a_id"],
+            status="active",
+            approved_by_user_id=serving_fixture["approver_id"],
+        )
+        second = ModelServingBinding(
+            organization_id=serving_fixture["organization_id"],
+            registry_id=registry.id,
+            model_version_id=model_version.id,
+            scope_type="sensor",
+            scope_id=serving_fixture["sensor_a_id"],
+            status="active",
+            approved_by_user_id=serving_fixture["approver_id"],
+        )
+        session.add(first)
+        session.flush()
+        session.add(second)
+        with pytest.raises(IntegrityError):
+            session.flush()
+        session.rollback()
+
+        first_org = ModelServingBinding(
+            organization_id=serving_fixture["organization_id"],
+            registry_id=registry.id,
+            model_version_id=model_version.id,
+            scope_type="organization",
+            scope_id=None,
+            status="active",
+            approved_by_user_id=serving_fixture["approver_id"],
+        )
+        second_org = ModelServingBinding(
+            organization_id=serving_fixture["organization_id"],
+            registry_id=registry.id,
+            model_version_id=model_version.id,
+            scope_type="organization",
+            scope_id=None,
+            status="active",
+            approved_by_user_id=serving_fixture["approver_id"],
+        )
+        session.add(first_org)
+        session.flush()
+        session.add(second_org)
+        with pytest.raises(IntegrityError):
+            session.flush()
 
 
 def test_drift_monitoring_creates_retraining_trigger_without_auto_promotion(

@@ -11,10 +11,12 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -124,6 +126,165 @@ class OrganizationMembership(Base, TimestampMixin, LifecycleMixin):
 
     organization: Mapped[Organization] = relationship(back_populates="memberships")
     user: Mapped[User] = relationship(back_populates="memberships")
+
+
+class OrganizationIdentityProvider(Base, TimestampMixin):
+    __tablename__ = "organization_identity_providers"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id", name="uq_org_idp_org_id"),
+        UniqueConstraint("organization_id", "name", name="uq_org_idp_org_name"),
+        UniqueConstraint("organization_id", "issuer", "audience", name="uq_org_idp_org_issuer_audience"),
+        CheckConstraint("status in ('active', 'inactive')", name="ck_org_idp_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    issuer: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    audience: Mapped[str] = mapped_column(String(255), nullable=False)
+    discovery_url: Mapped[str | None] = mapped_column(String(1024))
+    jwks_uri: Mapped[str] = mapped_column(String(1024), nullable=False)
+    allowed_algorithms: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    claim_mapping: Mapped[dict | None] = mapped_column(JSON)
+
+
+class UserIdentity(Base, TimestampMixin):
+    __tablename__ = "user_identities"
+    __table_args__ = (
+        UniqueConstraint("issuer", "subject", name="uq_user_identity_global_issuer_subject"),
+        UniqueConstraint("identity_provider_id", "subject", name="uq_user_identity_provider_subject"),
+        UniqueConstraint("organization_id", "issuer", "subject", name="uq_user_identity_org_issuer_subject"),
+        ForeignKeyConstraint(
+            ["organization_id", "identity_provider_id"],
+            ["organization_identity_providers.organization_id", "organization_identity_providers.id"],
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    identity_provider_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    issuer: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    subject: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    profile: Mapped[dict | None] = mapped_column(JSON)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ServicePrincipal(Base, TimestampMixin):
+    __tablename__ = "service_principals"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "name", name="uq_service_principal_org_name"),
+        UniqueConstraint("identity_provider_id", "external_subject", name="uq_service_principal_provider_subject"),
+        UniqueConstraint(
+            "organization_id",
+            "issuer",
+            "external_subject",
+            name="uq_service_principal_org_issuer_subject",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "identity_provider_id"],
+            ["organization_identity_providers.organization_id", "organization_identity_providers.id"],
+        ),
+        CheckConstraint("status in ('active', 'inactive', 'archived')", name="ck_service_principal_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    identity_provider_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    external_subject: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    issuer: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    permissions: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    metadata_json: Mapped[dict | None] = mapped_column(JSON)
+
+
+class ExternalPrincipalIdentity(Base, TimestampMixin):
+    __tablename__ = "external_principal_identities"
+    __table_args__ = (
+        UniqueConstraint("issuer", "subject", name="uq_external_principal_global_issuer_subject"),
+        UniqueConstraint("identity_provider_id", "subject", name="uq_external_principal_provider_subject"),
+        ForeignKeyConstraint(
+            ["organization_id", "identity_provider_id"],
+            ["organization_identity_providers.organization_id", "organization_identity_providers.id"],
+        ),
+        CheckConstraint("principal_type in ('user', 'service')", name="ck_external_principal_type"),
+        CheckConstraint(
+            "("
+            "principal_type = 'user' and user_identity_id is not null and service_principal_id is null"
+            ") or ("
+            "principal_type = 'service' and service_principal_id is not null and user_identity_id is null"
+            ")",
+            name="ck_external_principal_single_target",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    identity_provider_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    issuer: Mapped[str] = mapped_column(String(512), nullable=False, index=True)
+    subject: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    principal_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    user_identity_id: Mapped[str | None] = mapped_column(ForeignKey("user_identities.id"), nullable=True, index=True)
+    service_principal_id: Mapped[str | None] = mapped_column(
+        ForeignKey("service_principals.id"), nullable=True, index=True
+    )
+
+
+class SecretReference(Base, TimestampMixin):
+    __tablename__ = "secret_references"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "name", name="uq_secret_reference_org_name"),
+        CheckConstraint("status in ('active', 'inactive', 'rotating', 'archived')", name="ck_secret_reference_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider: Mapped[str] = mapped_column(String(120), nullable=False)
+    locator: Mapped[str] = mapped_column(String(1024), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_by_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    rotation_metadata: Mapped[dict | None] = mapped_column(JSON)
+    last_rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SecurityAuditEvent(Base):
+    __tablename__ = "security_audit_events"
+    __table_args__ = (
+        Index(
+            "ix_security_audit_events_org_occurred_id",
+            "organization_id",
+            text("occurred_at DESC"),
+            text("id DESC"),
+        ),
+        CheckConstraint("principal_type in ('user', 'service', 'system', 'anonymous')", name="ck_audit_principal_type"),
+        CheckConstraint("outcome in ('allowed', 'denied', 'failed')", name="ck_audit_outcome"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    organization_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id"), nullable=True, index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    principal_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    service_principal_id: Mapped[str | None] = mapped_column(
+        ForeignKey("service_principals.id"), nullable=True, index=True
+    )
+    issuer: Mapped[str | None] = mapped_column(String(512))
+    subject_hash: Mapped[str | None] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(255), nullable=False)
+    required_permission: Mapped[str | None] = mapped_column(String(120))
+    resource_type: Mapped[str | None] = mapped_column(String(120))
+    resource_id: Mapped[str | None] = mapped_column(String(255))
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(120), nullable=False)
+    http_method: Mapped[str | None] = mapped_column(String(16))
+    http_path: Mapped[str | None] = mapped_column(String(1024))
+    request_metadata: Mapped[dict | None] = mapped_column(JSON)
+    event_metadata: Mapped[dict | None] = mapped_column(JSON)
 
 
 class Site(Base, TimestampMixin, LifecycleMixin):
@@ -685,6 +846,24 @@ class ModelServingBinding(Base, TimestampMixin):
     __tablename__ = "model_serving_bindings"
     __table_args__ = (
         UniqueConstraint("organization_id", "id", name="uq_model_serving_bindings_org_id"),
+        Index(
+            "uq_active_model_serving_binding_scope_id",
+            "organization_id",
+            "registry_id",
+            "scope_type",
+            "scope_id",
+            unique=True,
+            sqlite_where=text("status = 'active' AND scope_id IS NOT NULL"),
+            postgresql_where=text("status = 'active' AND scope_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_active_model_serving_binding_org_scope",
+            "organization_id",
+            "registry_id",
+            unique=True,
+            sqlite_where=text("status = 'active' AND scope_type = 'organization' AND scope_id IS NULL"),
+            postgresql_where=text("status = 'active' AND scope_type = 'organization' AND scope_id IS NULL"),
+        ),
         ForeignKeyConstraint(
             ["organization_id", "registry_id"],
             ["ml_model_registries.organization_id", "ml_model_registries.id"],

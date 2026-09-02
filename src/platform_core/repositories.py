@@ -1210,15 +1210,21 @@ class PlatformRepository:
                 AnalyticsFeatureRecord.observed_at <= observed_at,
             )
             .order_by(
-                AnalyticsFeatureRecord.feature_name,
                 AnalyticsFeatureRecord.observed_at.desc(),
+                AnalyticsFeatureRecord.feature_name,
                 AnalyticsFeatureRecord.id.desc(),
             )
         )
-        latest: dict[str, AnalyticsFeatureRecord] = {}
+        snapshots: dict[object, dict[str, AnalyticsFeatureRecord]] = {}
         for row in self.session.scalars(statement):
-            latest.setdefault(row.feature_name, row)
-        return latest
+            snapshot = snapshots.setdefault(row.observed_at, {})
+            snapshot.setdefault(row.feature_name, row)
+        for snapshot in snapshots.values():
+            if all(name in snapshot for name in feature_names):
+                return snapshot
+        if snapshots:
+            return next(iter(snapshots.values()))
+        return {}
 
     def latest_feature_observed_at(
         self,
@@ -1422,10 +1428,13 @@ class PlatformRepository:
 
     def get_active_membership(self, organization_id: str, user_id: str) -> OrganizationMembership | None:
         return self.session.scalar(
-            select(OrganizationMembership).where(
+            select(OrganizationMembership)
+            .join(User, User.id == OrganizationMembership.user_id)
+            .where(
                 OrganizationMembership.organization_id == organization_id,
                 OrganizationMembership.user_id == user_id,
                 OrganizationMembership.lifecycle_state == "active",
+                User.lifecycle_state == "active",
             )
         )
 

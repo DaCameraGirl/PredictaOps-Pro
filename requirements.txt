@@ -14,3 +14,4 @@ pyarrow==22.0.0
 paho-mqtt==2.1.0
 asyncua==2.0.1
 httpx==0.28.1
+PyJWT[crypto]==2.10.1

@@ -67,7 +67,7 @@ jobs:
       - name: Run Platform Core migrations on PostgreSQL
         run: alembic upgrade head
 
-      - name: Test platform stack through Maintenance Operations against PostgreSQL
+      - name: Test platform stack through Enterprise Security against PostgreSQL
         run: >
           pytest
           tests/test_platform_core.py
@@ -76,6 +76,7 @@ jobs:
           tests/test_ml_platform.py
           tests/test_production_serving.py
           tests/test_maintenance_operations.py
+          tests/test_enterprise_security.py
           -v
 
       - name: Recreate PostgreSQL schema for bootstrap
