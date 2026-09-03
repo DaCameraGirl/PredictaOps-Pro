@@ -4,14 +4,17 @@ import csv
 import io
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
+from threading import Lock
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import pandas as pd
+from alembic.config import Config
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -19,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, select
 from sqlalchemy.exc import SQLAlchemyError
 
+from alembic import command
 from analytics_pipeline.service import AnalyticsService
 from bearing_data import (
     BEARING_COLS,
@@ -120,7 +124,7 @@ from ml_platform.contracts import (
     RollbackModelVersion,
 )
 from ml_platform.service import MLPlatformService
-from platform_core.config import database_settings, safe_database_label
+from platform_core.config import DEFAULT_SQLITE_PATH, database_settings, safe_database_label
 from platform_core.database import SessionLocal, check_database
 from platform_core.models import (
     Asset,
@@ -144,6 +148,8 @@ MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 SECURITY_SETTINGS = security_settings()
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 OIDC_VERIFIER = OidcTokenVerifier(http_timeout_seconds=SECURITY_SETTINGS.oidc_http_timeout_seconds)
+_LOCAL_SQLITE_SCHEMA_LOCK = Lock()
+_LOCAL_SQLITE_SCHEMA_READY = False
 
 app = FastAPI(
     title="Predictive Maintenance Studio",
@@ -323,6 +329,42 @@ def _enterprise_security_enabled() -> bool:
 def _reject_enterprise_legacy_endpoint() -> None:
     if _enterprise_security_enabled():
         raise HTTPException(status_code=403, detail="legacy IMS demo endpoint is disabled in enterprise mode")
+
+
+def _ensure_default_local_sqlite_schema() -> None:
+    """Keep the unconfigured local Studio demo on the real Alembic schema.
+
+    Operator-configured databases, enterprise mode, and production mode still fail closed
+    when migrations have not been run explicitly.
+    """
+    settings = database_settings()
+    default_sqlite_url = f"sqlite:///{DEFAULT_SQLITE_PATH.as_posix()}"
+    if (
+        os.environ.get("PMS_DATABASE_URL") is not None
+        or settings.url != default_sqlite_url
+        or SECURITY_SETTINGS.environment == "production"
+        or SECURITY_SETTINGS.mode != "disabled"
+    ):
+        return
+
+    global _LOCAL_SQLITE_SCHEMA_READY
+    if _LOCAL_SQLITE_SCHEMA_READY:
+        return
+    with _LOCAL_SQLITE_SCHEMA_LOCK:
+        if _LOCAL_SQLITE_SCHEMA_READY:
+            return
+        DEFAULT_SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        cfg = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
+        command.upgrade(cfg, "head")
+        _LOCAL_SQLITE_SCHEMA_READY = True
+
+
+def _ensure_studio_schema() -> None:
+    try:
+        _ensure_default_local_sqlite_schema()
+    except Exception as exc:
+        logger.exception("default local SQLite schema migration failed")
+        raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
 def _bearer_token(request: Request) -> str:
@@ -522,6 +564,7 @@ def platform_inventory():
 
 @app.get("/api/studio/overview")
 def studio_overview_default():
+    _ensure_studio_schema()
     with SessionLocal() as session:
         try:
             organization = session.scalar(select(Organization).where(Organization.slug == "nasa-ims"))
@@ -539,6 +582,7 @@ def studio_overview_default():
 
 @app.get("/api/studio/{organization_id}/overview")
 def studio_overview(organization_id: str):
+    _ensure_studio_schema()
     with SessionLocal() as session:
         try:
             organization = session.get(Organization, organization_id)

@@ -148,6 +148,26 @@ def test_studio_overview_exposes_hierarchy_and_health_summary(client):
     )
 
 
+def test_studio_overview_fails_closed_for_configured_unmigrated_database(
+    monkeypatch, tmp_path, model_dir, feature_table
+):
+    import main
+
+    import platform_core.database as platform_database
+
+    monkeypatch.setenv("PMS_DATABASE_URL", f"sqlite:///{(tmp_path / 'unmigrated.db').as_posix()}")
+    importlib.reload(platform_database)
+    reloaded_main = importlib.reload(main)
+    local_client = TestClient(reloaded_main.app)
+
+    resp = local_client.get("/api/studio/overview")
+    assert resp.status_code == 503
+    assert "no such table: organizations" in resp.json()["detail"]
+
+    monkeypatch.delenv("PMS_DATABASE_URL")
+    importlib.reload(platform_database)
+    importlib.reload(main)
+
 def test_api_starts_when_shap_initialization_fails(monkeypatch):
     import main
 
