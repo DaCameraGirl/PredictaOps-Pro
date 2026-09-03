@@ -649,6 +649,7 @@ def organization_platform_inventory(organization_id: str, request: Request):
                     "slug": asset.slug,
                     "name": asset.name,
                     "asset_type": asset.asset_type,
+                    "external_ref": asset.external_ref,
                 }
                 for asset in assets
             ],
@@ -659,6 +660,7 @@ def organization_platform_inventory(organization_id: str, request: Request):
                     "slug": component.slug,
                     "name": component.name,
                     "component_type": component.component_type,
+                    "external_ref": component.external_ref,
                 }
                 for component in components
             ],
@@ -675,6 +677,7 @@ def organization_platform_inventory(organization_id: str, request: Request):
                     "axis": sensor.axis,
                     "manufacturer": sensor.manufacturer,
                     "model": sensor.model,
+                    "external_ref": sensor.external_ref,
                 }
                 for sensor in sensors
             ],
@@ -762,6 +765,7 @@ def _studio_overview_payload(session, organization_id: str) -> dict:
                 "slug": asset.slug,
                 "name": asset.name,
                 "asset_type": asset.asset_type,
+                "external_ref": asset.external_ref,
                 "site_name": site_by_id.get(asset.site_id).name if asset.site_id in site_by_id else None,
                 "component_count": len(component_ids_by_asset.get(asset.id, set())),
                 "sensor_count": sum(
@@ -782,6 +786,7 @@ def _studio_overview_payload(session, organization_id: str) -> dict:
                 "slug": component.slug,
                 "name": component.name,
                 "component_type": component.component_type,
+                "external_ref": component.external_ref,
                 "asset_name": asset_by_id.get(component.asset_id).name if component.asset_id in asset_by_id else None,
                 "sensor_count": sum(1 for sensor in sensors if sensor.component_id == component.id),
             }
@@ -800,6 +805,7 @@ def _studio_overview_payload(session, organization_id: str) -> dict:
                 "axis": sensor.axis,
                 "manufacturer": sensor.manufacturer,
                 "model": sensor.model,
+                "external_ref": sensor.external_ref,
             }
             for sensor in sensors
         ],
