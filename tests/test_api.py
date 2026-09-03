@@ -146,6 +146,20 @@ def test_studio_overview_exposes_hierarchy_and_health_summary(client):
             "fleet_summary",
         }
     )
+    test2_asset = next(asset for asset in payload["assets"] if asset["external_ref"] == "ims_test2")
+    bearing1 = next(
+        component
+        for component in payload["components"]
+        if component["asset_id"] == test2_asset["id"] and component["external_ref"] == "ims_test2:bearing_1"
+    )
+    sensor1 = next(
+        sensor
+        for sensor in payload["sensors"]
+        if sensor["component_id"] == bearing1["id"] and sensor["external_ref"] == "ims_test2:bearing_1:sensor_1"
+    )
+    assert test2_asset["name"].endswith("Test 2 Machine")
+    assert bearing1["name"].startswith("Bearing 1")
+    assert sensor1["name"].endswith("sensor_1")
 
 
 def test_studio_overview_fails_closed_for_configured_unmigrated_database(

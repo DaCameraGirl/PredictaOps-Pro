@@ -122,6 +122,51 @@ def test_studio_hierarchy_navigation_journey(base_url):
         assert "Recommended action" in main_detail.text_content()
         browser.close()
 
+def test_studio_hierarchy_status_tracks_selected_analytics_health(base_url):
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        pytest.skip("playwright not installed; pip install playwright && playwright install chromium")
+
+    def nav_node(page, kind, label):
+        return page.locator(f"#studio-nav .studio-nav-node[data-kind='{kind}']", has_text=label).first
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": 1366, "height": 1000})
+        page.goto(base_url)
+        page.wait_for_selector("#studio-nav .studio-nav-node[data-kind='asset']", timeout=20000)
+
+        nav_node(page, "asset", "Test 2 Machine").click()
+        page.wait_for_selector("#studio-nav .studio-nav-node[data-kind='component']", timeout=15000)
+        nav_node(page, "component", "Bearing 1").click()
+        page.wait_for_selector("#studio-nav .studio-nav-node[data-kind='sensor']", timeout=15000)
+        nav_node(page, "sensor", "sensor_1").click()
+
+        page.wait_for_selector("#detail .callout.critical", timeout=20000)
+        page.wait_for_function(
+            """
+            () => {
+              const node = (kind, text) => {
+                const selector = `#studio-nav .studio-nav-node[data-kind='${kind}']`;
+                return [...document.querySelectorAll(selector)].find((entry) => entry.textContent.includes(text));
+              };
+              return node("asset", "Test 2 Machine")?.dataset.status === "critical"
+                && node("component", "Bearing 1")?.dataset.status === "critical"
+                && node("sensor", "sensor_1")?.dataset.status === "critical";
+            }
+            """,
+            timeout=15000,
+        )
+
+        operations_text = page.locator("#studio-detail").text_content().lower()
+        assert "selected analytics" in operations_text
+        assert "critical" in operations_text
+        assert "persisted alerts" in operations_text
+        assert "no active bindings" in operations_text
+        assert "no source records" in operations_text
+        assert "no persisted maintenance alerts" in operations_text
+        browser.close()
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
