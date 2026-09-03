@@ -22,15 +22,47 @@
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); }
   a { color: var(--accent); }
-  header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 8px; }
-  header h1 { font-size: 18px; margin: 0; }
-  header .subtitle { color: var(--muted); font-size: 13px; }
+  .studio-header { padding: 18px 24px 14px; border-bottom: 1px solid var(--border); background: rgba(13,18,27,0.95); }
+  .studio-header-inner { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px; }
+  .studio-brand { display: flex; align-items: center; gap: 12px; }
+  .studio-logo { width: 32px; height: 32px; border-radius: 10px; background: linear-gradient(135deg, var(--accent), #71d6bb); display: grid; place-items: center; font-weight: 700; color: #06151c; }
+  .studio-header h1 { font-size: 18px; margin: 0; }
+  .studio-header .subtitle { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .studio-crumbs { display: flex; flex-wrap: wrap; gap: 8px; color: var(--muted); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+  .studio-crumb { background: rgba(23,30,42,0.96); border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px; }
+  .studio-kpis { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 10px; padding: 16px 24px 0; }
+  .studio-kpi { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .studio-kpi .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.07em; }
+  .studio-kpi .value { margin-top: 6px; font-size: 22px; font-weight: 700; }
   #methodology-btn { background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px 14px; font-size: 12px; cursor: pointer; }
   #methodology-btn:hover { background: var(--border); }
   #profile-bar, #scope-banner { padding: 10px 24px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border); line-height: 1.6; }
   #profile-bar b, #scope-banner b { color: var(--text); }
   #scope-banner { background: rgba(250,178,25,0.06); }
   #scope-banner b.warn { color: var(--warn); }
+  #studio-rail { display: grid; grid-template-columns: 360px 1fr; gap: 16px; padding: 16px 24px; border-bottom: 1px solid var(--border); background: rgba(12,18,26,0.9); }
+  #studio-nav, #studio-detail { background: rgba(16,24,33,0.94); border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+  .studio-panel-title { color: var(--muted); text-transform: uppercase; letter-spacing: .08em; font-size: 11px; margin: 0 0 8px; }
+  .studio-nav-group { margin-bottom: 10px; }
+  .studio-nav-node { display: flex; justify-content: space-between; gap: 10px; width: 100%; border: 1px solid var(--border); background: rgba(20,29,41,0.9); color: var(--text); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; text-align: left; }
+  .studio-nav-node:hover { border-color: rgba(91,140,255,0.5); }
+  .studio-nav-node.active { border-color: rgba(91,140,255,0.65); box-shadow: inset 0 0 0 1px rgba(91,140,255,0.28); }
+  .studio-nav-node .meta { color: var(--muted); font-size: 11px; }
+  .studio-nav-node .label { font-size: 13px; font-weight: 600; }
+  .studio-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(160px, 1fr)); gap: 12px; }
+  .studio-stat { background: rgba(18,28,38,0.9); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+  .studio-stat .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+  .studio-stat .value { margin-top: 6px; font-size: 18px; font-weight: 700; }
+  .studio-empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
+  .studio-attention { display: grid; gap: 8px; }
+  .studio-attention-item { display: flex; justify-content: space-between; gap: 12px; background: rgba(18,28,38,0.9); border: 1px solid var(--border); border-radius: 10px; padding: 9px 10px; }
+  .status-pill { display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; padding: 4px 8px; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; border: 1px solid var(--border); }
+  .status-pill.critical { background: rgba(208,59,59,0.12); color: var(--critical); border-color: rgba(208,59,59,0.25); }
+  .status-pill.warning { background: rgba(250,178,25,0.12); color: var(--warn); border-color: rgba(250,178,25,0.25); }
+  .status-pill.watch { background: rgba(237,161,0,0.12); color: var(--watch); border-color: rgba(237,161,0,0.25); }
+  .status-pill.healthy { background: rgba(12,163,12,0.12); color: var(--ok); border-color: rgba(12,163,12,0.25); }
+  .status-pill.insufficient_evidence { background: rgba(139,150,171,0.12); color: var(--muted); border-color: rgba(139,150,171,0.25); }
+  .muted { color: var(--muted); }
   #time-control { padding: 12px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   #time-control input[type="range"] { flex: 1; min-width: 180px; accent-color: var(--accent); }
   #time-control button { background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 6px; width: 34px; height: 30px; cursor: pointer; font-size: 13px; }
@@ -112,15 +144,32 @@
 </style>
 </head>
 <body>
-<header>
-  <div>
-    <h1>Predictive Maintenance Studio</h1>
-    <div class="subtitle">NASA/IMS real bearing test-to-failure data &middot; remaining useful life</div>
+<header class="studio-header">
+  <div class="studio-header-inner">
+    <div class="studio-brand">
+      <div class="studio-logo">P</div>
+      <div>
+        <h1>PredictaOps Pro</h1>
+        <div class="subtitle">Know what’s breaking before it breaks.</div>
+      </div>
+    </div>
+    <div class="studio-crumbs" aria-label="Studio hierarchy">
+      <div class="studio-crumb">Fleet</div>
+      <div class="studio-crumb">Site</div>
+      <div class="studio-crumb">Asset</div>
+      <div class="studio-crumb">Component</div>
+      <div class="studio-crumb">Sensor</div>
+    </div>
+    <button id="methodology-btn" onclick="document.getElementById('methodology-modal').classList.add('open')">Methodology &amp; limitations</button>
   </div>
-  <button id="methodology-btn" onclick="document.getElementById('methodology-modal').classList.add('open')">Methodology &amp; limitations</button>
 </header>
+<div id="studio-kpis" class="studio-kpis"></div>
 <div id="profile-bar" class="loading">Loading dataset profile&hellip;</div>
 <div id="scope-banner" class="loading">Loading model scope&hellip;</div>
+<div id="studio-rail">
+  <div id="studio-nav"><div class="studio-panel-title">Fleet hierarchy</div><div class="studio-empty">Loading operational hierarchy…</div></div>
+  <div id="studio-detail"><div class="studio-panel-title">Operations context</div><div class="studio-empty">Select a site, asset, component, or sensor to inspect real evidence and maintenance context.</div></div>
+</div>
 <div id="time-control">
   <button id="btn-start" title="Jump to start">|&laquo;</button>
   <button id="btn-prev" title="Previous snapshot">&lsaquo;</button>
@@ -231,6 +280,218 @@ function renderMethodology(profile) {
     <h2>Source</h2>
     <p><a href="https://github.com/DaCameraGirl/abb-predictive-maintenance-2026" target="_blank" rel="noopener">Repository</a></p>
   `;
+}
+
+const studioState = { data: null, selectedSiteId: null, selectedAssetId: null, selectedComponentId: null, selectedSensorId: null };
+
+function statusPill(level, fallback = "healthy") {
+  const normalized = String(level || fallback).replace("_", " ");
+  const className = normalized === "critical" ? "critical" : normalized === "warning" ? "warning" : normalized === "watch" ? "watch" : normalized === "insufficient evidence" ? "insufficient_evidence" : "healthy";
+  return `<span class="status-pill ${className}">${normalized}</span>`;
+}
+
+function renderStudioHierarchy() {
+  const nav = document.getElementById("studio-nav");
+  const detail = document.getElementById("studio-detail");
+  const data = studioState.data;
+  if (!data) {
+    nav.innerHTML = '<div class="studio-panel-title">Fleet hierarchy</div><div class="studio-empty">Operational hierarchy unavailable.</div>';
+    detail.innerHTML = '<div class="studio-panel-title">Operations context</div><div class="studio-empty">No real hierarchy available.</div>';
+    return;
+  }
+
+  const sites = data.sites || [];
+  const assets = data.assets || [];
+  const components = data.components || [];
+  const sensors = data.sensors || [];
+
+  const siteItems = sites.length ? sites.map((site) => {
+    const siteAssets = assets.filter((asset) => asset.site_id === site.id);
+    const active = studioState.selectedSiteId === site.id ? "active" : "";
+    return `
+      <button class="studio-nav-node ${active}" data-kind="site" data-id="${site.id}" type="button">
+        <div>
+          <div class="label">${site.name}</div>
+          <div class="meta">${siteAssets.length} asset${siteAssets.length === 1 ? "" : "s"}</div>
+        </div>
+        ${statusPill(siteAssets.length ? "healthy" : "insufficient_evidence")}
+      </button>
+    `;
+  }).join("") : '<div class="studio-empty">No sites are registered for this organization.</div>';
+
+  const selectedSite = sites.find((site) => site.id === studioState.selectedSiteId) || sites[0] || null;
+  const selectedAsset = assets.find((asset) => asset.id === studioState.selectedAssetId) || (selectedSite ? assets.find((asset) => asset.site_id === selectedSite.id) : null) || null;
+  const selectedComponent = components.find((component) => component.id === studioState.selectedComponentId) || (selectedAsset ? components.find((component) => component.asset_id === selectedAsset.id) : null) || null;
+  const selectedSensor = sensors.find((sensor) => sensor.id === studioState.selectedSensorId) || (selectedComponent ? sensors.find((sensor) => sensor.component_id === selectedComponent.id) : null) || null;
+
+  const assetItems = selectedSite ? (assets.filter((asset) => asset.site_id === selectedSite.id).length ? assets.filter((asset) => asset.site_id === selectedSite.id).map((asset) => {
+    const assetComponents = components.filter((component) => component.asset_id === asset.id);
+    const active = studioState.selectedAssetId === asset.id ? "active" : "";
+    return `
+      <button class="studio-nav-node ${active}" data-kind="asset" data-id="${asset.id}" type="button">
+        <div>
+          <div class="label">${asset.name}</div>
+          <div class="meta">${assetComponents.length} component${assetComponents.length === 1 ? "" : "s"}</div>
+        </div>
+        ${statusPill(assetComponents.length ? "watch" : "insufficient_evidence")}
+      </button>
+    `;
+  }).join("") : '<div class="studio-empty">No assets for the selected site.</div>') : '<div class="studio-empty">Select a site to view assets.</div>';
+
+  const componentItems = selectedAsset ? (components.filter((component) => component.asset_id === selectedAsset.id).length ? components.filter((component) => component.asset_id === selectedAsset.id).map((component) => {
+    const sensorCount = sensors.filter((sensor) => sensor.component_id === component.id).length;
+    const active = studioState.selectedComponentId === component.id ? "active" : "";
+    return `
+      <button class="studio-nav-node ${active}" data-kind="component" data-id="${component.id}" type="button">
+        <div>
+          <div class="label">${component.name}</div>
+          <div class="meta">${component.component_type} · ${sensorCount} sensor${sensorCount === 1 ? "" : "s"}</div>
+        </div>
+        ${statusPill(component.component_type === "bearing" ? "watch" : "healthy")}
+      </button>
+    `;
+  }).join("") : '<div class="studio-empty">No components for the selected asset.</div>') : '<div class="studio-empty">Select an asset to view components.</div>';
+
+  const sensorItems = selectedComponent ? (sensors.filter((sensor) => sensor.component_id === selectedComponent.id).length ? sensors.filter((sensor) => sensor.component_id === selectedComponent.id).map((sensor) => {
+    const active = studioState.selectedSensorId === sensor.id ? "active" : "";
+    return `
+      <button class="studio-nav-node ${active}" data-kind="sensor" data-id="${sensor.id}" type="button">
+        <div>
+          <div class="label">${sensor.name}</div>
+          <div class="meta">${sensor.sensor_type} · ${sensor.unit || "n/a"}</div>
+        </div>
+        ${statusPill(sensor.sampling_rate_hz ? "healthy" : "insufficient_evidence")}
+      </button>
+    `;
+  }).join("") : '<div class="studio-empty">No sensors for the selected component.</div>') : '<div class="studio-empty">Select a component to view sensors.</div>';
+
+  nav.innerHTML = `
+    <div class="studio-panel-title">Fleet hierarchy</div>
+    <div class="studio-nav-group">
+      <div class="muted" style="margin-bottom:6px;">Site</div>
+      ${siteItems}
+    </div>
+    <div class="studio-nav-group">
+      <div class="muted" style="margin-bottom:6px;">Asset</div>
+      ${assetItems}
+    </div>
+    <div class="studio-nav-group">
+      <div class="muted" style="margin-bottom:6px;">Component / Bearing</div>
+      ${componentItems}
+    </div>
+    <div class="studio-nav-group">
+      <div class="muted" style="margin-bottom:6px;">Sensor</div>
+      ${sensorItems}
+    </div>
+  `;
+
+  const alertRows = (data.alerts || []).slice(0, 4).map((alert) => {
+    const severity = String(alert.severity || "watch").toLowerCase();
+    return `
+      <div class="studio-attention-item">
+        <div>
+          <div style="font-weight:600;">${alert.title || alert.alert_kind || "Alert"}</div>
+          <div class="muted" style="font-size:11px;">${alert.summary || "Real maintenance attention"}</div>
+        </div>
+        ${statusPill(severity)}
+      </div>
+    `;
+  });
+
+  const healthSummary = data.health || {};
+  const healthCards = `
+    <div class="studio-detail-grid">
+      <div class="studio-stat"><div class="label">Organization</div><div class="value">${data.organization?.name || "n/a"}</div></div>
+      <div class="studio-stat"><div class="label">Active alerts</div><div class="value">${data.fleet_summary?.alert_count ?? 0}</div></div>
+      <div class="studio-stat"><div class="label">Cases</div><div class="value">${data.fleet_summary?.case_count ?? 0}</div></div>
+      <div class="studio-stat"><div class="label">Work orders</div><div class="value">${data.fleet_summary?.work_order_count ?? 0}</div></div>
+      <div class="studio-stat"><div class="label">Ingestion</div><div class="value">${healthSummary.ingestion?.status || "n/a"}</div></div>
+      <div class="studio-stat"><div class="label">Serving</div><div class="value">${healthSummary.serving?.status || "n/a"}</div></div>
+    </div>
+  `;
+
+  detail.innerHTML = `
+    <div class="studio-panel-title">Operations context</div>
+    ${healthCards}
+    <div class="studio-panel-title" style="margin-top:14px;">Current focus</div>
+    ${selectedSite ? `<div class="studio-empty">Site: <strong>${selectedSite.name}</strong></div>` : ""}
+    ${selectedAsset ? `<div class="studio-empty">Asset: <strong>${selectedAsset.name}</strong></div>` : ""}
+    ${selectedComponent ? `<div class="studio-empty">Component: <strong>${selectedComponent.name}</strong></div>` : ""}
+    ${selectedSensor ? `<div class="studio-empty">Sensor: <strong>${selectedSensor.name}</strong></div>` : ""}
+    <div class="studio-panel-title" style="margin-top:14px;">Attention queue</div>
+    <div class="studio-attention">${alertRows.length ? alertRows.join("") : '<div class="studio-empty">No active alerts in the current organization.</div>'}</div>
+  `;
+
+  nav.querySelectorAll(".studio-nav-node").forEach((button) => {
+    button.addEventListener("click", () => {
+      const kind = button.dataset.kind;
+      const id = button.dataset.id;
+      if (kind === "site") {
+        studioState.selectedSiteId = id;
+        studioState.selectedAssetId = null;
+        studioState.selectedComponentId = null;
+        studioState.selectedSensorId = null;
+      } else if (kind === "asset") {
+        studioState.selectedSiteId = assets.find((asset) => asset.id === id)?.site_id || studioState.selectedSiteId;
+        studioState.selectedAssetId = id;
+        studioState.selectedComponentId = null;
+        studioState.selectedSensorId = null;
+      } else if (kind === "component") {
+        studioState.selectedComponentId = id;
+        studioState.selectedSensorId = null;
+        const component = components.find((entry) => entry.id === id);
+        if (component) {
+          studioState.selectedAssetId = component.asset_id;
+          const asset = assets.find((entry) => entry.id === component.asset_id);
+          if (asset) studioState.selectedSiteId = asset.site_id;
+        }
+      } else if (kind === "sensor") {
+        const sensor = sensors.find((entry) => entry.id === id);
+        if (sensor) {
+          studioState.selectedSensorId = id;
+          const component = components.find((entry) => entry.id === sensor.component_id);
+          if (component) {
+            studioState.selectedComponentId = component.id;
+            studioState.selectedAssetId = component.asset_id;
+            const asset = assets.find((entry) => entry.id === component.asset_id);
+            if (asset) studioState.selectedSiteId = asset.site_id;
+          }
+        }
+      }
+      renderStudioHierarchy();
+    });
+  });
+}
+
+async function loadStudioOverview() {
+  try {
+    const response = await fetch(`${API}/api/studio/overview`);
+    if (response.status === 401 || response.status === 403) {
+      document.getElementById("studio-nav").innerHTML = '<div class="studio-panel-title">Fleet hierarchy</div><div class="studio-empty">Permission denied for the current organization context.</div>';
+      document.getElementById("studio-detail").innerHTML = '<div class="studio-panel-title">Operations context</div><div class="studio-empty">401/403 — clear the current session or request a valid organization role.</div>';
+      return;
+    }
+    if (!response.ok) throw new Error(`Studio overview failed (${response.status})`);
+    const payload = await response.json();
+    studioState.data = payload;
+    if (!studioState.selectedSiteId && payload.sites?.length) studioState.selectedSiteId = payload.sites[0].id;
+    if (!studioState.selectedAssetId && payload.assets?.length) {
+      const firstSiteAsset = payload.assets.find((asset) => asset.site_id === studioState.selectedSiteId) || payload.assets[0];
+      if (firstSiteAsset) studioState.selectedAssetId = firstSiteAsset.id;
+    }
+    if (!studioState.selectedComponentId && payload.components?.length) {
+      const matching = payload.components.find((component) => component.asset_id === studioState.selectedAssetId) || payload.components[0];
+      if (matching) studioState.selectedComponentId = matching.id;
+    }
+    if (!studioState.selectedSensorId && payload.sensors?.length) {
+      const matching = payload.sensors.find((sensor) => sensor.component_id === studioState.selectedComponentId) || payload.sensors[0];
+      if (matching) studioState.selectedSensorId = matching.id;
+    }
+    renderStudioHierarchy();
+  } catch (error) {
+    document.getElementById("studio-nav").innerHTML = '<div class="studio-panel-title">Fleet hierarchy</div><div class="studio-empty">The operation hierarchy could not be loaded from the real backend.</div>';
+    document.getElementById("studio-detail").innerHTML = '<div class="studio-panel-title">Operations context</div><div class="studio-empty">' + (error && error.message ? error.message : "No data available") + '</div>';
+  }
 }
 
 async function loadTimeline() {
@@ -545,6 +806,7 @@ async function loadTrend() {
   buildTrendChart(points);
 }
 
+loadStudioOverview();
 loadProfile();
 loadTimeline();
 loadTrend();

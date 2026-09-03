@@ -123,6 +123,51 @@ def test_snapshot_and_bearing_detail_report_the_same_predicted_rul(client):
     assert detail_resp["predicted_rul"] == list_value
 
 
+def test_studio_overview_exposes_hierarchy_and_health_summary(client):
+    resp = client.get("/api/studio/overview")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["organization"]["slug"] == "nasa-ims"
+    assert payload["fleet_summary"]["site_count"] >= 1
+    assert payload["fleet_summary"]["asset_count"] >= 1
+    assert payload["fleet_summary"]["component_count"] >= 1
+    assert payload["fleet_summary"]["sensor_count"] >= 1
+    assert set(payload).issuperset(
+        {
+            "organization",
+            "sites",
+            "assets",
+            "components",
+            "sensors",
+            "health",
+            "alerts",
+            "cases",
+            "work_orders",
+            "fleet_summary",
+        }
+    )
+
+
+def test_studio_overview_fails_closed_for_configured_unmigrated_database(
+    monkeypatch, tmp_path, model_dir, feature_table
+):
+    import main
+
+    import platform_core.database as platform_database
+
+    monkeypatch.setenv("PMS_DATABASE_URL", f"sqlite:///{(tmp_path / 'unmigrated.db').as_posix()}")
+    importlib.reload(platform_database)
+    reloaded_main = importlib.reload(main)
+    local_client = TestClient(reloaded_main.app)
+
+    resp = local_client.get("/api/studio/overview")
+    assert resp.status_code == 503
+    assert "no such table: organizations" in resp.json()["detail"]
+
+    monkeypatch.delenv("PMS_DATABASE_URL")
+    importlib.reload(platform_database)
+    importlib.reload(main)
+
 def test_api_starts_when_shap_initialization_fails(monkeypatch):
     import main
 

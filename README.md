@@ -54,6 +54,8 @@ uvicorn app.main:app --reload
 
 Open `http://127.0.0.1:8000`.
 
+When `PMS_DATABASE_URL` is unset in development, the Studio overview keeps the local SQLite registry at `data/platform_core.db` on the real Alembic schema before bootstrapping the IMS hierarchy. Configured databases and production deployments should still run migrations explicitly before serving traffic.
+
 ## Platform Core database
 
 Production Slice 6 introduces the persistent platform registry underneath the existing IMS

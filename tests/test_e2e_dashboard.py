@@ -83,5 +83,45 @@ def test_critical_dashboard_journey(base_url):
         browser.close()
 
 
+def test_studio_hierarchy_navigation_journey(base_url):
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        pytest.skip("playwright not installed; pip install playwright && playwright install chromium")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        page = browser.new_page(viewport={"width": 1366, "height": 1000})
+        page.goto(base_url)
+        page.wait_for_selector("#studio-nav .studio-nav-node[data-kind='site']", timeout=20000)
+
+        site = page.locator("#studio-nav .studio-nav-node[data-kind='site']").first
+        assert site.count() == 1
+        site.click()
+
+        page.wait_for_selector("#studio-nav .studio-nav-node[data-kind='asset']", timeout=15000)
+        asset = page.locator("#studio-nav .studio-nav-node[data-kind='asset']").first
+        assert asset.count() == 1
+        asset.click()
+
+        page.wait_for_selector("#studio-nav .studio-nav-node[data-kind='component']", timeout=15000)
+        component = page.locator("#studio-nav .studio-nav-node[data-kind='component']").first
+        assert component.count() == 1
+        component.click()
+        page.wait_for_selector("#studio-nav .studio-nav-node[data-kind='sensor']", timeout=15000)
+
+        sensor = page.locator("#studio-nav .studio-nav-node[data-kind='sensor']").first
+        assert sensor.count() == 1
+        sensor.click()
+
+        detail = page.locator("#studio-detail")
+        assert "Sensor" in detail.text_content()
+        page.wait_for_selector("text=SHAP", timeout=20000)
+
+        main_detail = page.locator("#detail")
+        assert "Recommended action" in main_detail.text_content()
+        browser.close()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

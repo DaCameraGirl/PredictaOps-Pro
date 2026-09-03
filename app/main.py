@@ -4,14 +4,17 @@ import csv
 import io
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
+from threading import Lock
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import pandas as pd
+from alembic.config import Config
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -19,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect, select
 from sqlalchemy.exc import SQLAlchemyError
 
+from alembic import command
 from analytics_pipeline.service import AnalyticsService
 from bearing_data import (
     BEARING_COLS,
@@ -120,9 +124,17 @@ from ml_platform.contracts import (
     RollbackModelVersion,
 )
 from ml_platform.service import MLPlatformService
-from platform_core.config import database_settings, safe_database_label
+from platform_core.config import DEFAULT_SQLITE_PATH, database_settings, safe_database_label
 from platform_core.database import SessionLocal, check_database
-from platform_core.models import Asset, Base, Component, Organization, Sensor, Site
+from platform_core.models import (
+    Asset,
+    Base,
+    Component,
+    MaintenanceWorkOrder,
+    Organization,
+    Sensor,
+    Site,
+)
 from platform_core.services import PlatformService, get_platform_inventory
 from production_serving.contracts import PredictionRequest, ServingBindingCreate
 from production_serving.service import ProductionServingService
@@ -136,6 +148,8 @@ MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 SECURITY_SETTINGS = security_settings()
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 OIDC_VERIFIER = OidcTokenVerifier(http_timeout_seconds=SECURITY_SETTINGS.oidc_http_timeout_seconds)
+_LOCAL_SQLITE_SCHEMA_LOCK = Lock()
+_LOCAL_SQLITE_SCHEMA_READY = False
 
 app = FastAPI(
     title="Predictive Maintenance Studio",
@@ -315,6 +329,42 @@ def _enterprise_security_enabled() -> bool:
 def _reject_enterprise_legacy_endpoint() -> None:
     if _enterprise_security_enabled():
         raise HTTPException(status_code=403, detail="legacy IMS demo endpoint is disabled in enterprise mode")
+
+
+def _ensure_default_local_sqlite_schema() -> None:
+    """Keep the unconfigured local Studio demo on the real Alembic schema.
+
+    Operator-configured databases, enterprise mode, and production mode still fail closed
+    when migrations have not been run explicitly.
+    """
+    settings = database_settings()
+    default_sqlite_url = f"sqlite:///{DEFAULT_SQLITE_PATH.as_posix()}"
+    if (
+        os.environ.get("PMS_DATABASE_URL") is not None
+        or settings.url != default_sqlite_url
+        or SECURITY_SETTINGS.environment == "production"
+        or SECURITY_SETTINGS.mode != "disabled"
+    ):
+        return
+
+    global _LOCAL_SQLITE_SCHEMA_READY
+    if _LOCAL_SQLITE_SCHEMA_READY:
+        return
+    with _LOCAL_SQLITE_SCHEMA_LOCK:
+        if _LOCAL_SQLITE_SCHEMA_READY:
+            return
+        DEFAULT_SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        cfg = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
+        command.upgrade(cfg, "head")
+        _LOCAL_SQLITE_SCHEMA_READY = True
+
+
+def _ensure_studio_schema() -> None:
+    try:
+        _ensure_default_local_sqlite_schema()
+    except Exception as exc:
+        logger.exception("default local SQLite schema migration failed")
+        raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
 def _bearer_token(request: Request) -> str:
@@ -512,6 +562,38 @@ def platform_inventory():
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
 
 
+@app.get("/api/studio/overview")
+def studio_overview_default():
+    _ensure_studio_schema()
+    with SessionLocal() as session:
+        try:
+            organization = session.scalar(select(Organization).where(Organization.slug == "nasa-ims"))
+            if organization is None:
+                PlatformService(session).bootstrap_ims_registry()
+                session.commit()
+                organization = session.scalar(select(Organization).where(Organization.slug == "nasa-ims"))
+            if organization is None:
+                raise HTTPException(status_code=404, detail="default organization not found")
+            return _studio_overview_payload(session, organization.id)
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+@app.get("/api/studio/{organization_id}/overview")
+def studio_overview(organization_id: str):
+    _ensure_studio_schema()
+    with SessionLocal() as session:
+        try:
+            organization = session.get(Organization, organization_id)
+            if organization is None:
+                raise HTTPException(status_code=404, detail="organization not found")
+            return _studio_overview_payload(session, organization_id)
+        except SQLAlchemyError as exc:
+            session.rollback()
+            raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
 @app.get("/api/platform/{organization_id}/inventory")
 def organization_platform_inventory(organization_id: str, request: Request):
     with SessionLocal() as session:
@@ -611,6 +693,135 @@ def get_current_security_context(organization_id: str, request: Request):
         except SQLAlchemyError as exc:
             session.rollback()
             raise HTTPException(status_code=503, detail=f"platform database unavailable: {exc}") from exc
+
+
+def _studio_overview_payload(session, organization_id: str) -> dict:
+    organization = session.get(Organization, organization_id)
+    if organization is None:
+        raise HTTPException(status_code=404, detail="organization not found")
+    sites = list(
+        session.scalars(
+            select(Site)
+            .where(Site.organization_id == organization_id)
+            .order_by(Site.slug)
+        )
+    )
+    assets = list(
+        session.scalars(
+            select(Asset)
+            .where(Asset.organization_id == organization_id)
+            .order_by(Asset.slug)
+        )
+    )
+    components = list(
+        session.scalars(
+            select(Component)
+            .where(Component.organization_id == organization_id)
+            .order_by(Component.slug)
+        )
+    )
+    sensors = list(
+        session.scalars(
+            select(Sensor)
+            .where(Sensor.organization_id == organization_id)
+            .order_by(Sensor.slug)
+        )
+    )
+    site_by_id = {site.id: site for site in sites}
+    asset_by_id = {asset.id: asset for asset in assets}
+    component_ids_by_asset = {
+        asset_id: {component.id for component in components if component.asset_id == asset_id}
+        for asset_id in {asset.id for asset in assets}
+    }
+    alerts = MaintenanceOperationsService(session).list_alerts(organization_id)
+    cases = MaintenanceOperationsService(session).list_cases(organization_id)
+    work_orders = [
+        work_order_payload(row)
+        for row in session.scalars(
+            select(MaintenanceWorkOrder)
+            .where(MaintenanceWorkOrder.organization_id == organization_id)
+            .order_by(MaintenanceWorkOrder.created_at.desc())
+        ).all()
+    ]
+    return {
+        "organization": {"id": organization.id, "slug": organization.slug, "name": organization.name},
+        "sites": [
+            {
+                "id": site.id,
+                "slug": site.slug,
+                "name": site.name,
+                "timezone": site.timezone,
+                "asset_count": sum(1 for asset in assets if asset.site_id == site.id),
+            }
+            for site in sites
+        ],
+        "assets": [
+            {
+                "id": asset.id,
+                "site_id": asset.site_id,
+                "slug": asset.slug,
+                "name": asset.name,
+                "asset_type": asset.asset_type,
+                "site_name": site_by_id.get(asset.site_id).name if asset.site_id in site_by_id else None,
+                "component_count": len(component_ids_by_asset.get(asset.id, set())),
+                "sensor_count": sum(
+                    1
+                    for sensor in sensors
+                    if any(
+                        sensor.component_id == component_id
+                        for component_id in component_ids_by_asset.get(asset.id, set())
+                    )
+                ),
+            }
+            for asset in assets
+        ],
+        "components": [
+            {
+                "id": component.id,
+                "asset_id": component.asset_id,
+                "slug": component.slug,
+                "name": component.name,
+                "component_type": component.component_type,
+                "asset_name": asset_by_id.get(component.asset_id).name if component.asset_id in asset_by_id else None,
+                "sensor_count": sum(1 for sensor in sensors if sensor.component_id == component.id),
+            }
+            for component in components
+        ],
+        "sensors": [
+            {
+                "id": sensor.id,
+                "component_id": sensor.component_id,
+                "slug": sensor.slug,
+                "name": sensor.name,
+                "sensor_type": sensor.sensor_type,
+                "unit": sensor.unit,
+                "sampling_rate_hz": sensor.sampling_rate_hz,
+                "channel_name": sensor.channel_name,
+                "axis": sensor.axis,
+                "manufacturer": sensor.manufacturer,
+                "model": sensor.model,
+            }
+            for sensor in sensors
+        ],
+        "health": {
+            "ingestion": IngestionService(session).health(organization_id),
+            "analytics": AnalyticsService(session).health(organization_id),
+            "serving": ProductionServingService(session).health(organization_id),
+            "maintenance": MaintenanceOperationsService(session).health(organization_id),
+        },
+        "alerts": alerts,
+        "cases": cases,
+        "work_orders": work_orders,
+        "fleet_summary": {
+            "site_count": len(sites),
+            "asset_count": len(assets),
+            "component_count": len(components),
+            "sensor_count": len(sensors),
+            "alert_count": len(alerts),
+            "case_count": len(cases),
+            "work_order_count": len(work_orders),
+        },
+    }
 
 
 @app.post("/api/security/{organization_id}/identity-providers")
